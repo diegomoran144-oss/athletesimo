@@ -1,0 +1,6 @@
+config.toml_file([theme]
+base = ("light"
+primaryColor = "0066CC"
+backgroundColor = #FFFFFF
+secondaryBackgroundColor = # F5F5F5"
+textColor = "#000000"# )
