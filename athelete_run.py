@@ -74,8 +74,33 @@ def test_neon_connection():
 
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
-STRAVA_REDIRECT_URI ="https://athleterunpy-n8eens7b7gdf4xcsn9vvzf.streamlit.app"
+
+
+def get_strava_redirect_uri():
+    """
+    Use the URL that is currently running Athletismo.
+
+    Local:
+        http://localhost:8501
+
+    Streamlit Community Cloud:
+        https://your-app-name.streamlit.app
+
+    This keeps the same code working locally and after deployment.
+    """
+    try:
+        current_url = str(st.context.url)
+        if current_url:
+            # OAuth redirect URIs should not include query parameters/fragments.
+            return current_url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    except Exception:
+        pass
+
+    # Safe fallback for local development.
+    return "http://localhost:8501"
+
 
 
 # =========================================================
@@ -526,7 +551,7 @@ def create_strava_login_url(athlete_key):
 
     parameters = {
         "client_id": client_id,
-        "redirect_uri": STRAVA_REDIRECT_URI,
+        "redirect_uri": get_strava_redirect_uri(),
         "response_type": "code",
         "approval_prompt": "force",
         "scope": "read,activity:read_all",
@@ -1175,15 +1200,9 @@ def render_starter_page():
 # PUBLIC HOME / PRIVATE LOGIN ROUTING
 # =========================================================
 
-# The landing page stays public. Opening OLLU sends visitors to login.
-if st.session_state.get("page") == "login" and not st.session_state.get("logged_in"):
-    render_login_page()
-    st.stop()
-
-if st.session_state.get("page") == "home" and st.session_state.get("active_team") != "ollu_distance":
-    render_starter_page()
-    st.stop()
-
+# Handle a Strava OAuth return BEFORE the public landing page can stop execution.
+# This is essential on the deployed Streamlit URL because the OAuth return starts
+# a fresh app run with ?code=...&state=... in the URL.
 # Complete an OAuth return before drawing the dashboard.
 authorization_code = st.query_params.get("code")
 authorization_error = st.query_params.get("error")
@@ -1225,6 +1244,16 @@ if authorization_code:
     ) as error:
         st.error(f"Strava authorization failed: {error}")
 
+
+
+# The landing page stays public. Opening OLLU sends visitors to login.
+if st.session_state.get("page") == "login" and not st.session_state.get("logged_in"):
+    render_login_page()
+    st.stop()
+
+if st.session_state.get("page") == "home" and st.session_state.get("active_team") != "ollu_distance":
+    render_starter_page()
+    st.stop()
 
 # Never expose the athlete dashboard without an authenticated coach session.
 if (
