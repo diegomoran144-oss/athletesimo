@@ -74,33 +74,9 @@ def test_neon_connection():
 
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
-
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 
-
-def get_strava_redirect_uri():
-    """
-    Use the URL that is currently running Athletismo.
-
-    Local:
-        http://localhost:8501
-
-    Streamlit Community Cloud:
-        https://your-app-name.streamlit.app
-
-    This keeps the same code working locally and after deployment.
-    """
-    try:
-        current_url = str(st.context.url)
-        if current_url:
-            # OAuth redirect URIs should not include query parameters/fragments.
-            return current_url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-    except Exception:
-        pass
-
-    # Safe fallback for local development.
-    return "http://localhost:8501"
-
+STRAVA_REDIRECT_URI = "https://athleterunpy-n8eens7b7gdf4xcsn9vvzf.streamlit.app"
 
 
 # =========================================================
@@ -551,7 +527,7 @@ def create_strava_login_url(athlete_key):
 
     parameters = {
         "client_id": client_id,
-        "redirect_uri": get_strava_redirect_uri(),
+        "redirect_uri": STRAVA_REDIRECT_URI,
         "response_type": "code",
         "approval_prompt": "force",
         "scope": "read,activity:read_all",
