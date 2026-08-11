@@ -651,10 +651,52 @@ def exchange_authorization_code(code, athlete_key):
         },
         timeout=15,
     )
-    response.raise_for_status()
+
+    # Show Strava's actual response when OAuth fails.
+    # Never include our client secret, authorization code, or tokens in the error.
+    if not response.ok:
+        try:
+            error_data = response.json()
+            message = error_data.get("message", "Authorization failed")
+            errors = error_data.get("errors", [])
+
+            safe_details = []
+            for error in errors:
+                resource = error.get("resource", "")
+                field = error.get("field", "")
+                code_value = error.get("code", "")
+
+                detail = " / ".join(
+                    str(value)
+                    for value in (resource, field, code_value)
+                    if value
+                )
+                if detail:
+                    safe_details.append(detail)
+
+            detail_text = "; ".join(safe_details)
+            if detail_text:
+                raise RuntimeError(
+                    f"Strava token exchange failed "
+                    f"({response.status_code}): {message} — {detail_text}"
+                )
+
+            raise RuntimeError(
+                f"Strava token exchange failed "
+                f"({response.status_code}): {message}"
+            )
+
+        except ValueError:
+            raise RuntimeError(
+                f"Strava token exchange failed "
+                f"({response.status_code}). Strava returned a non-JSON error."
+            )
+
     token_data = response.json()
+
     verify_strava_identity(athlete_key, token_data)
     save_token_data(athlete_key, token_data)
+
     return token_data["access_token"]
 
 
