@@ -16,6 +16,8 @@ import requests
 import streamlit as st
 
 from athlete_data import athletes
+ollu_roster = pd.read_csv("ollu_roster_csv")
+
 
 # =========================================================
 # PAGE SETTINGS
