@@ -1,3 +1,8 @@
+Library
+/
+athlete_run_csv.py
+
+
 import base64
 import hashlib
 import hmac
@@ -15,47 +20,135 @@ import psycopg2
 import requests
 import streamlit as st
 
-from athlete_data import athletes
-ollu_roster = pd.read_csv("ollu_roster_csv")
 
-# Add OLLU CSV roster athletes to the AthleteOS athlete dictionary
-# Add OLLU CSV roster athletes to the AthleteOS athlete dictionary
-for _, row in ollu_roster.iterrows():
+# =========================================================
+# OLLU ROSTER — CSV IS THE SOURCE OF TRUTH
+# =========================================================
 
-    roster_name = f"{row['first_name']} {row['last_name']}".strip()
+ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
 
-    # Check whether this athlete already has a full profile in athlete_data.py.
-    # If so, preserve that existing AthleteOS key so saved Strava connections
-    # continue to belong to the same athlete.
-    existing_key = None
 
-    for key, athlete_data in athletes.items():
-        existing_name = (
-            athlete_data
-            .get("profile", {})
-            .get("name", "")
-            .strip()
+def clean_csv_value(value, default=""):
+    """Turn blank/NaN CSV values into safe AthleteOS values."""
+    if pd.isna(value):
+        return default
+    value = str(value).strip()
+    return default if value.lower() == "nan" else value
+
+
+def load_ollu_roster():
+    """
+    Load the complete AthleteOS roster from ollu_roster_csv.
+    athlete_id is the permanent ID used by the dashboard, Strava and notes.
+    """
+    roster = pd.read_csv(ROSTER_PATH, dtype=str, keep_default_na=False).fillna("")
+
+    required = {
+        "athlete_id", "first_name", "last_name",
+        "school", "team", "class_year",
+    }
+    missing = required - set(roster.columns)
+    if missing:
+        raise RuntimeError(
+            "Missing CSV columns: " + ", ".join(sorted(missing))
         )
 
-        if existing_name.lower() == roster_name.lower():
-            existing_key = key
-            break
+    roster["athlete_id"] = roster["athlete_id"].astype(str).str.strip()
 
-    # Existing athletes keep their original key.
-    # New roster athletes use their permanent CSV athlete_id.
-    athlete_key = existing_key or row["athlete_id"]
+    duplicate_ids = roster.loc[
+        roster["athlete_id"].duplicated(keep=False), "athlete_id"
+    ].tolist()
+    if duplicate_ids:
+        raise RuntimeError(
+            "Duplicate athlete_id values: "
+            + ", ".join(sorted(set(duplicate_ids)))
+        )
 
-    # Only create a basic profile when this athlete doesn't already exist.
-    if athlete_key not in athletes:
-        athletes[athlete_key] = {
-            "profile": {
-                "name": roster_name,
-                "school": row["school"],
-                "team": row["team"],
-                "class": row["class_year"],
-            }
-        
+    athletes = {}
+
+    for _, row in roster.iterrows():
+        athlete_id = clean_csv_value(row.get("athlete_id"))
+        if not athlete_id:
+            continue
+
+        first_name = clean_csv_value(row.get("first_name"))
+        last_name = clean_csv_value(row.get("last_name"))
+        full_name = f"{first_name} {last_name}".strip()
+
+        pbs = {}
+        pb_map = {
+            "800": "pb_800",
+            "1500": "pb_1500",
+            "mile": "pb_mile",
+            "3k": "pb_3k",
+            "5k": "pb_5k",
         }
+        for event, column in pb_map.items():
+            value = clean_csv_value(row.get(column))
+            if value:
+                pbs[event] = value
+
+        xc_results = {}
+        xc_8k = clean_csv_value(row.get("xc_8k_pb"))
+        xc_10k = clean_csv_value(row.get("xc_10k_pb"))
+
+        if xc_8k:
+            xc_results["8k"] = [
+                {"time": xc_8k, "meet": "XC Personal Best", "date": ""}
+            ]
+        if xc_10k:
+            xc_results["10k"] = [
+                {"time": xc_10k, "meet": "XC Personal Best", "date": ""}
+            ]
+
+        threshold = {
+            "short_reps": {
+                "pace": clean_csv_value(row.get("threshold_short_pace"), "--"),
+                "lactate": clean_csv_value(row.get("threshold_short_lactate"), "--"),
+            },
+            "medium_reps": {
+                "pace": clean_csv_value(row.get("threshold_medium_pace"), "--"),
+                "lactate": clean_csv_value(row.get("threshold_medium_lactate"), "--"),
+            },
+            "long_reps": {
+                "pace": clean_csv_value(row.get("threshold_long_pace"), "--"),
+                "lactate": clean_csv_value(row.get("threshold_long_lactate"), "--"),
+            },
+        }
+
+        athletes[athlete_id] = {
+            "profile": {
+                "name": full_name or athlete_id,
+                "first_name": first_name,
+                "last_name": last_name,
+                "school": clean_csv_value(row.get("school"), "OLLU"),
+                "team": clean_csv_value(row.get("team")),
+                "class": clean_csv_value(row.get("class_year"), "--"),
+            },
+            "pbs": pbs,
+            "xc_results": xc_results,
+            "threshold": threshold,
+
+            # Live training/HR is intentionally NOT stored in the CSV.
+            # Strava fills these areas after each athlete connects/syncs.
+            "training": {},
+            "recovery": {},
+
+            "strava_connected_csv": (
+                clean_csv_value(row.get("strava_connected")).lower() == "true"
+            ),
+            "coros_connected_csv": (
+                clean_csv_value(row.get("coros_connected")).lower() == "true"
+            ),
+        }
+
+    if not athletes:
+        raise RuntimeError("No athletes were loaded from ollu_roster_csv.")
+
+    return roster, athletes
+
+
+ollu_roster, athletes = load_ollu_roster()
 
 
 # =========================================================
@@ -692,52 +785,10 @@ def exchange_authorization_code(code, athlete_key):
         },
         timeout=15,
     )
-
-    # Show Strava's actual response when OAuth fails.
-    # Never include our client secret, authorization code, or tokens in the error.
-    if not response.ok:
-        try:
-            error_data = response.json()
-            message = error_data.get("message", "Authorization failed")
-            errors = error_data.get("errors", [])
-
-            safe_details = []
-            for error in errors:
-                resource = error.get("resource", "")
-                field = error.get("field", "")
-                code_value = error.get("code", "")
-
-                detail = " / ".join(
-                    str(value)
-                    for value in (resource, field, code_value)
-                    if value
-                )
-                if detail:
-                    safe_details.append(detail)
-
-            detail_text = "; ".join(safe_details)
-            if detail_text:
-                raise RuntimeError(
-                    f"Strava token exchange failed "
-                    f"({response.status_code}): {message} — {detail_text}"
-                )
-
-            raise RuntimeError(
-                f"Strava token exchange failed "
-                f"({response.status_code}): {message}"
-            )
-
-        except ValueError:
-            raise RuntimeError(
-                f"Strava token exchange failed "
-                f"({response.status_code}). Strava returned a non-JSON error."
-            )
-
+    response.raise_for_status()
     token_data = response.json()
-
     verify_strava_identity(athlete_key, token_data)
     save_token_data(athlete_key, token_data)
-
     return token_data["access_token"]
 
 
@@ -1409,11 +1460,10 @@ with st.sidebar:
 
     st.markdown("### Choose Athlete")
 
-    athlet3e_key = st.selectbox(
-        "Choose Athlete",
+    athlete_key = st.selectbox(
+        "",
         options=list(athletes.keys()),
         format_func=lambda key: athletes[key]["profile"]["name"],
-        label_visibility="collapsed",
     )
 
     st.divider()
@@ -1507,7 +1557,7 @@ with st.sidebar:
     elif st.session_state.get(error_session_key):
         if strava_is_connected(athlete_key):
             st.warning(
-                "Strava sync failed, so dictionary mileage is being shown. "
+                "Strava sync failed. No live Strava mileage is available right now. "
                 f"Details: {st.session_state[error_session_key]}"
             )
         else:
@@ -1526,7 +1576,7 @@ with st.sidebar:
 
 dictionary_volume = dictionary_weekly_mileage(training)
 volume_data = dictionary_volume
-volume_source = "Athlete dictionary"
+volume_source = "No live data"
 
 weekly_session_key = f"{athlete_key}_strava_weekly"
 heart_session_key = f"{athlete_key}_strava_heart_rate"
@@ -1716,7 +1766,7 @@ with pb_card:
                         use_container_width=True,
                     )
             else:
-                st.caption("Add 8K or 10K results in athlete_data.py.")
+                st.caption("No XC 8K or 10K PB is entered in ollu_roster_csv.")
 
 with source_card:
     with st.container(border=True):
@@ -2052,6 +2102,6 @@ with st.container(border=True):
         )
 
         st.progress(
-            factors.get("speed_reserve",0)/100,
+            factors.get("speed_reserve", 0) / 100,
             text="Speed Reserve"
         )
