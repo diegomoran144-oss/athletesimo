@@ -18,6 +18,21 @@ import streamlit as st
 from athlete_data import athletes
 ollu_roster = pd.read_csv("ollu_roster_csv")
 
+# Add OLLU CSV roster athletes to the AthleteOS athlete dictionary
+for _, row in ollu_roster.iterrows():
+    athlete_key = row["athlete_id"]
+
+    # Don't overwrite athletes that already have full profiles
+    if athlete_key not in athletes:
+        athletes[athlete_key] = {
+            "profile": {
+                "name": f"{row['first_name']} {row['last_name']}",
+                "school": row["school"],
+                "team": row["team"],
+                "class": row["class_year"],
+            }
+        }
+
 
 # =========================================================
 # PAGE SETTINGS
@@ -1371,9 +1386,10 @@ with st.sidebar:
     st.markdown("### Choose Athlete")
 
     athlete_key = st.selectbox(
-        "",
+        "Choose Athlete",
         options=list(athletes.keys()),
         format_func=lambda key: athletes[key]["profile"]["name"],
+        label_visibility="collapsed",
     )
 
     st.divider()
