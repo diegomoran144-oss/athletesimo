@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import html
 import re
 import secrets
 import sqlite3
@@ -8,6 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -356,121 +358,113 @@ def persist_strava_connection(athlete_key, connection):
 
 
 # =========================================================
-# COACH NOTES DATABASE
+# ATHLETE + COACH NOTES — NEON POSTGRESQL
 # =========================================================
-#
-# IMPORTANT:
-# Leave this section using SQLite for the moment.
-#
-# Once we confirm Strava -> Neon works correctly, we will
-# migrate Coach Notes to Neon as the next step.
-#
 
-STRAVA_DATABASE_PATH = Path(__file__).with_name("athleteos_strava.db")
+TEAM_TIMEZONE = ZoneInfo("America/Chicago")
 
 
-def initialize_coach_notes_database():
-    """Create persistent, athlete-specific daily coach notes."""
-
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
-        database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS coach_notes (
-                athlete_key TEXT NOT NULL,
-                note_date TEXT NOT NULL,
-                note_text TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (athlete_key, note_date)
+def initialize_notes_database():
+    """Create a shared athlete/coach notes feed in Neon."""
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS athlete_notes (
+                    id BIGSERIAL PRIMARY KEY,
+                    athlete_key TEXT NOT NULL,
+                    author_name TEXT NOT NULL,
+                    author_role TEXT NOT NULL,
+                    note_text TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT athlete_notes_role_check
+                        CHECK (author_role IN ('COACH', 'ATHLETE'))
+                )
+                """
             )
-            """
-        )
-
-
-def load_coach_note(athlete_key, note_date):
-    """Return one athlete's saved note for the selected date."""
-
-    initialize_coach_notes_database()
-
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
-
-        row = database.execute(
-            """
-            SELECT note_text
-            FROM coach_notes
-            WHERE athlete_key = ? AND note_date = ?
-            """,
-            (
-                athlete_key,
-                note_date.isoformat(),
-            ),
-        ).fetchone()
-
-    return row[0] if row else ""
-
-
-def save_coach_note(athlete_key, note_date, note_text):
-    """Create or update one athlete's note for one calendar day."""
-
-    initialize_coach_notes_database()
-
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
-
-        database.execute(
-            """
-            INSERT INTO coach_notes (
-                athlete_key,
-                note_date,
-                note_text,
-                updated_at
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS athlete_notes_athlete_created_idx
+                ON athlete_notes (athlete_key, created_at DESC)
+                """
             )
 
-            VALUES (?, ?, ?, ?)
 
-            ON CONFLICT(athlete_key, note_date)
+def save_athlete_note(athlete_key, author_name, author_role, note_text):
+    """Save one coach or athlete note to the selected athlete's Neon feed."""
+    clean_note = str(note_text).strip()
+    clean_author = str(author_name).strip()
+    clean_role = str(author_role).strip().upper()
 
-            DO UPDATE SET
-                note_text = excluded.note_text,
-                updated_at = excluded.updated_at
-            """,
+    if not clean_note:
+        raise ValueError("Write a note before saving.")
+    if clean_role not in {"COACH", "ATHLETE"}:
+        raise ValueError("Note role must be COACH or ATHLETE.")
+    if not clean_author:
+        raise ValueError("The note needs an author name.")
 
-            (
-                athlete_key,
-                note_date.isoformat(),
-                note_text.strip(),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
+    initialize_notes_database()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO athlete_notes (
+                    athlete_key,
+                    author_name,
+                    author_role,
+                    note_text
+                )
+                VALUES (%s, %s, %s, %s)
+                """,
+                (athlete_key, clean_author, clean_role, clean_note),
+            )
 
 
-def load_recent_coach_notes(athlete_key, limit=5):
-    """Return an athlete's most recent non-empty daily notes."""
+def load_athlete_notes(athlete_key, limit=40, role_filter=None):
+    """Load the newest shared notes for one athlete from Neon."""
+    initialize_notes_database()
 
-    initialize_coach_notes_database()
+    query = """
+        SELECT id, author_name, author_role, note_text, created_at
+        FROM athlete_notes
+        WHERE athlete_key = %s
+    """
+    params = [athlete_key]
 
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
+    if role_filter in {"COACH", "ATHLETE"}:
+        query += " AND author_role = %s"
+        params.append(role_filter)
 
-        rows = database.execute(
-            """
-            SELECT
-                note_date,
-                note_text
+    query += " ORDER BY created_at DESC LIMIT %s"
+    params.append(int(limit))
 
-            FROM coach_notes
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall()
 
-            WHERE athlete_key = ?
-            AND TRIM(note_text) != ''
+    return [
+        {
+            "id": row[0],
+            "author_name": row[1],
+            "author_role": row[2],
+            "note_text": row[3],
+            "created_at": row[4],
+        }
+        for row in rows
+    ]
 
-            ORDER BY note_date DESC
 
-            LIMIT ?
-            """,
-            (
-                athlete_key,
-                limit,
-            ),
-        ).fetchall()
-
-    return rows
+def format_note_timestamp(created_at):
+    """Format a Neon timestamp in the OLLU/San Antonio timezone."""
+    if not created_at:
+        return ""
+    try:
+        local_time = created_at.astimezone(TEAM_TIMEZONE)
+        return local_time.strftime("%b %d, %Y · %-I:%M %p")
+    except (AttributeError, ValueError):
+        return str(created_at)
 
 
 # =========================================================
@@ -519,75 +513,6 @@ def athlete_strava_connection(athlete_key):
 
     return connection
 
-
-def initialize_coach_notes_database():
-    """Create persistent, athlete-specific daily coach notes."""
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
-        database.execute(
-            """
-            CREATE TABLE IF NOT EXISTS coach_notes (
-                athlete_key TEXT NOT NULL,
-                note_date TEXT NOT NULL,
-                note_text TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (athlete_key, note_date)
-            )
-            """
-        )
-
-
-def load_coach_note(athlete_key, note_date):
-    """Return one athlete's saved note for the selected date."""
-    initialize_coach_notes_database()
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
-        row = database.execute(
-            """
-            SELECT note_text
-            FROM coach_notes
-            WHERE athlete_key = ? AND note_date = ?
-            """,
-            (athlete_key, note_date.isoformat()),
-        ).fetchone()
-    return row[0] if row else ""
-
-
-def save_coach_note(athlete_key, note_date, note_text):
-    """Create or update one athlete's note for one calendar day."""
-    initialize_coach_notes_database()
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
-        database.execute(
-            """
-            INSERT INTO coach_notes (
-                athlete_key, note_date, note_text, updated_at
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT(athlete_key, note_date) DO UPDATE SET
-                note_text = excluded.note_text,
-                updated_at = excluded.updated_at
-            """,
-            (
-                athlete_key,
-                note_date.isoformat(),
-                note_text.strip(),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-
-
-def load_recent_coach_notes(athlete_key, limit=5):
-    """Return an athlete's most recent non-empty daily notes."""
-    initialize_coach_notes_database()
-    with sqlite3.connect(STRAVA_DATABASE_PATH) as database:
-        rows = database.execute(
-            """
-            SELECT note_date, note_text
-            FROM coach_notes
-            WHERE athlete_key = ? AND TRIM(note_text) != ''
-            ORDER BY note_date DESC
-            LIMIT ?
-            """,
-            (athlete_key, limit),
-        ).fetchall()
-    return rows
 
 
 def strava_secret(name, default=None):
@@ -1432,6 +1357,75 @@ st.markdown(
         .pb-event { color: #6b7280; font-size: 14px; margin-bottom: 4px; }
         .pb-time { color: #111827; font-size: 27px; font-weight: 750; margin-bottom: 5px; }
         .status-dot { color: #2f9e44; font-size: 12px; }
+        .notes-title {
+            font-size: 28px;
+            font-weight: 760;
+            color: #111827;
+            margin-bottom: 2px;
+        }
+        .notes-subtitle {
+            color: #6b7280;
+            font-size: 14px;
+            margin-bottom: 12px;
+        }
+        .note-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 15px 16px;
+            margin-bottom: 12px;
+        }
+        .note-card-athlete {
+            background: #f5f9ff;
+            border-color: #dbeafe;
+        }
+        .note-card-coach {
+            background: #f3fbf4;
+            border-color: #d7efd9;
+        }
+        .note-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+        .note-author-wrap {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .note-author {
+            color: #111827;
+            font-size: 14px;
+            font-weight: 700;
+        }
+        .note-role {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: .25px;
+        }
+        .note-role-athlete {
+            color: #2563eb;
+            background: #e8f1ff;
+        }
+        .note-role-coach {
+            color: #24833b;
+            background: #e4f6e7;
+        }
+        .note-time {
+            color: #6b7280;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .note-body {
+            color: #1f2937;
+            font-size: 15px;
+            line-height: 1.55;
+            white-space: pre-wrap;
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1909,74 +1903,118 @@ with recovery_card:
             )
 
 # =========================================================
-# COACH NOTES — FULL WIDTH
+# ATHLETE + COACH NOTES
 # =========================================================
 
 st.write("")
-st.subheader("Coach Notes")
 
-with st.container(border=True):
-    notes_header_col, notes_date_col = st.columns([4, 1.3])
+notes_feed_col, notes_compose_col = st.columns([1.75, 1], gap="large")
 
-    with notes_header_col:
-        st.markdown("### Daily Training Observation")
-        st.caption(
-            "Record workout response, effort, soreness, lactate, recovery, "
-            "mechanics, or adjustments for the next session."
+with notes_feed_col:
+    st.markdown(
+        '<div class="notes-title">Notes</div>'
+        '<div class="notes-subtitle">Athlete feedback and coach responses in one timeline.</div>',
+        unsafe_allow_html=True,
+    )
+
+    note_filter_label = st.selectbox(
+        "Note filter",
+        options=["All Notes", "Athlete", "Coach"],
+        key=f"note_filter_{athlete_key}",
+        label_visibility="collapsed",
+    )
+    role_filter = {
+        "All Notes": None,
+        "Athlete": "ATHLETE",
+        "Coach": "COACH",
+    }[note_filter_label]
+
+    try:
+        notes = load_athlete_notes(
+            athlete_key,
+            limit=40,
+            role_filter=role_filter,
         )
+    except psycopg2.Error as error:
+        notes = []
+        st.error(f"Notes could not be loaded from Neon: {error}")
 
-    with notes_date_col:
-        note_date = st.date_input(
-            "Training date",
-            value=datetime.now().date(),
-            key=f"coach_note_date_{athlete_key}",
-        )
+    if notes:
+        for note in notes:
+            role = note.get("author_role", "ATHLETE").upper()
+            role_class = "coach" if role == "COACH" else "athlete"
+            safe_author = html.escape(str(note.get("author_name", "")))
+            safe_role = html.escape(role)
+            safe_time = html.escape(format_note_timestamp(note.get("created_at")))
+            safe_text = html.escape(str(note.get("note_text", ""))).replace("\n", "<br>")
 
-    saved_note = load_coach_note(athlete_key, note_date)
+            note_html = (
+                f'<div class="note-card note-card-{role_class}">'
+                '<div class="note-header">'
+                '<div class="note-author-wrap">'
+                f'<span class="note-author">{safe_author}</span>'
+                f'<span class="note-role note-role-{role_class}">{safe_role}</span>'
+                '</div>'
+                f'<span class="note-time">{safe_time}</span>'
+                '</div>'
+                f'<div class="note-body">{safe_text}</div>'
+                '</div>'
+            )
+            st.markdown(note_html, unsafe_allow_html=True)
+    else:
+        st.info("No notes yet. Add the first training update for this athlete.")
 
-    with st.form(
-        key=f"coach_note_form_{athlete_key}_{note_date.isoformat()}",
-        clear_on_submit=False,
-    ):
-        note_text = st.text_area(
-            "Coach observation",
-            value=saved_note,
-            height=220,
-            placeholder=(
-                "Example: Athlete handled threshold well today. Lactate stayed "
-                "controlled throughout the session. Mechanics remained smooth "
-                "and recovery looked good. Monitor tomorrow before increasing load..."
-            ),
-        )
+with notes_compose_col:
+    with st.container(border=True):
+        st.markdown("### Add a note")
+        st.caption("Share how training went or leave a coaching response.")
 
-        save_col, spacer_col = st.columns([1.2, 4])
-        with save_col:
-            save_note = st.form_submit_button(
+        with st.form(key=f"shared_note_form_{athlete_key}", clear_on_submit=True):
+            posting_as = st.selectbox(
+                "Posting as",
+                options=["Athlete", "Coach"],
+                key=f"note_posting_as_{athlete_key}",
+            )
+
+            if posting_as == "Athlete":
+                note_author_name = athlete_name
+                note_author_role = "ATHLETE"
+                st.caption(f"Posting as {athlete_name}")
+            else:
+                note_author_name = "Coach Zarate"
+                note_author_role = "COACH"
+                st.caption("Posting as Coach Zarate")
+
+            new_note_text = st.text_area(
+                "Note",
+                height=180,
+                placeholder=(
+                    "How did training go? Include effort, soreness, sleep, "
+                    "lactate, mechanics, recovery, or anything the coach should know."
+                ),
+                label_visibility="collapsed",
+            )
+
+            save_shared_note = st.form_submit_button(
                 "Save Note",
                 type="primary",
                 use_container_width=True,
             )
 
-    if save_note:
-        try:
-            save_coach_note(athlete_key, note_date, note_text)
-            st.success(f"Note saved for {note_date.strftime('%b %d, %Y')}.")
-        except sqlite3.DatabaseError as error:
-            st.error(f"The note could not be saved: {error}")
-
-    recent_notes = load_recent_coach_notes(athlete_key)
-
-    if recent_notes:
-        st.divider()
-        with st.expander("Recent Coach Notes"):
-            for saved_date, saved_text in recent_notes:
-                display_date = datetime.strptime(
-                    saved_date,
-                    "%Y-%m-%d",
-                ).strftime("%b %d, %Y")
-                st.markdown(f"**{display_date}**")
-                st.write(saved_text)
-                st.divider()
+        if save_shared_note:
+            try:
+                save_athlete_note(
+                    athlete_key=athlete_key,
+                    author_name=note_author_name,
+                    author_role=note_author_role,
+                    note_text=new_note_text,
+                )
+                st.success("Note added.")
+                st.rerun()
+            except ValueError as error:
+                st.warning(str(error))
+            except psycopg2.Error as error:
+                st.error(f"The note could not be saved to Neon: {error}")
 
 
 # =========================================================
