@@ -1,8 +1,3 @@
-Library
-/
-athlete_run_csv.py
-
-
 import base64
 import hashlib
 import hmac
