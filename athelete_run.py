@@ -19,18 +19,42 @@ from athlete_data import athletes
 ollu_roster = pd.read_csv("ollu_roster_csv")
 
 # Add OLLU CSV roster athletes to the AthleteOS athlete dictionary
+# Add OLLU CSV roster athletes to the AthleteOS athlete dictionary
 for _, row in ollu_roster.iterrows():
-    athlete_key = row["athlete_id"]
 
-    # Don't overwrite athletes that already have full profiles
+    roster_name = f"{row['first_name']} {row['last_name']}".strip()
+
+    # Check whether this athlete already has a full profile in athlete_data.py.
+    # If so, preserve that existing AthleteOS key so saved Strava connections
+    # continue to belong to the same athlete.
+    existing_key = None
+
+    for key, athlete_data in athletes.items():
+        existing_name = (
+            athlete_data
+            .get("profile", {})
+            .get("name", "")
+            .strip()
+        )
+
+        if existing_name.lower() == roster_name.lower():
+            existing_key = key
+            break
+
+    # Existing athletes keep their original key.
+    # New roster athletes use their permanent CSV athlete_id.
+    athlete_key = existing_key or row["athlete_id"]
+
+    # Only create a basic profile when this athlete doesn't already exist.
     if athlete_key not in athletes:
         athletes[athlete_key] = {
             "profile": {
-                "name": f"{row['first_name']} {row['last_name']}",
+                "name": roster_name,
                 "school": row["school"],
                 "team": row["team"],
                 "class": row["class_year"],
             }
+        
         }
 
 
@@ -1385,7 +1409,7 @@ with st.sidebar:
 
     st.markdown("### Choose Athlete")
 
-    athlete_key = st.selectbox(
+    athlet3e_key = st.selectbox(
         "Choose Athlete",
         options=list(athletes.keys()),
         format_func=lambda key: athletes[key]["profile"]["name"],
