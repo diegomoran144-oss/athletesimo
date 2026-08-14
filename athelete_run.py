@@ -17,7 +17,6 @@ import psycopg2
 import requests
 import streamlit as st
 
-
 # =========================================================
 # OLLU ROSTER — CSV IS THE SOURCE OF TRUTH
 # =========================================================
@@ -1434,6 +1433,19 @@ if (
 st.markdown(
     """
     <style>
+        /* Remove Streamlit's top white header strip across the dashboard. */
+        [data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        header {
+            display: none !important;
+        }
+
+        /* Reclaim the vertical space left by the removed header. */
+        .block-container {
+            padding-top: 1.25rem !important;
+        }
+
         .stApp { background-color: #f6f8f6; }
         [data-testid="stSidebar"] {
             background-color: #ffffff;
