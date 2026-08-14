@@ -1106,6 +1106,14 @@ def render_starter_page():
                 background: #f6f8f6;
             }
 
+            /* Remove Streamlit top white bar / header. */
+            [data-testid="stHeader"],
+            [data-testid="stToolbar"],
+            [data-testid="stDecoration"],
+            header {
+                display: none !important;
+            }
+
             /* Landing page has no dashboard sidebar. */
             [data-testid="stSidebar"] {
                 display: none;
@@ -1116,8 +1124,8 @@ def render_starter_page():
             }
 
             .block-container {
-                max-width: 1040px;
-                padding-top: 1.1rem;
+                max-width: 1120px;
+                padding-top: 1.4rem;
                 padding-bottom: 3rem;
             }
 
@@ -1233,7 +1241,7 @@ def render_starter_page():
         unsafe_allow_html=True,
     )
 
-    left_pad, search_col, right_pad = st.columns([0.35, 5.3, 0.35])
+    left_pad, search_col, right_pad = st.columns([0.25, 5.5, 0.25])
 
     with search_col:
         school_search = st.text_input(
@@ -1291,12 +1299,6 @@ def render_starter_page():
         # -------------------------------------------------
 
         team_image = get_team_image("ollu_distance")
-
-        st.markdown(
-            '<div class="landing-image-label">OLLU Distance</div>'
-            '<div class="landing-image-help">Our Lady of the Lake University</div>',
-            unsafe_allow_html=True,
-        )
 
         if team_image:
             st.image(str(team_image), use_container_width=True)
@@ -1812,14 +1814,34 @@ with st.container(border=True):
         )
 
     # -----------------------------------------------------
-    # SCHOOL
+    # SCHOOL LOGO
     # -----------------------------------------------------
 
     with school_col:
 
-        st.markdown("### OLLU")
+        # Use the team's saved image/logo instead of repeating
+        # the school name as text in the athlete header.
+        school_logo = get_team_image("ollu_distance")
 
-        st.caption(school)
+        if school_logo is not None:
+            st.image(
+                str(school_logo),
+                width=135,
+            )
+        else:
+            # Safe fallback if the team image cannot be found.
+            st.markdown(
+                f"""
+                <div style="
+                    font-size:28px;
+                    font-weight:800;
+                    color:#111827;
+                ">
+                    {school}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 # =========================================================
 # PERFORMANCE BESTS AND DATA SOURCE
