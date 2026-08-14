@@ -1105,9 +1105,23 @@ def render_starter_page():
                 background: #f6f8f6;
             }
 
+            /* PUBLIC LANDING PAGE ONLY:
+               remove Streamlit's white top/share bar and keep the sidebar hidden.
+               These rules disappear after st.stop() and the private dashboard
+               renders, so the normal sidebar/collapse control remains inside VEKDYN. */
+            [data-testid="stHeader"],
+            [data-testid="stToolbar"],
+            [data-testid="stDecoration"],
+            [data-testid="stStatusWidget"],
+            [data-testid="stSidebar"],
+            [data-testid="collapsedControl"],
+            [data-testid="stSidebarCollapsedControl"] {
+                display: none !important;
+            }
 
             [data-testid="stAppViewContainer"] > .main {
-                margin-left: 0;
+                margin-left: 0 !important;
+                padding-top: 0 !important;
             }
 
             .block-container {
