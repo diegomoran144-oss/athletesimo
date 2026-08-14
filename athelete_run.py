@@ -23,10 +23,24 @@ import streamlit as st
 # =========================================================
 
 ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
+TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
 
+
+
+
+def get_team_image(team_id):
+    """
+    Return the VEKDYN-controlled image saved for a team.
+    Visitors can view team branding but cannot upload or replace it.
+    """
+    for extension in (".png", ".jpg", ".jpeg", ".webp"):
+        image_path = TEAM_IMAGES_DIR / f"{team_id}{extension}"
+        if image_path.exists():
+            return image_path
+    return None
 
 def clean_csv_value(value, default=""):
-    """Turn blank/NaN CSV values into safe AthleteOS values."""
+    """Turn blank/NaN CSV values into safe VEKDYN values."""
     if pd.isna(value):
         return default
     value = str(value).strip()
@@ -35,7 +49,7 @@ def clean_csv_value(value, default=""):
 
 def load_ollu_roster():
     """
-    Load the complete AthleteOS roster from ollu_roster_csv.
+    Load the complete VEKDYN roster from ollu_roster_csv.
     athlete_id is the permanent ID used by the dashboard, Strava and notes.
     """
     roster = pd.read_csv(ROSTER_PATH, dtype=str, keep_default_na=False).fillna("")
@@ -153,20 +167,109 @@ ollu_roster, athletes = load_ollu_roster()
 # =========================================================
 
 st.set_page_config(
-    page_title="Athletismo",
+    page_title="VEKDYN",
     page_icon="🏃",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # =========================================================
-# AUTHENTICATION / PAGE ROUTING
+# AUTHENTICATION / PERSISTENT LOGIN / PAGE ROUTING
 # =========================================================
 
+LOGIN_SESSION_DAYS = 7
+
+
 def check_login(username, password):
+    """Check the coach username and password stored in Streamlit secrets."""
     correct_username = st.secrets["coach_login"]["username"]
     correct_password = st.secrets["coach_login"]["password"]
-    return username == correct_username and password == correct_password
+
+    return (
+        hmac.compare_digest(str(username), str(correct_username))
+        and hmac.compare_digest(str(password), str(correct_password))
+    )
+
+
+def get_login_signing_secret():
+    """
+    Sign VEKDYN login sessions without ever storing the coach password
+    in the browser. A dedicated LOGIN_SECRET can be added later.
+    """
+    try:
+        return str(st.secrets["LOGIN_SECRET"])
+    except (KeyError, FileNotFoundError):
+        return str(st.secrets["STRAVA_CLIENT_SECRET"])
+
+
+def create_login_token(username):
+    """Create a signed login token that expires after LOGIN_SESSION_DAYS."""
+    expires_at = int(
+        time.time() + timedelta(days=LOGIN_SESSION_DAYS).total_seconds()
+    )
+    payload = f"{username}:{expires_at}"
+    signature = hmac.new(
+        get_login_signing_secret().encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}:{signature}"
+
+
+def validate_login_token(token):
+    """Return the username when a signed login token is valid."""
+    if not token:
+        return None
+
+    try:
+        username, expires_at, returned_signature = token.rsplit(":", 2)
+        expires_at = int(expires_at)
+    except (ValueError, TypeError):
+        return None
+
+    if time.time() > expires_at:
+        return None
+
+    payload = f"{username}:{expires_at}"
+    expected_signature = hmac.new(
+        get_login_signing_secret().encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(returned_signature, expected_signature):
+        return None
+
+    return username
+
+
+def restore_login_session():
+    """Restore an authenticated VEKDYN session after a browser refresh."""
+    if st.session_state.get("logged_in"):
+        return
+
+    login_token = st.query_params.get("session")
+    username = validate_login_token(login_token)
+
+    if username:
+        st.session_state["logged_in"] = True
+        st.session_state["logged_in_user"] = username
+        st.session_state["active_team"] = "ollu_distance"
+        st.session_state["page"] = "dashboard"
+
+
+def log_out():
+    """End the current VEKDYN login session."""
+    st.session_state["logged_in"] = False
+    st.session_state.pop("logged_in_user", None)
+    st.session_state.pop("active_team", None)
+    st.session_state.pop("pending_team", None)
+
+    if "session" in st.query_params:
+        del st.query_params["session"]
+
+    st.session_state["page"] = "home"
+    st.rerun()
 
 
 if "logged_in" not in st.session_state:
@@ -178,17 +281,20 @@ if "page" not in st.session_state:
 if "pending_team" not in st.session_state:
     st.session_state.pending_team = None
 
+
+restore_login_session()
+
 # =========================================================
 # NEON DATABASE
 # =========================================================
 
 def get_database_connection():
-    """Open a connection to the Athletismo Neon PostgreSQL database."""
+    """Open a connection to the VEKDYN Neon PostgreSQL database."""
     return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 
 def test_neon_connection():
-    """Test whether Athletismo can reach Neon."""
+    """Test whether VEKDYN can reach Neon."""
     try:
         conn = get_database_connection()
         conn.close()
@@ -282,7 +388,7 @@ def load_saved_strava_connection(athlete_key):
 def saved_owner_of_strava_account(strava_athlete_id):
     """
     Check whether this Strava account is already connected
-    to another Athletismo athlete.
+    to another VEKDYN athlete.
     """
 
     if not strava_athlete_id:
@@ -305,31 +411,6 @@ def saved_owner_of_strava_account(strava_athlete_id):
             row = cursor.fetchone()
 
     return row[0] if row else None
-def migrate_isai_strava_key():
-    """
-    One-time migration:
-    Move Isai's existing Strava connection from the old
-    dictionary athlete key to his permanent CSV athlete_id.
-    """
-    initialize_strava_database()
-
-    old_key = "Isai"
-    new_key = "ollu_m_009"
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE strava_connections
-                SET athlete_key = %s
-                WHERE athlete_key = %s
-                """,
-                (new_key, old_key),
-            )
-
-        database.commit()
-        
-migrate_isai_strava_key()
 
 def persist_strava_connection(athlete_key, connection):
     """
@@ -508,7 +589,7 @@ def strava_secret(name, default=None):
 def strava_connections():
     """
     Return the in-session Strava connection store,
-    keyed by Athletismo athlete key.
+    keyed by VEKDYN athlete key.
     """
 
     return st.session_state.setdefault(
@@ -548,7 +629,7 @@ def strava_secret(name, default=None):
 
 
 def strava_connections():
-    """Return the in-session connection store keyed by AthleteOS athlete key."""
+    """Return the in-session connection store keyed by VEKDYN athlete key."""
     return st.session_state.setdefault("strava_connections", {})
 
 
@@ -615,7 +696,7 @@ def create_strava_login_url(athlete_key):
 
 
 def athlete_key_from_oauth_state(oauth_state):
-    """Validate Strava's returned state and recover the AthleteOS athlete key."""
+    """Validate Strava's returned state and recover the VEKDYN athlete key."""
     client_secret = strava_secret("STRAVA_CLIENT_SECRET")
     if not oauth_state or not client_secret:
         return None
@@ -709,7 +790,7 @@ def verify_strava_identity(athlete_key, token_data):
         == normalized_person_name(expected_first_name)
     )
 
-    # Some AthleteOS profiles currently contain only a first name ("Diego"),
+    # Some VEKDYN profiles currently contain only a first name ("Diego"),
     # while Strava returns the full name ("Diego Moran").
     if not (full_name_matches or first_name_matches):
         raise RuntimeError(
@@ -983,7 +1064,7 @@ def render_login_page():
         unsafe_allow_html=True,
     )
 
-    st.markdown("# Athletismo")
+    st.markdown("# VEKDYN")
     st.subheader("OLLU Distance — Coach Login")
     st.caption("Sign in to access the private athlete dashboard.")
 
@@ -995,10 +1076,14 @@ def render_login_page():
         if st.button("Log In", type="primary", use_container_width=True):
             if check_login(username, password):
                 st.session_state["logged_in"] = True
+                st.session_state["logged_in_user"] = username
                 st.session_state["active_team"] = (
                     st.session_state.get("pending_team") or "ollu_distance"
                 )
                 st.session_state["page"] = "dashboard"
+
+                # Keep the coach authenticated across browser refreshes.
+                st.query_params["session"] = create_login_token(username)
                 st.rerun()
             else:
                 st.error("Incorrect username or password.")
@@ -1133,7 +1218,7 @@ def render_starter_page():
     # -----------------------------------------------------
 
     st.markdown(
-        '<div class="starter-brand">Athlete<span>OS</span></div>',
+        '<div class="starter-brand">VEK<span>DYN</span></div>',
         unsafe_allow_html=True,
     )
 
@@ -1144,7 +1229,7 @@ def render_starter_page():
     st.markdown(
         '<div class="starter-heading">Find your team</div>'
         '<div class="starter-subheading">Search for your school to access '
-        'your AthleteOS workspace.</div>',
+        'your VEKDYN workspace.</div>',
         unsafe_allow_html=True,
     )
 
@@ -1205,37 +1290,38 @@ def render_starter_page():
         # TEAM / LANDING IMAGE
         # -------------------------------------------------
 
+        team_image = get_team_image("ollu_distance")
+
         st.markdown(
-            '<div class="landing-image-label">Team image</div>'
-            '<div class="landing-image-help">Upload a wide team photo or banner for the landing page.</div>',
+            '<div class="landing-image-label">OLLU Distance</div>'
+            '<div class="landing-image-help">Our Lady of the Lake University</div>',
             unsafe_allow_html=True,
         )
 
-        uploaded_team_image = st.file_uploader(
-            "Upload team image",
-            type=["jpg", "jpeg", "png"],
-            key="landing_team_image_upload",
-            label_visibility="collapsed",
-        )
-
-        if uploaded_team_image is not None:
-            st.session_state["landing_team_image_bytes"] = uploaded_team_image.getvalue()
-            st.session_state["landing_team_image_name"] = uploaded_team_image.name
-
-        landing_image_bytes = st.session_state.get("landing_team_image_bytes")
-
-        if landing_image_bytes:
-            image_base64 = base64.b64encode(landing_image_bytes).decode("utf-8")
-            image_name = st.session_state.get("landing_team_image_name", "team.jpg")
-            image_suffix = Path(image_name).suffix.lower()
-            image_mime = "image/png" if image_suffix == ".png" else "image/jpeg"
-
+        if team_image:
+            st.image(str(team_image), use_container_width=True)
+        else:
             st.markdown(
-                f'<div class="landing-banner"><img src="data:{image_mime};base64,{image_base64}" alt="OLLU Distance team banner"></div>',
+                """
+                <div style="
+                    width:100%;
+                    min-height:260px;
+                    border:1px solid #e5e7eb;
+                    border-radius:16px;
+                    display:flex;
+                    align-items:center;
+                    justify-content:center;
+                    background:#f9fafb;
+                    margin-top:12px;
+                ">
+                    <div style="text-align:center; color:#9ca3af;">
+                        <div style="font-size:28px; margin-bottom:8px;">🏃</div>
+                        <div style="font-size:14px; font-weight:600;">OLLU Distance</div>
+                    </div>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
-        else:
-            st.info("Upload a team image to fill this space on the landing page.")
 
         # -------------------------------------------------
         # FOOTER
@@ -1274,7 +1360,7 @@ if authorization_code:
 
         if connected_athlete_key not in athletes:
             raise RuntimeError(
-                "The Strava connection could not be matched to an AthleteOS profile. "
+                "The Strava connection could not be matched to an VEKDYN profile. "
                 "Return to the dashboard and select Connect Strava again."
             )
 
@@ -1463,7 +1549,7 @@ st.markdown(
 with st.sidebar:
 
     st.markdown(
-        "## Athlete<span style='color:#2f9e44'>OS</span>",
+        "## VEK<span style='color:#2f9e44'>DYN</span>",
         unsafe_allow_html=True
     )
 
@@ -1493,6 +1579,13 @@ with st.sidebar:
 
     st.caption("Coach Zarate")
     st.caption("OLLU Distance")
+
+    if st.button(
+        "Log Out",
+        key="logout_button",
+        use_container_width=True,
+    ):
+        log_out()
 
 athlete = athletes[athlete_key]
 profile = athlete["profile"]
