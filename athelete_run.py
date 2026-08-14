@@ -305,7 +305,31 @@ def saved_owner_of_strava_account(strava_athlete_id):
             row = cursor.fetchone()
 
     return row[0] if row else None
+def migrate_isai_strava_key():
+    """
+    One-time migration:
+    Move Isai's existing Strava connection from the old
+    dictionary athlete key to his permanent CSV athlete_id.
+    """
+    initialize_strava_database()
 
+    old_key = "Isai"
+    new_key = "ollu_m_009"
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE strava_connections
+                SET athlete_key = %s
+                WHERE athlete_key = %s
+                """,
+                (new_key, old_key),
+            )
+
+        database.commit()
+        
+migrate_isai_strava_key()
 
 def persist_strava_connection(athlete_key, connection):
     """
