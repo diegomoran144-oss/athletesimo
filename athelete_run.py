@@ -1819,23 +1819,41 @@ with st.container(border=True):
 
     with school_col:
 
-        # Use the team's saved image/logo instead of repeating
-        # the school name as text in the athlete header.
         school_logo = get_team_image("ollu_distance")
 
         if school_logo is not None:
+
+            # Make the school mark fill most of the athlete-header height.
+            # For a truly background-free logo, use a transparent PNG
+            # in team_images; CSS cannot remove white pixels baked into
+            # the source image.
+            st.markdown(
+                """
+                <style>
+                    div[data-testid="stImage"] img {
+                        max-height: 145px;
+                        width: auto;
+                        object-fit: contain;
+                    }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
             st.image(
                 str(school_logo),
-                width=135,
+                use_container_width=True,
             )
+
         else:
-            # Safe fallback if the team image cannot be found.
+
             st.markdown(
                 f"""
                 <div style="
                     font-size:28px;
                     font-weight:800;
                     color:#111827;
+                    text-align:center;
                 ">
                     {school}
                 </div>
