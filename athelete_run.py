@@ -1382,7 +1382,27 @@ if authorization_code:
         KeyError,
         RuntimeError,
     ) as error:
-        st.error(f"Strava authorization failed: {error}")
+        # If this athlete already has a valid saved Strava connection,
+        # an old/reused OAuth callback code should not create a red
+        # dashboard-wide error banner. The existing Neon connection
+        # remains the source of truth.
+        oauth_athlete_key = athlete_key_from_oauth_state(returned_oauth_state)
+
+        if (
+            oauth_athlete_key in athletes
+            and strava_is_connected(oauth_athlete_key)
+        ):
+            st.session_state.pop(
+                f"strava_error_{oauth_athlete_key}",
+                None,
+            )
+
+            # Remove the stale one-time OAuth parameters so Streamlit
+            # cannot try to exchange the same authorization code again.
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.error(f"Strava authorization failed: {error}")
 
 
 
