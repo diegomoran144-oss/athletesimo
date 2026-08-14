@@ -1433,31 +1433,36 @@ if (
 st.markdown(
     """
     <style>
-        /* Hide Streamlit toolbar/decorations without removing sidebar controls. */
-        [data-testid="stToolbar"] {
-            display: none !important;
+        /* Keep Streamlit's header alive so the sidebar reopen control works. */
+        [data-testid="stHeader"] {
+            background: transparent !important;
+            border: none !important;
         }
 
+        /* Hide only the unnecessary Streamlit toolbar / decoration. */
+        [data-testid="stToolbar"],
         [data-testid="stDecoration"] {
             display: none !important;
         }
 
-        /* Keep the header mounted so Streamlit can render the sidebar tab. */
-        [data-testid="stHeader"] {
-            background: transparent !important;
-            height: 0rem !important;
-        }
-
-        /* Preserve the control that reopens a collapsed sidebar. */
+        /* Preserve sidebar collapse / reopen controls across Streamlit versions. */
+        [data-testid="collapsedControl"],
         [data-testid="stSidebarCollapsedControl"],
-        [data-testid="stSidebarCollapseButton"] {
+        [data-testid="stSidebarCollapseButton"],
+        button[kind="header"] {
             display: flex !important;
             visibility: visible !important;
             opacity: 1 !important;
             z-index: 999999 !important;
         }
 
-        /* Reclaim vertical space without killing the sidebar control. */
+        /* Keep the header visually minimal. */
+        header {
+            background: transparent !important;
+            border: none !important;
+        }
+
+        /* Reclaim most of the top space without deleting the header controls. */
         .block-container {
             padding-top: 1.25rem !important;
         }
