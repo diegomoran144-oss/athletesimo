@@ -1433,15 +1433,31 @@ if (
 st.markdown(
     """
     <style>
-        /* Remove Streamlit's top white header strip across the dashboard. */
-        [data-testid="stHeader"],
-        [data-testid="stToolbar"],
-        [data-testid="stDecoration"],
-        header {
+        /* Hide Streamlit toolbar/decorations without removing sidebar controls. */
+        [data-testid="stToolbar"] {
             display: none !important;
         }
 
-        /* Reclaim the vertical space left by the removed header. */
+        [data-testid="stDecoration"] {
+            display: none !important;
+        }
+
+        /* Keep the header mounted so Streamlit can render the sidebar tab. */
+        [data-testid="stHeader"] {
+            background: transparent !important;
+            height: 0rem !important;
+        }
+
+        /* Preserve the control that reopens a collapsed sidebar. */
+        [data-testid="stSidebarCollapsedControl"],
+        [data-testid="stSidebarCollapseButton"] {
+            display: flex !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            z-index: 999999 !important;
+        }
+
+        /* Reclaim vertical space without killing the sidebar control. */
         .block-container {
             padding-top: 1.25rem !important;
         }
