@@ -1105,18 +1105,6 @@ def render_starter_page():
                 background: #f6f8f6;
             }
 
-            /* Remove Streamlit top white bar / header. */
-            [data-testid="stHeader"],
-            [data-testid="stToolbar"],
-            [data-testid="stDecoration"],
-            header {
-                display: none !important;
-            }
-
-            /* Landing page has no dashboard sidebar. */
-            [data-testid="stSidebar"] {
-                display: none;
-            }
 
             [data-testid="stAppViewContainer"] > .main {
                 margin-left: 0;
@@ -1433,39 +1421,7 @@ if (
 st.markdown(
     """
     <style>
-        /* Keep Streamlit's header alive so the sidebar reopen control works. */
-        [data-testid="stHeader"] {
-            background: transparent !important;
-            border: none !important;
-        }
 
-        /* Hide only the unnecessary Streamlit toolbar / decoration. */
-        [data-testid="stToolbar"],
-        [data-testid="stDecoration"] {
-            display: none !important;
-        }
-
-        /* Preserve sidebar collapse / reopen controls across Streamlit versions. */
-        [data-testid="collapsedControl"],
-        [data-testid="stSidebarCollapsedControl"],
-        [data-testid="stSidebarCollapseButton"],
-        button[kind="header"] {
-            display: flex !important;
-            visibility: visible !important;
-            opacity: 1 !important;
-            z-index: 999999 !important;
-        }
-
-        /* Keep the header visually minimal. */
-        header {
-            background: transparent !important;
-            border: none !important;
-        }
-
-        /* Reclaim most of the top space without deleting the header controls. */
-        .block-container {
-            padding-top: 1.25rem !important;
-        }
 
         .stApp { background-color: #f6f8f6; }
         [data-testid="stSidebar"] {
@@ -1547,14 +1503,8 @@ st.markdown(
             background: #f3fbf4;
             border-color: #d7efd9;
         }
-        .note-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            margin-bottom: 8px;
-        }
-        .note-author-wrap {
+        .note-
+.note-author-wrap {
             display: flex;
             align-items: center;
             gap: 8px;
