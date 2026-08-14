@@ -1609,6 +1609,77 @@ with st.sidebar:
     st.write("♡ Recovery")
     st.write("📝 Notes")
 
+    # -----------------------------------------------------
+    # CONTACT / FEEDBACK
+    # -----------------------------------------------------
+
+    st.divider()
+
+    st.markdown("### VEKDYN")
+
+    if st.button(
+        "✉ Contact & Feedback",
+        key="contact_feedback_button",
+        use_container_width=True,
+    ):
+        st.session_state["show_contact_form"] = (
+            not st.session_state.get("show_contact_form", False)
+        )
+
+    if st.session_state.get("show_contact_form", False):
+        st.caption(
+            "Questions, feedback, or interested in bringing "
+            "VEKDYN to your program?"
+        )
+
+        with st.form(
+            "vek_dyn_contact_form",
+            clear_on_submit=True,
+        ):
+            contact_name = st.text_input(
+                "Name",
+                placeholder="Your name",
+            )
+
+            contact_program = st.text_input(
+                "School / Program",
+                placeholder="School or running program",
+            )
+
+            contact_email = st.text_input(
+                "Email",
+                placeholder="name@email.com",
+            )
+
+            contact_message = st.text_area(
+                "Message",
+                placeholder=(
+                    "Tell us what you're interested in, "
+                    "share feedback, or report an issue."
+                ),
+                height=130,
+            )
+
+            contact_submit = st.form_submit_button(
+                "Send Message",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if contact_submit:
+            if not contact_name.strip():
+                st.warning("Please enter your name.")
+            elif not contact_email.strip():
+                st.warning("Please enter your email.")
+            elif not contact_message.strip():
+                st.warning("Please enter a message.")
+            else:
+                st.success("Thanks — your message is ready to send.")
+
+    # -----------------------------------------------------
+    # ACCOUNT
+    # -----------------------------------------------------
+
     st.divider()
 
     st.caption("Coach Zarate")
