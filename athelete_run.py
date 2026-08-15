@@ -2925,3 +2925,4 @@ with st.container(border=True):
         )
         st.caption(
             threshold.get('long_reps', {}).get('pace', '--')
+        )
