@@ -17,10 +17,6 @@ import psycopg2
 import requests
 import streamlit as st
 
-Library
-/
-VEKDYN_two_team_login.py
-
 
 # =========================================================
 # OLLU ROSTER — CSV IS THE SOURCE OF TRUTH
