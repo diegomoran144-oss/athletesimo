@@ -26,11 +26,8 @@ TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
 TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
 
 def get_team_logo(team_id):
-    for extension in (".png", ".jpg", ".jpeg", ".webp"):
-        p = TEAM_LOGOS_DIR / f"{team_id}{extension}"
-        if p.exists():
-            return p
-    return None
+    """Return the same team-specific school image used on the landing card."""
+    return get_team_image(team_id)
 
 
 
@@ -1608,8 +1605,8 @@ def render_starter_page():
         # -------------------------------------------------
 
         # This is deliberately separate from every school's card image.
-        # Save the general running photo as team_images/landing_page.jpg.
-        landing_image = get_team_image("landing_page")
+        # Save the general running photo as team_images/running_banner.jpg.
+        landing_image = get_team_image("running_banner")
         if landing_image:
             st.markdown('<div class="landing-banner">', unsafe_allow_html=True)
             st.image(str(landing_image), use_container_width=True)
