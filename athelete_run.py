@@ -1519,7 +1519,7 @@ def render_starter_page():
                 st.info("No team account matches that search yet.")
 
         # -------------------------------------------------
-        # RECENTLY ACCESSED — FULL WIDTH
+        # RECENTLY ACCESSED — TEAM CARDS WITH IMAGES
         # -------------------------------------------------
 
         st.markdown(
@@ -1527,31 +1527,71 @@ def render_starter_page():
             unsafe_allow_html=True,
         )
 
-        for team_id, meta_text in [
-            ("ollu_distance", f"{len(ollu_athletes)} athletes connected"),
-            ("sam_houston", "Workspace being built"),
-        ]:
+        team_cards = [
+            (
+                "ollu_distance",
+                f"{len(ollu_athletes)} athletes connected",
+            ),
+            (
+                "sam_houston",
+                "Workspace being built",
+            ),
+        ]
+
+        for team_id, meta_text in team_cards:
             config = team_config(team_id)
+            team_image = get_team_image(team_id)
 
             with st.container(border=True):
-                recent_icon, recent_text, recent_button = st.columns([0.45, 4.2, 1.25])
+                image_col, text_col, button_col = st.columns(
+                    [1.35, 3.8, 1.25],
+                    vertical_alignment="center",
+                )
 
-                with recent_icon:
-                    team_logo = get_team_logo(team_id)
-                    if team_logo:
-                        st.image(str(team_logo), width=58)
+                # Team-specific running image
+                with image_col:
+                    if team_image:
+                        st.image(
+                            str(team_image),
+                            use_container_width=True,
+                        )
                     else:
-                        st.markdown("## 🏃")
+                        # Fallback to the school logo if no team image exists yet.
+                        team_logo = get_team_logo(team_id)
+                        if team_logo:
+                            st.image(str(team_logo), width=90)
+                        else:
+                            st.markdown(
+                                """
+                                <div style="
+                                    height:90px;
+                                    display:flex;
+                                    align-items:center;
+                                    justify-content:center;
+                                    font-size:32px;
+                                ">
+                                    🏃
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
 
-                with recent_text:
+                # Team name and status
+                with text_col:
                     st.markdown(
-                        f'<div class="recent-team-name">{config["name"]}</div>'
-                        f'<div class="recent-team-meta">{meta_text}</div>',
+                        f"""
+                        <div class="recent-team-name">
+                            {config["name"]}
+                        </div>
+                        <div class="recent-team-meta">
+                            {meta_text}
+                        </div>
+                        """,
                         unsafe_allow_html=True,
                     )
 
-                with recent_button:
-                    st.write("")
+                # Open the correct school workspace
+                with button_col:
                     if st.button(
                         "Open Team →",
                         key=f"open_{team_id}",
@@ -1559,37 +1599,6 @@ def render_starter_page():
                         use_container_width=True,
                     ):
                         open_team_workspace(team_id)
-
-        # -------------------------------------------------
-        # TEAM / LANDING IMAGE
-        # -------------------------------------------------
-
-        team_image = get_team_image("ollu_distance")
-
-        if team_image:
-            st.image(str(team_image), use_container_width=True)
-        else:
-            st.markdown(
-                """
-                <div style="
-                    width:100%;
-                    min-height:260px;
-                    border:1px solid #e5e7eb;
-                    border-radius:16px;
-                    display:flex;
-                    align-items:center;
-                    justify-content:center;
-                    background:#f9fafb;
-                    margin-top:12px;
-                ">
-                    <div style="text-align:center; color:#9ca3af;">
-                        <div style="font-size:28px; margin-bottom:8px;">🏃</div>
-                        <div style="font-size:14px; font-weight:600;">OLLU Distance</div>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
         # -------------------------------------------------
         # FOOTER
