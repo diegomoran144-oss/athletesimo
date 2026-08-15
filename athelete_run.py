@@ -1210,9 +1210,11 @@ def render_pricing_page():
     .price-brand span{color:#2f9e44}
     .price-title{text-align:center;font-size:44px;font-weight:800;color:#111827}
     .price-sub{text-align:center;color:#6b7280;font-size:17px;margin:.4rem 0 1.3rem}
-    .price-number{text-align:center;color:#0b67c2;font-size:54px;font-weight:800}
-    .price-number span{font-size:18px;color:#374151;font-weight:500}
-    .price-caption{text-align:center;color:#6b7280;margin-top:-8px;margin-bottom:20px}
+    .plan-card{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:24px 26px;min-height:170px;margin-top:8px}
+    .plan-name{font-size:20px;font-weight:800;color:#111827}
+    .plan-price{font-size:42px;font-weight:800;color:#0b67c2;margin-top:8px}
+    .plan-price span{font-size:17px;font-weight:500;color:#6b7280}
+    .plan-copy{color:#6b7280;margin-top:7px;line-height:1.45}
     .purchase-box{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:22px 26px;margin-top:18px}
     .purchase-title{font-size:21px;font-weight:800;color:#111827;margin-bottom:14px}
     .purchase-row{display:flex;justify-content:space-between;gap:30px;border-bottom:1px solid #eef0ee;padding:10px 0;color:#374151}
@@ -1220,36 +1222,124 @@ def render_pricing_page():
     </style>""", unsafe_allow_html=True)
 
     st.markdown('<div class="price-brand">VEK<span>DYN</span></div>', unsafe_allow_html=True)
+
     if st.button("← Find your team"):
-        st.session_state["page"]="home"
+        st.session_state["page"] = "home"
         st.rerun()
 
     st.markdown(
         '<div class="price-title">VEKDYN Team Platform</div>'
-        '<div class="price-sub">Performance and training intelligence built for distance running programs.</div>'
-        '<div class="price-number">$600 <span>/ year</span></div>'
-        '<div class="price-caption">Standard published price · per program · annual license</div>',
-        unsafe_allow_html=True)
+        '<div class="price-sub">Performance and training intelligence built for distance running programs.</div>',
+        unsafe_allow_html=True,
+    )
 
-    left,right=st.columns(2)
+    annual_col, monthly_col = st.columns(2)
+
+    with annual_col:
+        st.markdown(
+            """
+            <div class="plan-card">
+                <div class="plan-name">Annual Team License</div>
+                <div class="plan-price">$500 <span>/ year</span></div>
+                <div class="plan-copy">Best value for programs purchasing on an annual budget.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with monthly_col:
+        st.markdown(
+            """
+            <div class="plan-card">
+                <div class="plan-name">Monthly Team License</div>
+                <div class="plan-price">$50 <span>/ month</span></div>
+                <div class="plan-copy">Flexible month-to-month access for programs that prefer monthly billing.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.caption("Annual billing saves $100 compared with 12 months of monthly billing.")
+
+    left, right = st.columns(2)
     with left:
         st.markdown("#### Included")
-        st.markdown("✓ Team dashboard & analytics  \n✓ Athlete performance profiles  \n✓ Strava integration  \n✓ Team workout planning  \n✓ Coach & athlete notes")
+        st.markdown(
+            "✓ Team dashboard & analytics  \\n"
+            "✓ Athlete performance profiles  \\n"
+            "✓ Strava integration  \\n"
+            "✓ Team workout planning  \\n"
+            "✓ Coach & athlete notes"
+        )
     with right:
         st.markdown("#### Performance tools")
-        st.markdown("✓ Threshold & training analytics  \n✓ Race predictions  \n✓ Recovery tracking  \n✓ Secure team workspace  \n✓ Continuous updates")
+        st.markdown(
+            "✓ Threshold & training analytics  \\n"
+            "✓ Race predictions  \\n"
+            "✓ Recovery tracking  \\n"
+            "✓ Secure team workspace  \\n"
+            "✓ Continuous updates"
+        )
 
-    st.markdown("""
-    <div class="purchase-box">
-      <div class="purchase-title">Purchasing Information</div>
-      <div class="purchase-row"><span>Vendor / Company Name</span><strong>VEKDYN</strong></div>
-      <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div>
-      <div class="purchase-row"><span>License Type</span><strong>Annual Team License</strong></div>
-      <div class="purchase-row"><span>Standard Published Price</span><strong>$600.00 USD per year</strong></div>
-      <div class="purchase-row"><span>Billing</span><strong>Annual · billed once per year</strong></div>
-      <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div>
-    </div>""", unsafe_allow_html=True)
-    st.info("Founding-program or pilot pricing may be provided by written quote. The published standard price remains $600 per program per year.")
+    st.markdown(
+        """
+        <div class="purchase-box">
+          <div class="purchase-title">Purchasing Information</div>
+          <div class="purchase-row"><span>Vendor / Company Name</span><strong>VEKDYN</strong></div>
+          <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div>
+          <div class="purchase-row"><span>License Options</span><strong>Annual or Monthly Team License</strong></div>
+          <div class="purchase-row"><span>Published Pricing</span><strong>$500/year or $50/month</strong></div>
+          <div class="purchase-row"><span>Billing</span><strong>Annual invoice or monthly billing</strong></div>
+          <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.info(
+        "Founding-program or pilot pricing may be provided by written quote. "
+        "Published standard pricing is $500/year or $50/month per program."
+    )
+
+    st.markdown("### Request an Invoice")
+    st.caption(
+        "Coaches or university purchasing staff can prepare the information needed "
+        "for a VEKDYN invoice. No payment or banking information is collected here."
+    )
+
+    with st.form("invoice_request_form"):
+        invoice_school = st.text_input("School / Program")
+        invoice_contact = st.text_input("Coach or Purchasing Contact")
+        invoice_email = st.text_input("Contact Email")
+        invoice_plan = st.selectbox(
+            "License",
+            [
+                "Annual Team License — $500/year",
+                "Monthly Team License — $50/month",
+            ],
+        )
+        invoice_po = st.text_input("PO / Requisition Number (optional)")
+        invoice_notes = st.text_area("Purchasing Notes (optional)")
+        invoice_submit = st.form_submit_button(
+            "Prepare Invoice Request",
+            use_container_width=True,
+        )
+
+    if invoice_submit:
+        if not invoice_school.strip() or not invoice_contact.strip() or not invoice_email.strip():
+            st.error("Please enter the school/program, contact name, and contact email.")
+        else:
+            st.success("Invoice request prepared.")
+            st.markdown(
+                f"""**Vendor:** VEKDYN  
+**Product:** VEKDYN Team Platform  
+**School / Program:** {invoice_school}  
+**Contact:** {invoice_contact}  
+**Email:** {invoice_email}  
+**License:** {invoice_plan}  
+**PO / Requisition:** {invoice_po or "Not provided"}  
+**Notes:** {invoice_notes or "None"}"""
+            )
 
 
 def render_starter_page():
