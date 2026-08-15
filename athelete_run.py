@@ -23,6 +23,14 @@ import streamlit as st
 
 ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
 TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
+TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
+
+def get_team_logo(team_id):
+    for extension in (".png", ".jpg", ".jpeg", ".webp"):
+        p = TEAM_LOGOS_DIR / f"{team_id}{extension}"
+        if p.exists():
+            return p
+    return None
 
 
 
@@ -1189,6 +1197,61 @@ def render_login_page():
             st.rerun()
 
 
+def render_pricing_page():
+    """Public purchasing page for schools to verify VEKDYN pricing."""
+    st.markdown("""
+    <style>
+    .stApp{background:#f6f8f6}
+    [data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],
+    [data-testid="stStatusWidget"],[data-testid="stSidebar"],[data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapsedControl"]{display:none!important}
+    .block-container{max-width:980px;padding-top:1.6rem;padding-bottom:3rem}
+    .price-brand{font-size:28px;font-weight:800;color:#111827;margin-bottom:1.4rem}
+    .price-brand span{color:#2f9e44}
+    .price-title{text-align:center;font-size:44px;font-weight:800;color:#111827}
+    .price-sub{text-align:center;color:#6b7280;font-size:17px;margin:.4rem 0 1.3rem}
+    .price-number{text-align:center;color:#0b67c2;font-size:54px;font-weight:800}
+    .price-number span{font-size:18px;color:#374151;font-weight:500}
+    .price-caption{text-align:center;color:#6b7280;margin-top:-8px;margin-bottom:20px}
+    .purchase-box{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:22px 26px;margin-top:18px}
+    .purchase-title{font-size:21px;font-weight:800;color:#111827;margin-bottom:14px}
+    .purchase-row{display:flex;justify-content:space-between;gap:30px;border-bottom:1px solid #eef0ee;padding:10px 0;color:#374151}
+    .purchase-row:last-child{border-bottom:none}.purchase-row strong{color:#111827}
+    </style>""", unsafe_allow_html=True)
+
+    st.markdown('<div class="price-brand">VEK<span>DYN</span></div>', unsafe_allow_html=True)
+    if st.button("← Find your team"):
+        st.session_state["page"]="home"
+        st.rerun()
+
+    st.markdown(
+        '<div class="price-title">VEKDYN Team Platform</div>'
+        '<div class="price-sub">Performance and training intelligence built for distance running programs.</div>'
+        '<div class="price-number">$600 <span>/ year</span></div>'
+        '<div class="price-caption">Standard published price · per program · annual license</div>',
+        unsafe_allow_html=True)
+
+    left,right=st.columns(2)
+    with left:
+        st.markdown("#### Included")
+        st.markdown("✓ Team dashboard & analytics  \n✓ Athlete performance profiles  \n✓ Strava integration  \n✓ Team workout planning  \n✓ Coach & athlete notes")
+    with right:
+        st.markdown("#### Performance tools")
+        st.markdown("✓ Threshold & training analytics  \n✓ Race predictions  \n✓ Recovery tracking  \n✓ Secure team workspace  \n✓ Continuous updates")
+
+    st.markdown("""
+    <div class="purchase-box">
+      <div class="purchase-title">Purchasing Information</div>
+      <div class="purchase-row"><span>Vendor / Company Name</span><strong>VEKDYN</strong></div>
+      <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div>
+      <div class="purchase-row"><span>License Type</span><strong>Annual Team License</strong></div>
+      <div class="purchase-row"><span>Standard Published Price</span><strong>$600.00 USD per year</strong></div>
+      <div class="purchase-row"><span>Billing</span><strong>Annual · billed once per year</strong></div>
+      <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div>
+    </div>""", unsafe_allow_html=True)
+    st.info("Founding-program or pilot pricing may be provided by written quote. The published standard price remains $600 per program per year.")
+
+
 def render_starter_page():
     """Show the clean public team-search landing page."""
 
@@ -1320,10 +1383,13 @@ def render_starter_page():
     # BRAND
     # -----------------------------------------------------
 
-    st.markdown(
-        '<div class="starter-brand">VEK<span>DYN</span></div>',
-        unsafe_allow_html=True,
-    )
+    brand_col, pricing_col = st.columns([5, 1.25])
+    with brand_col:
+        st.markdown('<div class="starter-brand">VEK<span>DYN</span></div>', unsafe_allow_html=True)
+    with pricing_col:
+        if st.button("For Programs / Pricing", use_container_width=True, key="public_pricing"):
+            st.session_state["page"] = "pricing"
+            st.rerun()
 
     # -----------------------------------------------------
     # FIND YOUR TEAM
@@ -1381,7 +1447,11 @@ def render_starter_page():
                 recent_icon, recent_text, recent_button = st.columns([0.45, 4.2, 1.25])
 
                 with recent_icon:
-                    st.markdown("## 🏃")
+                    team_logo = get_team_logo(team_id)
+                    if team_logo:
+                        st.image(str(team_logo), width=58)
+                    else:
+                        st.markdown("## 🏃")
 
                 with recent_text:
                     st.markdown(
@@ -1517,6 +1587,10 @@ if authorization_code:
 # The landing page stays public. Opening OLLU sends visitors to login.
 if st.session_state.get("page") == "login" and not st.session_state.get("logged_in"):
     render_login_page()
+    st.stop()
+
+if st.session_state.get("page") == "pricing":
+    render_pricing_page()
     st.stop()
 
 if st.session_state.get("page") == "home":
@@ -2851,4 +2925,3 @@ with st.container(border=True):
         )
         st.caption(
             threshold.get('long_reps', {}).get('pace', '--')
-        )
