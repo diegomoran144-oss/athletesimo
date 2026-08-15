@@ -17,7 +17,6 @@ import psycopg2
 import requests
 import streamlit as st
 
-
 # =========================================================
 # OLLU ROSTER — CSV IS THE SOURCE OF TRUTH
 # =========================================================
@@ -159,7 +158,30 @@ def load_ollu_roster():
     return roster, athletes
 
 
-ollu_roster, athletes = load_ollu_roster()
+ollu_roster, ollu_athletes = load_ollu_roster()
+
+# =========================================================
+# TEAM ROSTERS
+# =========================================================
+
+# Sam Houston starts empty. When the coach sends the roster, populate this
+# dictionary in the same athlete-data structure used by OLLU.
+sam_houston_athletes = {}
+
+
+def get_team_athletes(team_id):
+    """Return only the roster for the authenticated VEKDYN team."""
+    if team_id == "ollu_distance":
+        return ollu_athletes
+
+    if team_id == "sam_houston":
+        return sam_houston_athletes
+
+    return {}
+
+
+# Used by the public landing page before a private workspace is selected.
+athletes = ollu_athletes
 
 
 # =========================================================
@@ -1350,7 +1372,7 @@ def render_starter_page():
         )
 
         for team_id, meta_text in [
-            ("ollu_distance", f"{len(athletes)} athletes connected"),
+            ("ollu_distance", f"{len(ollu_athletes)} athletes connected"),
             ("sam_houston", "Workspace being built"),
         ]:
             config = team_config(team_id)
@@ -1513,22 +1535,10 @@ if (
 active_team = st.session_state["active_team"]
 active_team_config = team_config(active_team)
 
+# The existing dashboard remains shared. Only its data source changes.
+athletes = get_team_athletes(active_team)
 
-# Sam Houston has its own authenticated workspace now. Until its roster/data
-# source is added, do not fall through into the OLLU athlete dashboard.
-if active_team == "sam_houston":
-    st.markdown("# VEKDYN")
-    st.subheader("Sam Houston Distance")
-    st.success("Private Sam Houston workspace connected.")
-    st.caption(
-        "This workspace is isolated from OLLU. Add the Sam Houston roster "
-        "and team data here as you build the second team."
-    )
 
-    if st.button("Log Out", key="sam_houston_build_logout"):
-        log_out()
-
-    st.stop()
 
 
 # =========================================================
@@ -1726,6 +1736,53 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+# =========================================================
+# EMPTY TEAM ROSTER
+# =========================================================
+
+if not athletes:
+    with st.sidebar:
+        st.markdown(
+            "## VEK<span style='color:#2f9e44'>DYN</span>",
+            unsafe_allow_html=True,
+        )
+        st.success("▣ Dashboard")
+        st.divider()
+        st.caption(active_team_config["name"])
+        st.info("Roster pending")
+
+        if st.button(
+            "Log Out",
+            key=f"empty_roster_logout_{active_team}",
+            use_container_width=True,
+        ):
+            log_out()
+
+    st.markdown(f"# {active_team_config['name']}")
+    st.markdown("## Team Dashboard")
+    st.info(
+        "No athletes have been added to this roster yet. "
+        "When the coach sends the roster, add it to the Sam Houston roster "
+        "source and this same VEKDYN dashboard will populate automatically."
+    )
+
+    status_col1, status_col2, status_col3 = st.columns(3)
+
+    with status_col1:
+        st.metric("Athletes", "0")
+
+    with status_col2:
+        st.metric("Team", active_team_config["short_name"])
+
+    with status_col3:
+        st.metric("Workspace", "Ready")
+
+    st.caption(
+        "This team's login, roster, and workspace are isolated from OLLU."
+    )
+    st.stop()
 
 
 # =========================================================
