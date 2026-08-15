@@ -35,13 +35,16 @@ def get_team_logo(team_id):
 
 
 
-def get_team_image(team_id):
-    """
-    Return the VEKDYN-controlled image saved for a team.
-    Visitors can view team branding but cannot upload or replace it.
+def get_team_image(image_id):
+    """Return a VEKDYN-controlled image from team_images by its unique ID.
+
+    Expected files:
+        team_images/landing_page.jpg   -> public landing-page banner
+        team_images/ollu_distance.jpg  -> OLLU team card image
+        team_images/sam_houston.jpg    -> Sam Houston team card image
     """
     for extension in (".png", ".jpg", ".jpeg", ".webp"):
-        image_path = TEAM_IMAGES_DIR / f"{team_id}{extension}"
+        image_path = TEAM_IMAGES_DIR / f"{image_id}{extension}"
         if image_path.exists():
             return image_path
     return None
@@ -1601,6 +1604,18 @@ def render_starter_page():
                         open_team_workspace(team_id)
 
         # -------------------------------------------------
+        # PUBLIC LANDING-PAGE IMAGE
+        # -------------------------------------------------
+
+        # This is deliberately separate from every school's card image.
+        # Save the general running photo as team_images/landing_page.jpg.
+        landing_image = get_team_image("landing_page")
+        if landing_image:
+            st.markdown('<div class="landing-banner">', unsafe_allow_html=True)
+            st.image(str(landing_image), use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # -------------------------------------------------
         # FOOTER
         # -------------------------------------------------
 
@@ -2284,7 +2299,7 @@ with st.container(border=True):
 
     with school_col:
 
-        school_logo = get_team_image("ollu_distance")
+        school_logo = get_team_logo(active_team)
 
         if school_logo is not None:
 
