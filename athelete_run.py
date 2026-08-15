@@ -17,6 +17,11 @@ import psycopg2
 import requests
 import streamlit as st
 
+Library
+/
+VEKDYN_two_team_login.py
+
+
 # =========================================================
 # OLLU ROSTER — CSV IS THE SOURCE OF TRUTH
 # =========================================================
@@ -179,10 +184,46 @@ st.set_page_config(
 LOGIN_SESSION_DAYS = 7
 
 
-def check_login(username, password):
-    """Check the coach username and password stored in Streamlit secrets."""
-    correct_username = st.secrets["coach_login"]["username"]
-    correct_password = st.secrets["coach_login"]["password"]
+TEAM_CONFIG = {
+    "ollu_distance": {
+        "name": "OLLU Distance",
+        "short_name": "OLLU",
+    },
+    "sam_houston": {
+        "name": "Sam Houston Distance",
+        "short_name": "Sam Houston",
+    },
+}
+
+
+def team_config(team_id):
+    """Return display settings for one VEKDYN team."""
+    return TEAM_CONFIG.get(
+        team_id,
+        {"name": "VEKDYN Team", "short_name": "Team"},
+    )
+
+
+def check_login(team_id, username, password):
+    """
+    Check credentials for the selected team.
+
+    secrets.toml format:
+
+    [team_logins.ollu_distance]
+    username = "..."
+    password = "..."
+
+    [team_logins.sam_houston]
+    username = "..."
+    password = "..."
+    """
+    try:
+        team_login = st.secrets["team_logins"][team_id]
+        correct_username = team_login["username"]
+        correct_password = team_login["password"]
+    except (KeyError, TypeError, FileNotFoundError):
+        return False
 
     return (
         hmac.compare_digest(str(username), str(correct_username))
@@ -201,12 +242,12 @@ def get_login_signing_secret():
         return str(st.secrets["STRAVA_CLIENT_SECRET"])
 
 
-def create_login_token(username):
-    """Create a signed login token that expires after LOGIN_SESSION_DAYS."""
+def create_login_token(username, team_id):
+    """Create a signed login token tied to one VEKDYN team."""
     expires_at = int(
         time.time() + timedelta(days=LOGIN_SESSION_DAYS).total_seconds()
     )
-    payload = f"{username}:{expires_at}"
+    payload = f"{team_id}:{username}:{expires_at}"
     signature = hmac.new(
         get_login_signing_secret().encode("utf-8"),
         payload.encode("utf-8"),
@@ -216,20 +257,20 @@ def create_login_token(username):
 
 
 def validate_login_token(token):
-    """Return the username when a signed login token is valid."""
+    """Return (username, team_id) when a signed team session is valid."""
     if not token:
         return None
 
     try:
-        username, expires_at, returned_signature = token.rsplit(":", 2)
+        team_id, username, expires_at, returned_signature = token.rsplit(":", 3)
         expires_at = int(expires_at)
     except (ValueError, TypeError):
         return None
 
-    if time.time() > expires_at:
+    if team_id not in TEAM_CONFIG or time.time() > expires_at:
         return None
 
-    payload = f"{username}:{expires_at}"
+    payload = f"{team_id}:{username}:{expires_at}"
     expected_signature = hmac.new(
         get_login_signing_secret().encode("utf-8"),
         payload.encode("utf-8"),
@@ -239,23 +280,23 @@ def validate_login_token(token):
     if not hmac.compare_digest(returned_signature, expected_signature):
         return None
 
-    return username
+    return username, team_id
 
 
 def restore_login_session():
-    """Restore an authenticated VEKDYN session after a browser refresh."""
+    """Restore the correct team workspace after a browser refresh."""
     if st.session_state.get("logged_in"):
         return
 
     login_token = st.query_params.get("session")
-    username = validate_login_token(login_token)
+    restored = validate_login_token(login_token)
 
-    if username:
+    if restored:
+        username, team_id = restored
         st.session_state["logged_in"] = True
         st.session_state["logged_in_user"] = username
-        st.session_state["active_team"] = "ollu_distance"
+        st.session_state["active_team"] = team_id
         st.session_state["page"] = "dashboard"
-
 
 def log_out():
     """End the current VEKDYN login session."""
@@ -1037,21 +1078,39 @@ def lactate_value(threshold_lactate, key):
         return str(value)
 
 
-def open_ollu_workspace():
-    """Send a visitor to login before exposing the private team dashboard."""
-    st.session_state["pending_team"] = "ollu_distance"
+def open_team_workspace(team_id):
+    """Send a visitor to the selected team's protected VEKDYN workspace."""
+    if team_id not in TEAM_CONFIG:
+        st.error("That VEKDYN team workspace is not configured.")
+        return
 
-    if st.session_state.get("logged_in"):
-        st.session_state["active_team"] = "ollu_distance"
+    # A session authenticated for one school must not silently open another.
+    if (
+        st.session_state.get("logged_in")
+        and st.session_state.get("active_team") == team_id
+    ):
         st.session_state["page"] = "dashboard"
     else:
+        st.session_state["logged_in"] = False
+        st.session_state.pop("logged_in_user", None)
+        st.session_state["pending_team"] = team_id
         st.session_state["page"] = "login"
+
+        if "session" in st.query_params:
+            del st.query_params["session"]
 
     st.rerun()
 
 
 def render_login_page():
-    """Coach login shown only after a protected team is opened."""
+    """Show the login page for whichever VEKDYN team was selected."""
+    pending_team = (
+        st.session_state.get("pending_team")
+        or st.session_state.get("active_team")
+        or "ollu_distance"
+    )
+    config = team_config(pending_team)
+
     st.markdown(
         """
         <style>
@@ -1064,35 +1123,52 @@ def render_login_page():
     )
 
     st.markdown("# VEKDYN")
-    st.subheader("OLLU Distance — Coach Login")
-    st.caption("Sign in to access the private athlete dashboard.")
+    st.subheader(f"{config['name']} — Coach Login")
+    st.caption("Sign in to access this private team workspace.")
 
-    username = st.text_input("Username", key="coach_username")
-    password = st.text_input("Password", type="password", key="coach_password")
+    username = st.text_input(
+        "Username",
+        key=f"coach_username_{pending_team}",
+    )
+    password = st.text_input(
+        "Password",
+        type="password",
+        key=f"coach_password_{pending_team}",
+    )
 
     login_col, back_col = st.columns(2)
+
     with login_col:
-        if st.button("Log In", type="primary", use_container_width=True):
-            if check_login(username, password):
+        if st.button(
+            "Log In",
+            type="primary",
+            use_container_width=True,
+            key=f"login_{pending_team}",
+        ):
+            if check_login(pending_team, username, password):
                 st.session_state["logged_in"] = True
                 st.session_state["logged_in_user"] = username
-                st.session_state["active_team"] = (
-                    st.session_state.get("pending_team") or "ollu_distance"
-                )
+                st.session_state["active_team"] = pending_team
+                st.session_state["pending_team"] = None
                 st.session_state["page"] = "dashboard"
 
-                # Keep the coach authenticated across browser refreshes.
-                st.query_params["session"] = create_login_token(username)
+                st.query_params["session"] = create_login_token(
+                    username,
+                    pending_team,
+                )
                 st.rerun()
             else:
-                st.error("Incorrect username or password.")
+                st.error("Incorrect username or password for this team.")
 
     with back_col:
-        if st.button("← Back", use_container_width=True):
+        if st.button(
+            "← Back",
+            use_container_width=True,
+            key=f"back_from_{pending_team}_login",
+        ):
             st.session_state["page"] = "home"
             st.session_state["pending_team"] = None
             st.rerun()
-
 
 
 def render_starter_page():
@@ -1255,12 +1331,17 @@ def render_starter_page():
         normalized_search = school_search.strip().casefold()
 
         if normalized_search:
-            ollu_matches = any(
-                phrase in "our lady of the lake university ollu distance san antonio"
+            searchable_teams = (
+                "our lady of the lake university ollu distance san antonio "
+                "sam houston state university sam houston shsu distance huntsville"
+            )
+
+            team_matches = any(
+                phrase in searchable_teams
                 for phrase in normalized_search.split()
             )
 
-            if not ollu_matches:
+            if not team_matches:
                 st.info("No team account matches that search yet.")
 
         # -------------------------------------------------
@@ -1272,28 +1353,34 @@ def render_starter_page():
             unsafe_allow_html=True,
         )
 
-        with st.container(border=True):
-            recent_icon, recent_text, recent_button = st.columns([0.45, 4.2, 1.25])
+        for team_id, meta_text in [
+            ("ollu_distance", f"{len(athletes)} athletes connected"),
+            ("sam_houston", "Workspace being built"),
+        ]:
+            config = team_config(team_id)
 
-            with recent_icon:
-                st.markdown("## 🏃")
+            with st.container(border=True):
+                recent_icon, recent_text, recent_button = st.columns([0.45, 4.2, 1.25])
 
-            with recent_text:
-                st.markdown(
-                    '<div class="recent-team-name">OLLU Distance</div>'
-                    f'<div class="recent-team-meta">{len(athletes)} athletes connected</div>',
-                    unsafe_allow_html=True,
-                )
+                with recent_icon:
+                    st.markdown("## 🏃")
 
-            with recent_button:
-                st.write("")
-                if st.button(
-                    "Open Team →",
-                    key="open_recent_team",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    open_ollu_workspace()
+                with recent_text:
+                    st.markdown(
+                        f'<div class="recent-team-name">{config["name"]}</div>'
+                        f'<div class="recent-team-meta">{meta_text}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                with recent_button:
+                    st.write("")
+                    if st.button(
+                        "Open Team →",
+                        key=f"open_{team_id}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        open_team_workspace(team_id)
 
         # -------------------------------------------------
         # TEAM / LANDING IMAGE
@@ -1414,17 +1501,37 @@ if st.session_state.get("page") == "login" and not st.session_state.get("logged_
     render_login_page()
     st.stop()
 
-if st.session_state.get("page") == "home" and st.session_state.get("active_team") != "ollu_distance":
+if st.session_state.get("page") == "home":
     render_starter_page()
     st.stop()
 
-# Never expose the athlete dashboard without an authenticated coach session.
+# Never expose any team dashboard without authentication for that workspace.
 if (
     not st.session_state.get("logged_in")
-    or st.session_state.get("active_team") != "ollu_distance"
+    or st.session_state.get("active_team") not in TEAM_CONFIG
 ):
     st.session_state["page"] = "login"
     render_login_page()
+    st.stop()
+
+active_team = st.session_state["active_team"]
+active_team_config = team_config(active_team)
+
+
+# Sam Houston has its own authenticated workspace now. Until its roster/data
+# source is added, do not fall through into the OLLU athlete dashboard.
+if active_team == "sam_houston":
+    st.markdown("# VEKDYN")
+    st.subheader("Sam Houston Distance")
+    st.success("Private Sam Houston workspace connected.")
+    st.caption(
+        "This workspace is isolated from OLLU. Add the Sam Houston roster "
+        "and team data here as you build the second team."
+    )
+
+    if st.button("Log Out", key="sam_houston_build_logout"):
+        log_out()
+
     st.stop()
 
 
@@ -1555,6 +1662,70 @@ st.markdown(
             line-height: 1.55;
             white-space: pre-wrap;
         }
+
+        .team-workout-title {
+            font-size: 28px;
+            font-weight: 760;
+            color: #111827;
+            margin-top: 10px;
+            margin-bottom: 2px;
+        }
+
+        .team-workout-subtitle {
+            color: #6b7280;
+            font-size: 14px;
+            margin-bottom: 12px;
+        }
+
+        .team-workout-card {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 16px;
+            min-height: 245px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
+        }
+
+        .team-workout-date {
+            color: #6b7280;
+            font-size: 12px;
+            font-weight: 650;
+            margin-bottom: 6px;
+        }
+
+        .team-workout-type {
+            color: #111827;
+            font-size: 18px;
+            font-weight: 760;
+            margin-bottom: 13px;
+        }
+
+        .team-workout-detail {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            color: #374151;
+            font-size: 13px;
+            line-height: 1.4;
+            margin-bottom: 10px;
+        }
+
+        .team-workout-label {
+            color: #2f9e44;
+            font-size: 11px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: .3px;
+        }
+
+        .team-workout-notes {
+            border-top: 1px solid #eef0ee;
+            margin-top: 12px;
+            padding-top: 10px;
+            color: #6b7280;
+            font-size: 12px;
+            line-height: 1.45;
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1667,8 +1838,8 @@ with st.sidebar:
 
     st.divider()
 
-    st.caption("Coach Zarate")
-    st.caption("OLLU Distance")
+    st.caption("Coach")
+    st.caption(active_team_config["name"])
 
     if st.button(
         "Log Out",
@@ -1762,8 +1933,8 @@ with st.sidebar:
         st.caption("This athlete has not connected Strava yet.")
 
     st.write("")
-    st.caption("Coach Zarate")
-    st.caption("OLLU Distance")
+    st.caption("Coach")
+    st.caption(active_team_config["name"])
 
 
 # =========================================================
@@ -2263,45 +2434,6 @@ with notes_compose_col:
 
 
 # =========================================================
-# THRESHOLD LACTATE PROFILE
-# =========================================================
-
-st.subheader("Threshold Lactate Profile")
-
-threshold = athlete.get("threshold", {})
-
-with st.container(border=True):
-
-    short_col, medium_col, long_col = st.columns(3)
-
-    with short_col:
-        st.metric(
-            "Short Reps (1-3 min)",
-            f"{threshold.get('short_reps', {}).get('lactate', '--')} mmol"
-        )
-        st.caption(
-            threshold.get('short_reps', {}).get('pace', '--')
-        )
-
-    with medium_col:
-        st.metric(
-            "Medium Reps (5-10 min)",
-            f"{threshold.get('medium_reps', {}).get('lactate', '--')} mmol"
-        )
-        st.caption(
-            threshold.get('medium_reps', {}).get('pace', '--')
-        )
-
-    with long_col:
-        st.metric(
-            "Long Reps (10-15 min)",
-            f"{threshold.get('long_reps', {}).get('lactate', '--')} mmol"
-        )
-        st.caption(
-            threshold.get('long_reps', {}).get('pace', '--')
-        )
-
-# =========================================================
 # PERFORMANCE PREDICTIONS
 # =========================================================
 
@@ -2382,4 +2514,288 @@ with st.container(border=True):
         st.progress(
             factors.get("speed_reserve", 0) / 100,
             text="Speed Reserve"
+        )
+
+
+# =========================================================
+# TEAM WORKOUTS — EXCEL IMPORT
+# =========================================================
+
+TEAM_WORKOUT_COLUMNS = [
+    "Date",
+    "Type",
+    "Warm Up",
+    "Workout",
+    "Cool Down",
+    "Notes",
+]
+
+
+def load_team_training_plan(uploaded_file):
+    """
+    Read one team-wide Excel training plan.
+
+    Expected columns:
+        Date | Type | Warm Up | Workout | Cool Down | Notes
+
+    The plan belongs to the whole team, so there is intentionally
+    no athlete column.
+    """
+    try:
+        plan = pd.read_excel(uploaded_file)
+    except Exception as error:
+        raise ValueError(f"VEKDYN could not read that Excel file: {error}") from error
+
+    # Normalize accidental leading/trailing spaces in Excel headers.
+    plan.columns = [str(column).strip() for column in plan.columns]
+
+    missing_columns = [
+        column
+        for column in TEAM_WORKOUT_COLUMNS
+        if column not in plan.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "The training plan is missing these columns: "
+            + ", ".join(missing_columns)
+        )
+
+    plan = plan[TEAM_WORKOUT_COLUMNS].copy()
+
+    plan["Date"] = pd.to_datetime(
+        plan["Date"],
+        errors="coerce",
+    )
+
+    plan = plan.dropna(subset=["Date"])
+
+    for column in ["Type", "Warm Up", "Workout", "Cool Down", "Notes"]:
+        plan[column] = (
+            plan[column]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+    # A workout needs at least the main Workout field.
+    plan = plan[
+        plan["Workout"].str.len() > 0
+    ].copy()
+
+    plan = plan.sort_values("Date").reset_index(drop=True)
+
+    if plan.empty:
+        raise ValueError(
+            "No valid workouts were found. Make sure Date and Workout are filled in."
+        )
+
+    return plan
+
+
+def workout_value(value, fallback="—"):
+    """Return a clean display value for workout-card text."""
+    value = str(value).strip()
+
+    if not value or value.lower() == "nan":
+        return fallback
+
+    return value
+
+
+def render_team_workout_card(workout):
+    """Render one workout using the clean VEKDYN card style."""
+    workout_date = pd.Timestamp(workout["Date"])
+    date_label = workout_date.strftime("%a, %b %d")
+
+    workout_type = html.escape(
+        workout_value(workout.get("Type"), "Team Training")
+    )
+    warm_up = html.escape(
+        workout_value(workout.get("Warm Up"))
+    )
+    main_workout = html.escape(
+        workout_value(workout.get("Workout"))
+    )
+    cool_down = html.escape(
+        workout_value(workout.get("Cool Down"))
+    )
+    notes = html.escape(
+        workout_value(workout.get("Notes"), "")
+    )
+
+    details_html = (
+        f'<div class="team-workout-detail">'
+        f'<span class="team-workout-label">Warm-up</span>'
+        f'<span>{warm_up}</span>'
+        f'</div>'
+        f'<div class="team-workout-detail">'
+        f'<span class="team-workout-label">Workout</span>'
+        f'<span>{main_workout}</span>'
+        f'</div>'
+        f'<div class="team-workout-detail">'
+        f'<span class="team-workout-label">Cool-down</span>'
+        f'<span>{cool_down}</span>'
+        f'</div>'
+    )
+
+    notes_html = ""
+    if notes:
+        notes_html = (
+            f'<div class="team-workout-notes">'
+            f'<span class="team-workout-label">Coach notes</span><br>'
+            f'{notes}'
+            f'</div>'
+        )
+
+    st.markdown(
+        f"""
+        <div class="team-workout-card">
+            <div class="team-workout-date">{date_label}</div>
+            <div class="team-workout-type">{workout_type}</div>
+            {details_html}
+            {notes_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_team_workouts():
+    """
+    Import and display the shared OLLU team plan.
+
+    This first version keeps the imported workbook in Streamlit session state.
+    The next persistence step can save the same rows to Neon by team_id.
+    """
+    st.markdown(
+        '<div class="team-workout-title">Upcoming Workouts</div>'
+        '<div class="team-workout-subtitle">'
+        'Team-wide training assigned by the coach.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Coach import control stays compact so the workout cards remain the focus.
+    with st.expander("Import team training plan (.xlsx)", expanded=False):
+        st.caption(
+            "Excel columns: Date, Type, Warm Up, Workout, Cool Down, Notes. "
+            "The same plan is shown for the entire roster."
+        )
+
+        uploaded_plan = st.file_uploader(
+            "Upload Excel training plan",
+            type=["xlsx"],
+            key="team_training_plan_upload",
+            label_visibility="collapsed",
+        )
+
+        if uploaded_plan is not None:
+            try:
+                preview_plan = load_team_training_plan(uploaded_plan)
+
+                st.dataframe(
+                    preview_plan,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                if st.button(
+                    "Import Workouts",
+                    key="import_team_workouts_button",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    plan_key = f"team_training_plan_{active_team}"
+                    plan_name_key = f"team_training_plan_name_{active_team}"
+                    st.session_state[plan_key] = preview_plan
+                    st.session_state[plan_name_key] = uploaded_plan.name
+                    st.success(
+                        f"{len(preview_plan)} team workouts imported into VEKDYN."
+                    )
+                    st.rerun()
+
+            except ValueError as error:
+                st.warning(str(error))
+
+    plan_key = f"team_training_plan_{active_team}"
+    training_plan = st.session_state.get(plan_key)
+
+    if training_plan is None or training_plan.empty:
+        st.info(
+            "No team training plan has been imported yet. "
+            "Upload the coach's Excel plan to populate this section."
+        )
+        return
+
+    today = pd.Timestamp.now(tz=TEAM_TIMEZONE).tz_localize(None).normalize()
+
+    upcoming = training_plan[
+        training_plan["Date"].dt.normalize() >= today
+    ].copy()
+
+    # If the plan has no future dates, show the most recent workouts instead
+    # so the section never looks broken during a demo.
+    if upcoming.empty:
+        upcoming = training_plan.tail(4).copy()
+        st.caption("No future workouts are entered. Showing the most recent sessions.")
+    else:
+        upcoming = upcoming.head(4)
+
+    source_name = st.session_state.get(
+        f"team_training_plan_name_{active_team}"
+    )
+    if source_name:
+        st.caption(f"Training plan source: {source_name}")
+
+    workout_columns = st.columns(len(upcoming), gap="medium")
+
+    for column, (_, workout) in zip(
+        workout_columns,
+        upcoming.iterrows(),
+    ):
+        with column:
+            render_team_workout_card(workout)
+
+
+render_team_workouts()
+
+
+# =========================================================
+# THRESHOLD LACTATE PROFILE
+# =========================================================
+
+st.subheader("Threshold Lactate Profile")
+
+threshold = athlete.get("threshold", {})
+
+with st.container(border=True):
+
+    short_col, medium_col, long_col = st.columns(3)
+
+    with short_col:
+        st.metric(
+            "Short Reps (1-3 min)",
+            f"{threshold.get('short_reps', {}).get('lactate', '--')} mmol"
+        )
+        st.caption(
+            threshold.get('short_reps', {}).get('pace', '--')
+        )
+
+    with medium_col:
+        st.metric(
+            "Medium Reps (5-10 min)",
+            f"{threshold.get('medium_reps', {}).get('lactate', '--')} mmol"
+        )
+        st.caption(
+            threshold.get('medium_reps', {}).get('pace', '--')
+        )
+
+    with long_col:
+        st.metric(
+            "Long Reps (10-15 min)",
+            f"{threshold.get('long_reps', {}).get('lactate', '--')} mmol"
+        )
+        st.caption(
+            threshold.get('long_reps', {}).get('pace', '--')
         )
