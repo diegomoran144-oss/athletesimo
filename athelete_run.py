@@ -2671,87 +2671,491 @@ with notes_compose_col:
                 st.error(f"The note could not be saved to Neon: {error}")
 
 
+
 # =========================================================
-# PERFORMANCE PREDICTIONS
+# VEKDYN PERFORMANCE PREDICTION ENGINE
 # =========================================================
 
-prediction = athlete.get("prediction", {})
+def vekdyn_time_to_seconds(value):
+    """Convert race/pace strings such as 1:55.20, 14:55, or 5:05/mi to seconds."""
+    if value in (None, "", "--"):
+        return None
+
+    clean = str(value).strip().lower()
+    clean = clean.replace("/mile", "").replace("/mi", "").replace("per mile", "")
+    clean = re.sub(r"[^0-9:.]", "", clean)
+
+    if not clean:
+        return None
+
+    try:
+        parts = clean.split(":")
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def vekdyn_seconds_to_time(seconds, decimals=1):
+    if seconds is None:
+        return "--"
+
+    minutes = int(seconds // 60)
+    remaining = seconds - (minutes * 60)
+
+    if decimals == 0:
+        return f"{minutes}:{int(round(remaining)):02d}"
+
+    width = 3 + decimals
+    return f"{minutes}:{remaining:0{width}.{decimals}f}"
+
+
+def vekdyn_linear_score(value, slow_value, fast_value, low_score, high_score):
+    """Continuous score where a lower time/pace is better."""
+    if value is None:
+        return 0
+
+    if value >= slow_value:
+        return int(round(low_score))
+    if value <= fast_value:
+        return int(round(high_score))
+
+    fraction = (slow_value - value) / (slow_value - fast_value)
+    return int(round(low_score + fraction * (high_score - low_score)))
+
+
+def vekdyn_speed_reserve_score(eight_seconds):
+    """Male distance-runner speed-reserve scale discussed for VEKDYN."""
+    if eight_seconds is None:
+        return 0, "No 800m PB"
+
+    if eight_seconds >= 125:
+        return 12, "Low"
+    if eight_seconds >= 120:
+        return vekdyn_linear_score(eight_seconds, 125, 120, 15, 30), "Low"
+    if eight_seconds >= 118:
+        return vekdyn_linear_score(eight_seconds, 120, 118, 30, 45), "Developing"
+    if eight_seconds >= 115:
+        return vekdyn_linear_score(eight_seconds, 118, 115, 45, 65), "Good"
+    if eight_seconds >= 110:
+        return vekdyn_linear_score(eight_seconds, 115, 110, 65, 88), "Elite"
+    return min(100, vekdyn_linear_score(eight_seconds, 110, 105, 88, 100)), "National"
+
+
+def vekdyn_aerobic_score(five_k_seconds):
+    """Continuous 5K ability score using the VEKDYN male distance framework."""
+    if five_k_seconds is None:
+        return 0, "No 5K PB"
+
+    if five_k_seconds >= 1050:       # 17:30+
+        return 12, "Low"
+    if five_k_seconds >= 990:        # 17:30-16:30
+        return vekdyn_linear_score(five_k_seconds, 1050, 990, 15, 28), "Low"
+    if five_k_seconds >= 930:        # 16:30-15:30
+        return vekdyn_linear_score(five_k_seconds, 990, 930, 28, 43), "Okay"
+    if five_k_seconds >= 880:        # 15:30-14:40
+        return vekdyn_linear_score(five_k_seconds, 930, 880, 43, 65), "Good"
+    if five_k_seconds >= 840:        # 14:40-14:00
+        return vekdyn_linear_score(five_k_seconds, 880, 840, 65, 82), "Competitive"
+    if five_k_seconds >= 810:        # 14:00-13:30
+        return vekdyn_linear_score(five_k_seconds, 840, 810, 82, 92), "Elite"
+    return min(100, vekdyn_linear_score(five_k_seconds, 810, 780, 92, 100)), "National Competitive"
+
+
+def vekdyn_parse_lactate(value):
+    if value in (None, "", "--"):
+        return None
+    match = re.search(r"\d+(?:\.\d+)?", str(value))
+    return float(match.group()) if match else None
+
+
+def vekdyn_threshold_profile(threshold):
+    """
+    Use the fastest entered threshold pace that remains controlled at 2.0-3.5 mmol.
+    If no controlled sample exists, fall back to the best usable entered sample
+    but lower the score/confidence.
+    """
+    samples = []
+
+    for rep_name in ("short_reps", "medium_reps", "long_reps"):
+        rep = threshold.get(rep_name, {}) or {}
+        pace_seconds = vekdyn_time_to_seconds(rep.get("pace"))
+        lactate = vekdyn_parse_lactate(rep.get("lactate"))
+
+        if pace_seconds is not None and lactate is not None:
+            samples.append({
+                "rep": rep_name,
+                "pace": pace_seconds,
+                "lactate": lactate,
+            })
+
+    if not samples:
+        return 0, "No LT data", None, False
+
+    controlled = [
+        sample for sample in samples
+        if 2.0 <= sample["lactate"] <= 3.5
+    ]
+
+    if controlled:
+        best = min(controlled, key=lambda sample: sample["pace"])
+        pace = best["pace"]
+
+        if pace >= 345:
+            score, label = 20, "Low"
+        elif pace >= 325:
+            score, label = vekdyn_linear_score(pace, 345, 325, 25, 40), "Developing"
+        elif pace >= 305:
+            score, label = vekdyn_linear_score(pace, 325, 305, 40, 60), "Good"
+        elif pace >= 290:
+            score, label = vekdyn_linear_score(pace, 305, 290, 60, 76), "Very Good"
+        elif pace >= 275:
+            score, label = vekdyn_linear_score(pace, 290, 275, 76, 90), "Elite"
+        else:
+            score, label = min(100, vekdyn_linear_score(pace, 275, 260, 90, 100)), "Exceptional"
+
+        # Reward a stable controlled profile across multiple entered rep lengths.
+        if len(controlled) >= 2:
+            score = min(100, score + 3)
+        if len(controlled) >= 3:
+            score = min(100, score + 2)
+
+        return score, label, best, True
+
+    best = min(samples, key=lambda sample: abs(sample["lactate"] - 2.75))
+    return 30, "LT uncertain", best, False
+
+
+def vekdyn_recent_mileage(volume_data):
+    """Average up to the four most recent non-zero weekly mileage values."""
+    if volume_data is None or getattr(volume_data, "empty", True):
+        return None
+
+    try:
+        miles = pd.to_numeric(volume_data["Mileage"], errors="coerce").dropna()
+        miles = miles[miles > 0].tail(4)
+        if miles.empty:
+            return None
+        return float(miles.mean())
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def vekdyn_volume_compatibility(eight_seconds, weekly_miles):
+    """
+    VEKDYN volume/speed-reserve compatibility heuristic.
+    This is a performance-model assumption, not a safety cutoff.
+    """
+    if eight_seconds is None or weekly_miles is None:
+        return 50, "Unknown"
+
+    if eight_seconds >= 120:
+        target_low, target_high = 45, 60
+    elif eight_seconds >= 118:
+        target_low, target_high = 50, 65
+    elif eight_seconds >= 115:
+        target_low, target_high = 60, 75
+    elif eight_seconds >= 110:
+        target_low, target_high = 65, 85
+    else:
+        target_low, target_high = 70, 95
+
+    if target_low <= weekly_miles <= target_high:
+        return 92, "Matched"
+
+    if weekly_miles < target_low:
+        gap = target_low - weekly_miles
+        return max(35, int(round(88 - gap * 3))), "Below model range"
+
+    gap = weekly_miles - target_high
+    return max(35, int(round(85 - gap * 2.5))), "Check elasticity"
+
+
+VEKDYN_800_GRID = [122, 119, 117, 115, 112, 110, 108]
+VEKDYN_5K_GRID = [990, 930, 900, 880, 860, 840, 820, 800]
+
+# Midpoints (seconds) of the mile ranges we built together.
+VEKDYN_MILE_MATRIX = [
+    [280, 269, 263.5, 260, 257, 254, 251, 248],      # 2:02
+    [274, 265.5, 260, 257, 254, 251, 248, 245],      # 1:59
+    [271, 262.5, 258, 255, 252, 249, 246, 243],      # 1:57
+    [268, 260.5, 256, 253, 250, 247, 244, 241],      # 1:55
+    [264, 256.5, 252, 249, 246, 243, 240, 237],      # 1:52
+    [261, 253.5, 249, 246, 243, 240, 237, 234],      # 1:50
+    [258, 250.5, 246, 243, 240.5, 237, 234, 231],    # 1:48
+]
+
+
+def vekdyn_interpolate_1d(x, x1, x2, y1, y2):
+    if x1 == x2:
+        return y1
+    fraction = (x - x1) / (x2 - x1)
+    return y1 + fraction * (y2 - y1)
+
+
+def vekdyn_bracket(value, grid, descending=False):
+    ordered = sorted(grid, reverse=descending)
+
+    if descending:
+        if value >= ordered[0]:
+            return ordered[0], ordered[0]
+        if value <= ordered[-1]:
+            return ordered[-1], ordered[-1]
+        for a, b in zip(ordered, ordered[1:]):
+            if a >= value >= b:
+                return a, b
+    else:
+        if value <= ordered[0]:
+            return ordered[0], ordered[0]
+        if value >= ordered[-1]:
+            return ordered[-1], ordered[-1]
+        for a, b in zip(ordered, ordered[1:]):
+            if a <= value <= b:
+                return a, b
+
+    return ordered[-1], ordered[-1]
+
+
+def vekdyn_base_mile_prediction(eight_seconds, five_k_seconds):
+    """
+    Bilinear interpolation across the VEKDYN 800 x 5K matrix.
+    This avoids snapping a 1:53.4 / 14:32 athlete to a single box.
+    """
+    if eight_seconds is None or five_k_seconds is None:
+        return None
+
+    # Clamp only outside the current calibration surface.
+    eight = max(min(eight_seconds, max(VEKDYN_800_GRID)), min(VEKDYN_800_GRID))
+    five_k = max(min(five_k_seconds, max(VEKDYN_5K_GRID)), min(VEKDYN_5K_GRID))
+
+    e_fast, e_slow = vekdyn_bracket(eight, VEKDYN_800_GRID, descending=False)
+    f_fast, f_slow = vekdyn_bracket(five_k, VEKDYN_5K_GRID, descending=False)
+
+    def matrix_value(e_value, f_value):
+        row = VEKDYN_800_GRID.index(e_value)
+        col = VEKDYN_5K_GRID.index(f_value)
+        return VEKDYN_MILE_MATRIX[row][col]
+
+    q11 = matrix_value(e_fast, f_fast)
+    q12 = matrix_value(e_fast, f_slow)
+    q21 = matrix_value(e_slow, f_fast)
+    q22 = matrix_value(e_slow, f_slow)
+
+    if f_fast == f_slow:
+        top = q11
+        bottom = q21
+    else:
+        top = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q11, q12)
+        bottom = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q21, q22)
+
+    if e_fast == e_slow:
+        return top
+
+    return vekdyn_interpolate_1d(eight, e_fast, e_slow, top, bottom)
+
+
+def vekdyn_elasticity_modifier(status="Preserved"):
+    """
+    The current VEKDYN model assumes elasticity/speed expression is preserved
+    unless the athlete/coach marks evidence that it is not.
+    """
+    modifiers = {
+        "Preserved": 0.0,
+        "Moderately Preserved": 2.0,
+        "Uncertain": 4.0,
+        "Suppressed": 7.0,
+    }
+    return modifiers.get(status, 0.0)
+
+
+def vekdyn_predict_1500(
+    personal_bests,
+    threshold,
+    volume_data,
+    elasticity_status="Preserved",
+):
+    eight_seconds = vekdyn_time_to_seconds(personal_bests.get("800"))
+    five_k_seconds = vekdyn_time_to_seconds(personal_bests.get("5k"))
+
+    speed_score, speed_label = vekdyn_speed_reserve_score(eight_seconds)
+    aerobic_score, aerobic_label = vekdyn_aerobic_score(five_k_seconds)
+    threshold_score, threshold_label, lt_sample, lt_controlled = (
+        vekdyn_threshold_profile(threshold)
+    )
+
+    weekly_miles = vekdyn_recent_mileage(volume_data)
+    volume_score, volume_label = vekdyn_volume_compatibility(
+        eight_seconds,
+        weekly_miles,
+    )
+
+    base_mile = vekdyn_base_mile_prediction(eight_seconds, five_k_seconds)
+
+    if base_mile is None:
+        return {
+            "available": False,
+            "reason": "An 800m PB and 5K PB are needed for the VEKDYN prediction.",
+            "speed_score": speed_score,
+            "aerobic_score": aerobic_score,
+            "threshold_score": threshold_score,
+            "volume_score": volume_score,
+            "elasticity_score": 90 if elasticity_status == "Preserved" else 65,
+        }
+
+    adjusted_mile = base_mile + vekdyn_elasticity_modifier(elasticity_status)
+
+    # Convert the predicted mile capability to 1500m at the same average pace.
+    # A small range is shown because the model is a capability estimate, not a guarantee.
+    predicted_1500 = adjusted_mile * (1500.0 / 1609.344)
+
+    evidence = 0
+    evidence += 1 if eight_seconds is not None else 0
+    evidence += 1 if five_k_seconds is not None else 0
+    evidence += 1 if weekly_miles is not None else 0
+    evidence += 1 if lt_sample is not None else 0
+
+    confidence = 52
+    confidence += 12 if eight_seconds is not None else 0
+    confidence += 15 if five_k_seconds is not None else 0
+    confidence += 8 if weekly_miles is not None else 0
+    confidence += 8 if lt_controlled else (3 if lt_sample is not None else 0)
+    confidence += 4 if volume_label == "Matched" else 0
+    confidence += 3 if elasticity_status == "Preserved" else 0
+    confidence = min(95, confidence)
+
+    # Wider range when supporting training data is missing.
+    half_range = 3.0
+    if lt_sample is None:
+        half_range += 1.5
+    if weekly_miles is None:
+        half_range += 1.0
+    if elasticity_status in {"Uncertain", "Suppressed"}:
+        half_range += 1.5
+
+    return {
+        "available": True,
+        "mile_seconds": adjusted_mile,
+        "mile_display": vekdyn_seconds_to_time(adjusted_mile, 1),
+        "1500_seconds": predicted_1500,
+        "1500_low": vekdyn_seconds_to_time(predicted_1500 - half_range, 1),
+        "1500_mid": vekdyn_seconds_to_time(predicted_1500, 1),
+        "1500_high": vekdyn_seconds_to_time(predicted_1500 + half_range, 1),
+        "1500_range": (
+            f"{vekdyn_seconds_to_time(predicted_1500 - half_range, 1)}"
+            f"–{vekdyn_seconds_to_time(predicted_1500 + half_range, 1)}"
+        ),
+        "confidence": confidence,
+        "speed_score": speed_score,
+        "speed_label": speed_label,
+        "aerobic_score": aerobic_score,
+        "aerobic_label": aerobic_label,
+        "threshold_score": threshold_score,
+        "threshold_label": threshold_label,
+        "volume_score": volume_score,
+        "volume_label": volume_label,
+        "weekly_miles": weekly_miles,
+        "elasticity_score": (
+            92 if elasticity_status == "Preserved"
+            else 75 if elasticity_status == "Moderately Preserved"
+            else 58 if elasticity_status == "Uncertain"
+            else 40
+        ),
+        "elasticity_status": elasticity_status,
+        "lt_sample": lt_sample,
+    }
+
+
+# =========================================================
+# PERFORMANCE PREDICTIONS — LIVE VEKDYN MODEL
+# =========================================================
+
+threshold_for_prediction = athlete.get("threshold", {})
+
+# The current model assumes the athlete's elasticity/speed qualities are being
+# preserved unless future athlete/coach data says otherwise.
+elasticity_status = athlete.get("elasticity_status", "Preserved")
+
+vekdyn_prediction = vekdyn_predict_1500(
+    personal_bests=personal_bests,
+    threshold=threshold_for_prediction,
+    volume_data=volume_data,
+    elasticity_status=elasticity_status,
+)
 
 with st.container(border=True):
 
     st.subheader("Performance Predictions")
 
     st.caption(
-        "Based on current fitness, training load, recovery, "
-        "threshold profile, and historical performances"
+        "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
+        "supported by threshold, volume compatibility, and preserved elasticity."
     )
 
-    prediction_col, confidence_col, factors_col = st.columns([2,1,2])
-
+    prediction_col, confidence_col, factors_col = st.columns([2, 1, 2])
 
     with prediction_col:
-
         st.caption("Predicted 1500m Range")
 
-        predicted_time = prediction.get(
-            "1500m",
-            {}
-        ).get(
-            "range",
-            "--"
-        )
+        if vekdyn_prediction["available"]:
+            st.markdown(f"## {vekdyn_prediction['1500_range']}")
+            st.caption(
+                f"Estimated mile capability: {vekdyn_prediction['mile_display']}"
+            )
+        else:
+            st.markdown("## --")
+            st.caption(vekdyn_prediction["reason"])
 
-        st.markdown(
-            f"## {predicted_time}"
-        )
-
-        st.caption(
-            "Prediction updates as training data changes."
-        )
-
+        st.caption("Prediction updates as athlete and training data change.")
 
     with confidence_col:
-
-        confidence = prediction.get(
-            "1500m",
-            {}
-        ).get(
-            "confidence",
-            "--"
-        )
+        confidence = vekdyn_prediction.get("confidence", 0)
 
         st.metric(
             "Confidence",
             f"{confidence}%"
         )
 
-        st.caption(
-            "High Confidence"
-        )
+        if confidence >= 85:
+            confidence_label = "High Confidence"
+        elif confidence >= 70:
+            confidence_label = "Moderate Confidence"
+        else:
+            confidence_label = "Developing Confidence"
 
+        st.caption(confidence_label)
+
+        recent_miles = vekdyn_prediction.get("weekly_miles")
+        if recent_miles is not None:
+            st.caption(f"Recent volume: {recent_miles:.1f} mi/wk")
 
     with factors_col:
-
         st.write("**Performance Factors**")
 
-        factors = prediction.get(
-            "factors",
-            {}
-        )
-
         st.progress(
-            factors.get("aerobic_fitness",0)/100,
+            vekdyn_prediction.get("aerobic_score", 0) / 100,
             text="Aerobic Fitness"
         )
 
         st.progress(
-            factors.get("threshold_fitness",0)/100,
+            vekdyn_prediction.get("threshold_score", 0) / 100,
             text="Threshold Fitness"
         )
 
         st.progress(
-            factors.get("speed_reserve", 0) / 100,
+            vekdyn_prediction.get("speed_score", 0) / 100,
             text="Speed Reserve"
+        )
+
+        st.progress(
+            vekdyn_prediction.get("elasticity_score", 0) / 100,
+            text="Elasticity Preservation"
+        )
+
+        st.caption(
+            f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}"
         )
 
 
