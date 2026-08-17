@@ -17,34 +17,30 @@ import psycopg2
 import requests
 import streamlit as st
 
-# =========================================================
-# OLLU ROSTER — CSV IS THE SOURCE OF TRUTH
-# =========================================================
+# =================================================
+# TEAM ROSTERS — CSV FILES ARE THE SOURCE OF TRUTH
+# =================================================
 
-ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
+OLLU_ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
+SAM_HOUSTON_ROSTER_PATH = Path(__file__).with_name("sam_houston_csv")
+
 TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
 TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
+
 
 def get_team_logo(team_id):
     """Return the same team-specific school image used on the landing card."""
     return get_team_image(team_id)
 
 
-
-
 def get_team_image(image_id):
-    """Return a VEKDYN-controlled image from team_images by its unique ID.
-
-    Expected files:
-        team_images/landing_page.jpg   -> public landing-page banner
-        team_images/ollu_distance.jpg  -> OLLU team card image
-        team_images/sam_houston.jpg    -> Sam Houston team card image
-    """
+    """Return a VEKDYN-controlled image from team_images by its unique ID."""
     for extension in (".png", ".jpg", ".jpeg", ".webp"):
         image_path = TEAM_IMAGES_DIR / f"{image_id}{extension}"
         if image_path.exists():
             return image_path
     return None
+
 
 def clean_csv_value(value, default=""):
     """Turn blank/NaN CSV values into safe VEKDYN values."""
@@ -54,36 +50,95 @@ def clean_csv_value(value, default=""):
     return default if value.lower() == "nan" else value
 
 
-def load_ollu_roster():
-    """
-    Load the complete VEKDYN roster from ollu_roster_csv.
-    athlete_id is the permanent ID used by the dashboard, Strava and notes.
-    """
-    roster = pd.read_csv(ROSTER_PATH, dtype=str, keep_default_na=False).fillna("")
+def make_athlete_id(name):
+    """Create a stable simple athlete ID when a CSV does not already provide one."""
+    value = clean_csv_value(name).lower()
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    return value
 
-    required = {
-        "athlete_id", "first_name", "last_name",
-        "school", "team", "class_year",
-    }
-    missing = required - set(roster.columns)
-    if missing:
-        raise RuntimeError(
-            "Missing CSV columns: " + ", ".join(sorted(missing))
+
+def load_team_roster(roster_path, default_school="", default_team="Distance"):
+    """
+    Load either roster format currently used by VEKDYN.
+
+    OLLU format:
+        athlete_id, first_name, last_name, school, team, class_year, ...
+
+    Sam Houston format:
+        name, sex, class_year, pb_800, pb_1500, pb_mile, pb_3k, pb_5k, pb_8k
+
+    Both formats are converted into the same athlete dictionary so the
+    dashboard can render each school separately with the same UI.
+    """
+    if not roster_path.exists():
+        raise FileNotFoundError(f"Roster file not found: {roster_path}")
+
+    roster = pd.read_csv(
+        roster_path,
+        dtype=str,
+        keep_default_na=False,
+    ).fillna("")
+
+    # Normalize column names in case whitespace was accidentally added.
+    roster.columns = [str(column).strip() for column in roster.columns]
+
+    # -------------------------------------------------
+    # NORMALIZE NAME / ID FIELDS
+    # -------------------------------------------------
+    if "athlete_id" not in roster.columns:
+        if "name" not in roster.columns:
+            raise RuntimeError(
+                f"{roster_path.name} must contain either athlete_id/first_name/last_name "
+                "or a name column."
+            )
+
+        roster["name"] = roster["name"].astype(str).str.strip()
+        roster["athlete_id"] = roster["name"].apply(make_athlete_id)
+
+        split_names = roster["name"].str.split()
+        roster["first_name"] = split_names.str[0].fillna("")
+        roster["last_name"] = split_names.apply(
+            lambda parts: " ".join(parts[1:]) if isinstance(parts, list) and len(parts) > 1 else ""
         )
+    else:
+        if "first_name" not in roster.columns:
+            roster["first_name"] = ""
+        if "last_name" not in roster.columns:
+            roster["last_name"] = ""
+
+    # Supply team fields for the compact Sam Houston CSV.
+    if "school" not in roster.columns:
+        roster["school"] = default_school
+
+    if "team" not in roster.columns:
+        roster["team"] = default_team
+
+    if "class_year" not in roster.columns:
+        roster["class_year"] = "FR"
 
     roster["athlete_id"] = roster["athlete_id"].astype(str).str.strip()
 
-    duplicate_ids = roster.loc[
-        roster["athlete_id"].duplicated(keep=False), "athlete_id"
+    # Ignore blank IDs when checking duplicates.
+    nonblank_ids = roster.loc[
+        roster["athlete_id"] != "",
+        "athlete_id",
+    ]
+
+    duplicate_ids = nonblank_ids[
+        nonblank_ids.duplicated(keep=False)
     ].tolist()
+
     if duplicate_ids:
         raise RuntimeError(
-            "Duplicate athlete_id values: "
+            f"{roster_path.name} has duplicate athlete_id values: "
             + ", ".join(sorted(set(duplicate_ids)))
         )
 
     athletes = {}
 
+    # -------------------------------------------------
+    # BUILD ATHLETE DICTIONARY
+    # -------------------------------------------------
     for _, row in roster.iterrows():
         athlete_id = clean_csv_value(row.get("athlete_id"))
         if not athlete_id:
@@ -93,7 +148,14 @@ def load_ollu_roster():
         last_name = clean_csv_value(row.get("last_name"))
         full_name = f"{first_name} {last_name}".strip()
 
+        if not full_name:
+            full_name = clean_csv_value(row.get("name"), athlete_id)
+
+        # ---------------------------------------------
+        # TRACK PERSONAL BESTS
+        # ---------------------------------------------
         pbs = {}
+
         pb_map = {
             "800": "pb_800",
             "1500": "pb_1500",
@@ -101,24 +163,49 @@ def load_ollu_roster():
             "3k": "pb_3k",
             "5k": "pb_5k",
         }
+
         for event, column in pb_map.items():
             value = clean_csv_value(row.get(column))
             if value:
                 pbs[event] = value
 
+        # ---------------------------------------------
+        # CROSS COUNTRY RESULTS
+        # ---------------------------------------------
         xc_results = {}
-        xc_8k = clean_csv_value(row.get("xc_8k_pb"))
+
+        # OLLU uses xc_8k_pb; the compact Sam Houston CSV uses pb_8k.
+        xc_8k = clean_csv_value(
+            row.get("xc_8k_pb"),
+            clean_csv_value(row.get("pb_8k")),
+        )
+
         xc_10k = clean_csv_value(row.get("xc_10k_pb"))
+
+        # Future women's 6K support if pb_6k or xc_6k_pb is added.
+        xc_6k = clean_csv_value(
+            row.get("xc_6k_pb"),
+            clean_csv_value(row.get("pb_6k")),
+        )
+
+        if xc_6k:
+            xc_results["6k"] = [
+                {"time": xc_6k, "meet": "XC Personal Best", "date": ""}
+            ]
 
         if xc_8k:
             xc_results["8k"] = [
                 {"time": xc_8k, "meet": "XC Personal Best", "date": ""}
             ]
+
         if xc_10k:
             xc_results["10k"] = [
                 {"time": xc_10k, "meet": "XC Personal Best", "date": ""}
             ]
 
+        # ---------------------------------------------
+        # THRESHOLD DATA
+        # ---------------------------------------------
         threshold = {
             "short_reps": {
                 "pace": clean_csv_value(row.get("threshold_short_pace"), "--"),
@@ -139,16 +226,16 @@ def load_ollu_roster():
                 "name": full_name or athlete_id,
                 "first_name": first_name,
                 "last_name": last_name,
-                "school": clean_csv_value(row.get("school"), "OLLU"),
-                "team": clean_csv_value(row.get("team")),
-                "class": clean_csv_value(row.get("class_year"), "--"),
+                "school": clean_csv_value(row.get("school"), default_school),
+                "team": clean_csv_value(row.get("team"), default_team),
+                "class": clean_csv_value(row.get("class_year"), "FR"),
+                "sex": clean_csv_value(row.get("sex")),
             },
             "pbs": pbs,
             "xc_results": xc_results,
             "threshold": threshold,
 
-            # Live training/HR is intentionally NOT stored in the CSV.
-            # Strava fills these areas after each athlete connects/syncs.
+            # Live training/HR is intentionally not stored in the roster CSV.
             "training": {},
             "recovery": {},
 
@@ -161,24 +248,36 @@ def load_ollu_roster():
         }
 
     if not athletes:
-        raise RuntimeError("No athletes were loaded from ollu_roster_csv.")
+        raise RuntimeError(
+            f"No athletes were loaded from {roster_path.name}."
+        )
 
     return roster, athletes
 
 
-ollu_roster, ollu_athletes = load_ollu_roster()
-
 # =========================================================
-# TEAM ROSTERS
+# LOAD EACH TEAM SEPARATELY
 # =========================================================
 
-# Sam Houston starts empty. When the coach sends the roster, populate this
-# dictionary in the same athlete-data structure used by OLLU.
-sam_houston_athletes = {}
+ollu_roster, ollu_athletes = load_team_roster(
+    OLLU_ROSTER_PATH,
+    default_school="OLLU",
+    default_team="Distance",
+)
 
+sam_houston_roster, sam_houston_athletes = load_team_roster(
+    SAM_HOUSTON_ROSTER_PATH,
+    default_school="Sam Houston",
+    default_team="Distance",
+)
+
+
+# =========================================================
+# TEAM ROUTING
+# =========================================================
 
 def get_team_athletes(team_id):
-    """Return only the roster for the authenticated VEKDYN team."""
+    """Return only the roster belonging to the selected VEKDYN team."""
     if team_id == "ollu_distance":
         return ollu_athletes
 
