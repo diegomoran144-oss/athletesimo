@@ -2075,14 +2075,27 @@ if not athletes:
 
 with st.sidebar:
 
+    # -----------------------------------------------------
+    # VEKDYN / TEAM IDENTITY
+    # -----------------------------------------------------
+
     st.markdown(
         "## VEK<span style='color:#2f9e44'>DYN</span>",
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
+
+    # Keep the coach and current school immediately under
+    # the VEKDYN identity so the active workspace is obvious.
+    st.caption("Coach")
+    st.caption(active_team_config["name"])
 
     st.success("▣ Dashboard")
 
     st.divider()
+
+    # -----------------------------------------------------
+    # ATHLETE SELECTION
+    # -----------------------------------------------------
 
     st.markdown("### Choose Athlete")
 
@@ -2090,9 +2103,124 @@ with st.sidebar:
         "",
         options=list(athletes.keys()),
         format_func=lambda key: athletes[key]["profile"]["name"],
+        key="sidebar_athlete_selector",
     )
 
+    # We can read the selected athlete immediately so the
+    # Strava controls sit directly below the selector.
+    selected_sidebar_athlete = athletes[athlete_key]
+    selected_sidebar_profile = selected_sidebar_athlete["profile"]
+    athlete_name_for_button = selected_sidebar_profile.get("name", "Athlete")
+    athlete_first_name = athlete_name_for_button.split()[0]
+
+    weekly_session_key = f"{athlete_key}_strava_weekly"
+    heart_session_key = f"{athlete_key}_strava_heart_rate"
+    message_session_key = f"strava_message_{athlete_key}"
+    error_session_key = f"strava_error_{athlete_key}"
+
+    # -----------------------------------------------------
+    # STRAVA — DIRECTLY UNDER ATHLETE SELECTOR
+    # -----------------------------------------------------
+
+    if strava_is_connected(athlete_key):
+
+        if st.button(
+            f"Sync {athlete_first_name}'s Strava",
+            key=f"sync_strava_{athlete_key}",
+            use_container_width=True,
+            type="primary",
+        ):
+            try:
+                token = get_valid_strava_token(athlete_key)
+
+                weekly, heart_rate = get_strava_training_data(
+                    token,
+                    number_of_weeks=8,
+                )
+
+                st.session_state[weekly_session_key] = weekly
+                st.session_state[heart_session_key] = heart_rate
+
+                st.session_state[message_session_key] = (
+                    f"{athlete_name_for_button}'s Strava sync is complete."
+                )
+
+                st.session_state.pop(error_session_key, None)
+
+            except (
+                requests.RequestException,
+                sqlite3.DatabaseError,
+                RuntimeError,
+                KeyError,
+            ) as error:
+                st.session_state[error_session_key] = str(error)
+
+        connection = athlete_strava_connection(athlete_key)
+        connected_strava_name = connection.get("strava_name")
+
+        if connected_strava_name:
+            st.caption(
+                f"Connected Strava account: {connected_strava_name}"
+            )
+        else:
+            st.caption("Strava connected")
+
+        reconnect_url = create_strava_login_url(athlete_key)
+
+        if reconnect_url:
+            st.link_button(
+                f"Reconnect {athlete_first_name}'s Strava",
+                reconnect_url,
+                use_container_width=True,
+            )
+
+    else:
+
+        login_url = create_strava_login_url(athlete_key)
+
+        if login_url:
+            st.link_button(
+                f"Connect {athlete_first_name}'s Strava",
+                login_url,
+                use_container_width=True,
+            )
+        else:
+            st.warning(
+                "Add the Strava Client ID to secrets.toml first."
+            )
+
+    # -----------------------------------------------------
+    # STRAVA STATUS
+    # -----------------------------------------------------
+
+    if st.session_state.get(message_session_key):
+        st.success(
+            st.session_state[message_session_key]
+        )
+
+    elif st.session_state.get(error_session_key):
+
+        if strava_is_connected(athlete_key):
+            st.warning(
+                "Strava sync failed. No live Strava mileage is "
+                "available right now. "
+                f"Details: {st.session_state[error_session_key]}"
+            )
+        else:
+            st.warning(
+                st.session_state[error_session_key]
+            )
+
+    elif not strava_is_connected(athlete_key):
+        st.caption(
+            "This athlete has not connected Strava yet."
+        )
+
     st.divider()
+
+    # -----------------------------------------------------
+    # ATHLETE OVERVIEW
+    # -----------------------------------------------------
 
     st.markdown("### Athlete Overview")
 
@@ -2116,10 +2244,17 @@ with st.sidebar:
         use_container_width=True,
     ):
         st.session_state["show_contact_form"] = (
-            not st.session_state.get("show_contact_form", False)
+            not st.session_state.get(
+                "show_contact_form",
+                False,
+            )
         )
 
-    if st.session_state.get("show_contact_form", False):
+    if st.session_state.get(
+        "show_contact_form",
+        False,
+    ):
+
         st.caption(
             "Questions, feedback, or interested in bringing "
             "VEKDYN to your program?"
@@ -2129,6 +2264,7 @@ with st.sidebar:
             "vek_dyn_contact_form",
             clear_on_submit=True,
         ):
+
             contact_name = st.text_input(
                 "Name",
                 placeholder="Your name",
@@ -2160,23 +2296,24 @@ with st.sidebar:
             )
 
         if contact_submit:
+
             if not contact_name.strip():
                 st.warning("Please enter your name.")
+
             elif not contact_email.strip():
                 st.warning("Please enter your email.")
+
             elif not contact_message.strip():
                 st.warning("Please enter a message.")
+
             else:
-                st.success("Thanks — your message is ready to send.")
+                st.success(
+                    "Thanks — your message is ready to send."
+                )
 
     # -----------------------------------------------------
-    # ACCOUNT
+    # LOG OUT — NOTHING BELOW THIS
     # -----------------------------------------------------
-
-    st.divider()
-
-    st.caption("Coach")
-    st.caption(active_team_config["name"])
 
     if st.button(
         "Log Out",
@@ -2185,93 +2322,24 @@ with st.sidebar:
     ):
         log_out()
 
+
+# =========================================================
+# SELECTED ATHLETE DATA
+# =========================================================
+
 athlete = athletes[athlete_key]
 profile = athlete["profile"]
 personal_bests = athlete.get("pbs", {})
 xc_results = athlete.get("xc_results", {})
 training = athlete.get("training", {})
-recovery = athlete.get("recovery", training.get("recovery", {}))
+recovery = athlete.get(
+    "recovery",
+    training.get("recovery", {}),
+)
 threshold_lactate = athlete.get(
     "threshold_lactate",
     training.get("threshold_lactate", {}),
 )
-
-
-with st.sidebar:
-    athlete_name_for_button = profile.get("name", "Athlete")
-    weekly_session_key = f"{athlete_key}_strava_weekly"
-    heart_session_key = f"{athlete_key}_strava_heart_rate"
-    message_session_key = f"strava_message_{athlete_key}"
-    error_session_key = f"strava_error_{athlete_key}"
-
-    if strava_is_connected(athlete_key):
-        if st.button(
-            f"Sync {athlete_name_for_button.split()[0]}'s Strava",
-            use_container_width=True,
-        ):
-            try:
-                token = get_valid_strava_token(athlete_key)
-                weekly, heart_rate = get_strava_training_data(
-                    token,
-                    number_of_weeks=8,
-                )
-                st.session_state[weekly_session_key] = weekly
-                st.session_state[heart_session_key] = heart_rate
-                st.session_state[message_session_key] = (
-                    f"{athlete_name_for_button}'s Strava sync is complete."
-                )
-                st.session_state.pop(error_session_key, None)
-            except (
-                requests.RequestException,
-                sqlite3.DatabaseError,
-                RuntimeError,
-                KeyError,
-            ) as error:
-                st.session_state[error_session_key] = str(error)
-
-        connection = athlete_strava_connection(athlete_key)
-        connected_strava_name = connection.get("strava_name")
-        if connected_strava_name:
-            st.caption(f"Connected Strava account: {connected_strava_name}")
-        else:
-            st.caption("Strava connection configured")
-
-        # Always offer a fresh OAuth connection. This lets an athlete replace
-        # an expired saved token or correct an account connected by mistake.
-        reconnect_url = create_strava_login_url(athlete_key)
-        if reconnect_url:
-            st.link_button(
-                f"Reconnect {athlete_name_for_button.split()[0]}'s Strava",
-                reconnect_url,
-                use_container_width=True,
-            )
-    else:
-        login_url = create_strava_login_url(athlete_key)
-        if login_url:
-            st.link_button(
-                f"Connect {athlete_name_for_button.split()[0]}'s Strava",
-                login_url,
-                use_container_width=True,
-            )
-        else:
-            st.warning("Add the Strava Client ID to secrets.toml first.")
-
-    if st.session_state.get(message_session_key):
-        st.success(st.session_state[message_session_key])
-    elif st.session_state.get(error_session_key):
-        if strava_is_connected(athlete_key):
-            st.warning(
-                "Strava sync failed. No live Strava mileage is available right now. "
-                f"Details: {st.session_state[error_session_key]}"
-            )
-        else:
-            st.warning(st.session_state[error_session_key])
-    elif not strava_is_connected(athlete_key):
-        st.caption("This athlete has not connected Strava yet.")
-
-    st.write("")
-    st.caption("Coach")
-    st.caption(active_team_config["name"])
 
 
 # =========================================================
