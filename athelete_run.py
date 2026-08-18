@@ -2071,6 +2071,9 @@ if not athletes:
 # SIDEBAR AND ATHLETE SELECTION
 # =========================================================
 
+if "dashboard_view" not in st.session_state:
+    st.session_state["dashboard_view"] = "Dashboard"
+
 with st.sidebar:
 
     # -----------------------------------------------------
@@ -2087,7 +2090,13 @@ with st.sidebar:
     st.caption("Coach")
     st.caption(active_team_config["name"])
 
-    st.success("▣ Dashboard")
+    if st.button(
+        "▣ Dashboard",
+        key="nav_dashboard",
+        use_container_width=True,
+        type="primary" if st.session_state["dashboard_view"] == "Dashboard" else "secondary",
+    ):
+        st.session_state["dashboard_view"] = "Dashboard"
 
     st.divider()
 
@@ -2122,12 +2131,12 @@ with st.sidebar:
 
     if strava_is_connected(athlete_key):
 
-        if st.button(
-            f"Sync {athlete_first_name}'s Strava",
-            key=f"sync_strava_{athlete_key}",
-            use_container_width=True,
-            type="primary",
-        ):
+        # Automatically sync only when the coach selects a different athlete.
+        # This avoids a redundant Sync button and prevents extra Strava API calls
+        # on every normal Streamlit rerun.
+        auto_sync_key = f"{active_team}:{athlete_key}"
+
+        if st.session_state.get("last_auto_synced_athlete") != auto_sync_key:
             try:
                 token = get_valid_strava_token(athlete_key)
 
@@ -2140,10 +2149,12 @@ with st.sidebar:
                 st.session_state[heart_session_key] = heart_rate
 
                 st.session_state[message_session_key] = (
-                    f"{athlete_name_for_button}'s Strava sync is complete."
+                    f"{athlete_name_for_button}'s Strava synced automatically."
                 )
-
                 st.session_state.pop(error_session_key, None)
+
+                # Mark this athlete as synced only after a successful request.
+                st.session_state["last_auto_synced_athlete"] = auto_sync_key
 
             except (
                 requests.RequestException,
@@ -2222,11 +2233,24 @@ with st.sidebar:
 
     st.markdown("### Athlete Overview")
 
-    st.write("♙ Profile")
-    st.write("♨ Training")
-    st.write("↗ Performance")
-    st.write("♡ Recovery")
-    st.write("📝 Notes")
+    nav_items = [
+        ("♙ Profile", "Profile"),
+        ("♨ Training", "Training"),
+        ("↗ Performance", "Performance"),
+        ("♡ Recovery", "Recovery"),
+        ("📝 Notes", "Notes"),
+    ]
+
+    for label, view_name in nav_items:
+        if st.button(
+            label,
+            key=f"nav_{view_name.lower()}",
+            use_container_width=True,
+            type="primary" if st.session_state.get("dashboard_view") == view_name else "secondary",
+        ):
+            st.session_state["dashboard_view"] = view_name
+
+    dashboard_view = st.session_state.get("dashboard_view", "Dashboard")
 
     # -----------------------------------------------------
     # CONTACT / FEEDBACK
@@ -2396,444 +2420,448 @@ def render_circular_athlete_photo(photo_path, alt_text="Athlete profile photo"):
     )
 
 
-# =========================================================
-# PROFILE DATA
-# =========================================================
+if dashboard_view in {"Dashboard", "Profile"}:
+    # =========================================================
+    # PROFILE DATA
+    # =========================================================
 
-athlete_name = profile.get("name", "Unknown Athlete")
-school = profile.get("school", "School not available")
-athlete_class = profile.get("class", "Class not available")
+    athlete_name = profile.get("name", "Unknown Athlete")
+    school = profile.get("school", "School not available")
+    athlete_class = profile.get("class", "Class not available")
 
-initials = "".join(
-    word[0] for word in athlete_name.split()[:2]
-).upper()
+    initials = "".join(
+        word[0] for word in athlete_name.split()[:2]
+    ).upper()
 
-athlete_photo = get_athlete_photo(athlete_key)
+    athlete_photo = get_athlete_photo(athlete_key)
 
 
-with st.container(border=True):
-
-    photo_col, athlete_col, school_col = st.columns([1, 4, 1.5])
-
-    # -----------------------------------------------------
-    # ATHLETE PHOTO
-    # -----------------------------------------------------
-
-    with photo_col:
-
-        if athlete_photo is not None:
-
-            render_circular_athlete_photo(
-                athlete_photo,
-                alt_text=f"{athlete_name} profile photo",
-            )
-
-        else:
-
-            st.markdown(
-                f'<div class="profile-circle">{initials}</div>',
-                unsafe_allow_html=True
-            )
-
-    # -----------------------------------------------------
-    # ATHLETE INFORMATION
-    # -----------------------------------------------------
-
-    with athlete_col:
-
-        st.markdown(
-            f'<span class="athlete-name">{athlete_name}</span>&nbsp;&nbsp;'
-            '<span class="active-badge">Active</span>',
-            unsafe_allow_html=True,
-        )
-
-        st.write(
-            f"**{athlete_class}**  •  🟢 Distance"
-        )
-
-        st.caption(
-            "5'9\"  •  150 lbs  •  San Antonio, TX"
-        )
-
-    # -----------------------------------------------------
-    # SCHOOL LOGO
-    # -----------------------------------------------------
-
-    with school_col:
-
-        school_logo = get_team_logo(active_team)
-
-        if school_logo is not None:
-
-            # Make the school mark fill most of the athlete-header height.
-            # For a truly background-free logo, use a transparent PNG
-            # in team_images; CSS cannot remove white pixels baked into
-            # the source image.
-            st.markdown(
-                """
-                <style>
-                    div[data-testid="stImage"] img {
-                        max-height: 145px;
-                        width: auto;
-                        object-fit: contain;
-                    }
-                </style>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            st.image(
-                str(school_logo),
-                use_container_width=True,
-            )
-
-        else:
-
-            st.markdown(
-                f"""
-                <div style="
-                    font-size:28px;
-                    font-weight:800;
-                    color:#111827;
-                    text-align:center;
-                ">
-                    {school}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-# =========================================================
-# PERFORMANCE BESTS AND DATA SOURCE
-# =========================================================
-
-pb_card, source_card = st.columns([2, 1])
-
-with pb_card:
     with st.container(border=True):
-        st.subheader("Performance Bests")
-        performance_view = st.radio(
-            "Performance type",
-            options=["Track", "Cross Country"],
-            horizontal=True,
-            key=f"performance_view_{athlete_key}",
-            label_visibility="collapsed",
-        )
 
-        if performance_view == "Track":
-            if personal_bests:
-                pb_columns = st.columns(len(personal_bests))
-                for column, event in zip(pb_columns, personal_bests):
-                    with column:
-                        st.markdown(
-                            f"""
-                            <div class="pb-event">{event.upper()}</div>
-                            <div class="pb-time">{personal_bests[event]}</div>
-                            <div class="green-text">Watch Race ↗</div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
+        photo_col, athlete_col, school_col = st.columns([1, 4, 1.5])
+
+        # -----------------------------------------------------
+        # ATHLETE PHOTO
+        # -----------------------------------------------------
+
+        with photo_col:
+
+            if athlete_photo is not None:
+
+                render_circular_athlete_photo(
+                    athlete_photo,
+                    alt_text=f"{athlete_name} profile photo",
+                )
+
             else:
-                st.info("No track performance bests have been entered.")
 
-        else:
-            xc_columns = st.columns(2)
-            for column, event in zip(xc_columns, ["8k", "10k"]):
-                result = primary_xc_result(xc_results, event)
-                result_details = result["meet"]
-                if result["date"]:
-                    result_details = f'{result_details} • {result["date"]}'
+                st.markdown(
+                    f'<div class="profile-circle">{initials}</div>',
+                    unsafe_allow_html=True
+                )
 
-                with column:
-                    st.markdown(
-                        f"""
-                        <div class="pb-event">{event.upper()} XC</div>
-                        <div class="pb-time">{result["time"]}</div>
-                        <div class="small-text">{result_details}</div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+        # -----------------------------------------------------
+        # ATHLETE INFORMATION
+        # -----------------------------------------------------
 
-            all_xc_rows = []
-            for event in ["8k", "10k"]:
-                for result in get_xc_results_for_event(xc_results, event):
-                    all_xc_rows.append(
-                        {
-                            "Event": event.upper(),
-                            "Time": result.get("time", "--"),
-                            "Meet": result.get("meet", ""),
-                            "Date": result.get("date", ""),
+        with athlete_col:
+
+            st.markdown(
+                f'<span class="athlete-name">{athlete_name}</span>&nbsp;&nbsp;'
+                '<span class="active-badge">Active</span>',
+                unsafe_allow_html=True,
+            )
+
+            st.write(
+                f"**{athlete_class}**  •  🟢 Distance"
+            )
+
+            st.caption(
+                "5'9\"  •  150 lbs  •  San Antonio, TX"
+            )
+
+        # -----------------------------------------------------
+        # SCHOOL LOGO
+        # -----------------------------------------------------
+
+        with school_col:
+
+            school_logo = get_team_logo(active_team)
+
+            if school_logo is not None:
+
+                # Make the school mark fill most of the athlete-header height.
+                # For a truly background-free logo, use a transparent PNG
+                # in team_images; CSS cannot remove white pixels baked into
+                # the source image.
+                st.markdown(
+                    """
+                    <style>
+                        div[data-testid="stImage"] img {
+                            max-height: 145px;
+                            width: auto;
+                            object-fit: contain;
                         }
-                    )
-
-            if all_xc_rows:
-                with st.expander("View all XC results"):
-                    st.dataframe(
-                        pd.DataFrame(all_xc_rows),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-            else:
-                st.caption("No XC 8K or 10K PB is entered in ollu_roster_csv.")
-
-with source_card:
-    with st.container(border=True):
-        st.subheader("Heart Rate Benchmark")
-        max_observed_hr = live_heart_rate.get(
-            "max_heart_rate",
-            recovery.get("max_observed_heart_rate", "--"),
-        )
-        max_hr_date = live_heart_rate.get(
-            "max_heart_rate_date",
-            recovery.get("max_heart_rate_date", "Not available"),
-        )
-        st.metric("8-Week Max Observed HR", f"{max_observed_hr} bpm")
-        st.caption(f"Recorded: {max_hr_date}")
-        st.caption(f"Training source: {volume_source}")
-        if live_heart_rate:
-            st.markdown("<span class='green-text'>● Strava</span>", unsafe_allow_html=True)
-        elif strava_is_connected(athlete_key):
-            st.caption("Sync an HR-enabled Strava run to update this benchmark.")
-
-
-# =========================================================
-# WEEKLY TRAINING VOLUME + HEART RATE & RECOVERY
-# =========================================================
-
-volume_card, recovery_card = st.columns([2, 1])
-
-with volume_card:
-    with st.container(border=True):
-        st.subheader("Weekly Training Volume")
-
-        if volume_data.empty:
-            st.info("No weekly training data is available.")
-        else:
-            current_volume = float(volume_data["Mileage"].iloc[-1])
-            previous_volume = (
-                float(volume_data["Mileage"].iloc[-2])
-                if len(volume_data) > 1
-                else current_volume
-            )
-            volume_change = current_volume - previous_volume
-
-            number_col, graph_col = st.columns([1, 3])
-
-            with number_col:
-                st.metric(
-                    label="This Week",
-                    value=f"{current_volume:.1f} mi",
-                    delta=f"{volume_change:+.1f} mi",
+                    </style>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                st.caption(f"Source: {volume_source}")
 
-                if volume_source == "Live Strava data":
-                    st.markdown(
-                        "<span class='green-text'>● Strava</span>",
-                        unsafe_allow_html=True,
-                    )
-
-            with graph_col:
-                volume_chart = (
-                    alt.Chart(volume_data)
-                    .mark_area(
-                        line={"color": "#35a33b", "strokeWidth": 3},
-                        color=alt.Gradient(
-                            gradient="linear",
-                            stops=[
-                                alt.GradientStop(color="#dff3e1", offset=0),
-                                alt.GradientStop(color="#ffffff", offset=1),
-                            ],
-                            x1=1,
-                            x2=1,
-                            y1=1,
-                            y2=0,
-                        ),
-                        point={"filled": True, "fill": "#35a33b", "size": 80},
-                    )
-                    .encode(
-                        x=alt.X(
-                            "Week:N",
-                            sort=None,
-                            axis=alt.Axis(title=None, labelAngle=0),
-                        ),
-                        y=alt.Y(
-                            "Mileage:Q",
-                            title="Miles",
-                            scale=alt.Scale(zero=True),
-                        ),
-                        tooltip=[
-                            alt.Tooltip("Week:N"),
-                            alt.Tooltip("Mileage:Q", title="Miles", format=".1f"),
-                        ],
-                    )
-                    .properties(height=240)
+                st.image(
+                    str(school_logo),
+                    use_container_width=True,
                 )
-                st.altair_chart(volume_chart, use_container_width=True)
 
-with recovery_card:
-    with st.container(border=True):
-        st.subheader("Heart Rate & Recovery")
-
-        heart_updated = live_heart_rate.get(
-            "last_updated",
-            recovery.get("last_updated", "Not available"),
-        )
-        st.caption(f"Last updated: {heart_updated}")
-
-        sleep_left, sleep_right = st.columns(2)
-
-        with sleep_left:
-            sleeping_hr = recovery.get(
-                "sleep_heart_rate",
-                recovery.get("resting_hr", "--"),
-            )
-            st.metric("Sleeping HR", f"{sleeping_hr} bpm")
-            st.caption("COROS connection pending")
-
-        with sleep_right:
-            st.metric(
-                "Sleep Time",
-                f"{recovery.get('sleep_hours', '--')}h {recovery.get('sleep_minutes', '--')}m",
-            )
-            st.markdown(
-                "<span class='status-dot'>● Good</span>",
-                unsafe_allow_html=True,
-            )
-
-        st.divider()
-
-        recovery_left, recovery_right = st.columns(2)
-
-        with recovery_left:
-            st.metric(
-                "Average HRV",
-                f"{recovery.get('average_hrv', '--')} ms",
-            )
-            st.markdown(
-                "<span class='status-dot'>● Optimal</span>",
-                unsafe_allow_html=True,
-            )
-
-        with recovery_right:
-            st.metric(
-                "Recovery Score",
-                f"{recovery.get('recovery_score', '--')}%",
-            )
-
-# =========================================================
-# ATHLETE + COACH NOTES
-# =========================================================
-
-st.write("")
-
-notes_feed_col, notes_compose_col = st.columns([1.75, 1], gap="large")
-
-with notes_feed_col:
-    st.markdown(
-        '<div class="notes-title">Notes</div>'
-        '<div class="notes-subtitle">Athlete feedback and coach responses in one timeline.</div>',
-        unsafe_allow_html=True,
-    )
-
-    note_filter_label = st.selectbox(
-        "Note filter",
-        options=["All Notes", "Athlete", "Coach"],
-        key=f"note_filter_{athlete_key}",
-        label_visibility="collapsed",
-    )
-    role_filter = {
-        "All Notes": None,
-        "Athlete": "ATHLETE",
-        "Coach": "COACH",
-    }[note_filter_label]
-
-    try:
-        notes = load_athlete_notes(
-            athlete_key,
-            limit=40,
-            role_filter=role_filter,
-        )
-    except psycopg2.Error as error:
-        notes = []
-        st.error(f"Notes could not be loaded from Neon: {error}")
-
-    if notes:
-        for note in notes:
-            role = note.get("author_role", "ATHLETE").upper()
-            role_class = "coach" if role == "COACH" else "athlete"
-            safe_author = html.escape(str(note.get("author_name", "")))
-            safe_role = html.escape(role)
-            safe_time = html.escape(format_note_timestamp(note.get("created_at")))
-            safe_text = html.escape(str(note.get("note_text", ""))).replace("\n", "<br>")
-
-            note_html = (
-                f'<div class="note-card note-card-{role_class}">'
-                '<div class="note-header">'
-                '<div class="note-author-wrap">'
-                f'<span class="note-author">{safe_author}</span>'
-                f'<span class="note-role note-role-{role_class}">{safe_role}</span>'
-                '</div>'
-                f'<span class="note-time">{safe_time}</span>'
-                '</div>'
-                f'<div class="note-body">{safe_text}</div>'
-                '</div>'
-            )
-            st.markdown(note_html, unsafe_allow_html=True)
-    else:
-        st.info("No notes yet. Add the first training update for this athlete.")
-
-with notes_compose_col:
-    with st.container(border=True):
-        st.markdown("### Add a note")
-        st.caption("Share how training went or leave a coaching response.")
-
-        with st.form(key=f"shared_note_form_{athlete_key}", clear_on_submit=True):
-            posting_as = st.selectbox(
-                "Posting as",
-                options=["Athlete", "Coach"],
-                key=f"note_posting_as_{athlete_key}",
-            )
-
-            if posting_as == "Athlete":
-                note_author_name = athlete_name
-                note_author_role = "ATHLETE"
-                st.caption(f"Posting as {athlete_name}")
             else:
-                note_author_name = "Coach Zarate"
-                note_author_role = "COACH"
-                st.caption("Posting as Coach Zarate")
 
-            new_note_text = st.text_area(
-                "Note",
-                height=180,
-                placeholder=(
-                    "How did training go? Include effort, soreness, sleep, "
-                    "lactate, mechanics, recovery, or anything the coach should know."
-                ),
+                st.markdown(
+                    f"""
+                    <div style="
+                        font-size:28px;
+                        font-weight:800;
+                        color:#111827;
+                        text-align:center;
+                    ">
+                        {school}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+if dashboard_view in {"Dashboard", "Profile", "Performance", "Recovery"}:
+    # =========================================================
+    # PERFORMANCE BESTS AND DATA SOURCE
+    # =========================================================
+
+    pb_card, source_card = st.columns([2, 1])
+
+    with pb_card:
+        with st.container(border=True):
+            st.subheader("Performance Bests")
+            performance_view = st.radio(
+                "Performance type",
+                options=["Track", "Cross Country"],
+                horizontal=True,
+                key=f"performance_view_{athlete_key}",
                 label_visibility="collapsed",
             )
 
-            save_shared_note = st.form_submit_button(
-                "Save Note",
-                type="primary",
-                use_container_width=True,
-            )
+            if performance_view == "Track":
+                if personal_bests:
+                    pb_columns = st.columns(len(personal_bests))
+                    for column, event in zip(pb_columns, personal_bests):
+                        with column:
+                            st.markdown(
+                                f"""
+                                <div class="pb-event">{event.upper()}</div>
+                                <div class="pb-time">{personal_bests[event]}</div>
+                                <div class="green-text">Watch Race ↗</div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    st.info("No track performance bests have been entered.")
 
-        if save_shared_note:
-            try:
-                save_athlete_note(
-                    athlete_key=athlete_key,
-                    author_name=note_author_name,
-                    author_role=note_author_role,
-                    note_text=new_note_text,
+            else:
+                xc_columns = st.columns(2)
+                for column, event in zip(xc_columns, ["8k", "10k"]):
+                    result = primary_xc_result(xc_results, event)
+                    result_details = result["meet"]
+                    if result["date"]:
+                        result_details = f'{result_details} • {result["date"]}'
+
+                    with column:
+                        st.markdown(
+                            f"""
+                            <div class="pb-event">{event.upper()} XC</div>
+                            <div class="pb-time">{result["time"]}</div>
+                            <div class="small-text">{result_details}</div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                all_xc_rows = []
+                for event in ["8k", "10k"]:
+                    for result in get_xc_results_for_event(xc_results, event):
+                        all_xc_rows.append(
+                            {
+                                "Event": event.upper(),
+                                "Time": result.get("time", "--"),
+                                "Meet": result.get("meet", ""),
+                                "Date": result.get("date", ""),
+                            }
+                        )
+
+                if all_xc_rows:
+                    with st.expander("View all XC results"):
+                        st.dataframe(
+                            pd.DataFrame(all_xc_rows),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                else:
+                    st.caption("No XC 8K or 10K PB is entered in ollu_roster_csv.")
+
+    with source_card:
+        with st.container(border=True):
+            st.subheader("Heart Rate Benchmark")
+            max_observed_hr = live_heart_rate.get(
+                "max_heart_rate",
+                recovery.get("max_observed_heart_rate", "--"),
+            )
+            max_hr_date = live_heart_rate.get(
+                "max_heart_rate_date",
+                recovery.get("max_heart_rate_date", "Not available"),
+            )
+            st.metric("8-Week Max Observed HR", f"{max_observed_hr} bpm")
+            st.caption(f"Recorded: {max_hr_date}")
+            st.caption(f"Training source: {volume_source}")
+            if live_heart_rate:
+                st.markdown("<span class='green-text'>● Strava</span>", unsafe_allow_html=True)
+            elif strava_is_connected(athlete_key):
+                st.caption("Sync an HR-enabled Strava run to update this benchmark.")
+
+
+if dashboard_view in {"Dashboard", "Training", "Recovery"}:
+    # =========================================================
+    # WEEKLY TRAINING VOLUME + HEART RATE & RECOVERY
+    # =========================================================
+
+    volume_card, recovery_card = st.columns([2, 1])
+
+    with volume_card:
+        with st.container(border=True):
+            st.subheader("Weekly Training Volume")
+
+            if volume_data.empty:
+                st.info("No weekly training data is available.")
+            else:
+                current_volume = float(volume_data["Mileage"].iloc[-1])
+                previous_volume = (
+                    float(volume_data["Mileage"].iloc[-2])
+                    if len(volume_data) > 1
+                    else current_volume
                 )
-                st.success("Note added.")
-                st.rerun()
-            except ValueError as error:
-                st.warning(str(error))
-            except psycopg2.Error as error:
-                st.error(f"The note could not be saved to Neon: {error}")
+                volume_change = current_volume - previous_volume
+
+                number_col, graph_col = st.columns([1, 3])
+
+                with number_col:
+                    st.metric(
+                        label="This Week",
+                        value=f"{current_volume:.1f} mi",
+                        delta=f"{volume_change:+.1f} mi",
+                    )
+                    st.caption(f"Source: {volume_source}")
+
+                    if volume_source == "Live Strava data":
+                        st.markdown(
+                            "<span class='green-text'>● Strava</span>",
+                            unsafe_allow_html=True,
+                        )
+
+                with graph_col:
+                    volume_chart = (
+                        alt.Chart(volume_data)
+                        .mark_area(
+                            line={"color": "#35a33b", "strokeWidth": 3},
+                            color=alt.Gradient(
+                                gradient="linear",
+                                stops=[
+                                    alt.GradientStop(color="#dff3e1", offset=0),
+                                    alt.GradientStop(color="#ffffff", offset=1),
+                                ],
+                                x1=1,
+                                x2=1,
+                                y1=1,
+                                y2=0,
+                            ),
+                            point={"filled": True, "fill": "#35a33b", "size": 80},
+                        )
+                        .encode(
+                            x=alt.X(
+                                "Week:N",
+                                sort=None,
+                                axis=alt.Axis(title=None, labelAngle=0),
+                            ),
+                            y=alt.Y(
+                                "Mileage:Q",
+                                title="Miles",
+                                scale=alt.Scale(zero=True),
+                            ),
+                            tooltip=[
+                                alt.Tooltip("Week:N"),
+                                alt.Tooltip("Mileage:Q", title="Miles", format=".1f"),
+                            ],
+                        )
+                        .properties(height=240)
+                    )
+                    st.altair_chart(volume_chart, use_container_width=True)
+
+    with recovery_card:
+        with st.container(border=True):
+            st.subheader("Heart Rate & Recovery")
+
+            heart_updated = live_heart_rate.get(
+                "last_updated",
+                recovery.get("last_updated", "Not available"),
+            )
+            st.caption(f"Last updated: {heart_updated}")
+
+            sleep_left, sleep_right = st.columns(2)
+
+            with sleep_left:
+                sleeping_hr = recovery.get(
+                    "sleep_heart_rate",
+                    recovery.get("resting_hr", "--"),
+                )
+                st.metric("Sleeping HR", f"{sleeping_hr} bpm")
+                st.caption("COROS connection pending")
+
+            with sleep_right:
+                st.metric(
+                    "Sleep Time",
+                    f"{recovery.get('sleep_hours', '--')}h {recovery.get('sleep_minutes', '--')}m",
+                )
+                st.markdown(
+                    "<span class='status-dot'>● Good</span>",
+                    unsafe_allow_html=True,
+                )
+
+            st.divider()
+
+            recovery_left, recovery_right = st.columns(2)
+
+            with recovery_left:
+                st.metric(
+                    "Average HRV",
+                    f"{recovery.get('average_hrv', '--')} ms",
+                )
+                st.markdown(
+                    "<span class='status-dot'>● Optimal</span>",
+                    unsafe_allow_html=True,
+                )
+
+            with recovery_right:
+                st.metric(
+                    "Recovery Score",
+                    f"{recovery.get('recovery_score', '--')}%",
+                )
+
+if dashboard_view in {"Dashboard", "Notes"}:
+    # =========================================================
+    # ATHLETE + COACH NOTES
+    # =========================================================
+
+    st.write("")
+
+    notes_feed_col, notes_compose_col = st.columns([1.75, 1], gap="large")
+
+    with notes_feed_col:
+        st.markdown(
+            '<div class="notes-title">Notes</div>'
+            '<div class="notes-subtitle">Athlete feedback and coach responses in one timeline.</div>',
+            unsafe_allow_html=True,
+        )
+
+        note_filter_label = st.selectbox(
+            "Note filter",
+            options=["All Notes", "Athlete", "Coach"],
+            key=f"note_filter_{athlete_key}",
+            label_visibility="collapsed",
+        )
+        role_filter = {
+            "All Notes": None,
+            "Athlete": "ATHLETE",
+            "Coach": "COACH",
+        }[note_filter_label]
+
+        try:
+            notes = load_athlete_notes(
+                athlete_key,
+                limit=40,
+                role_filter=role_filter,
+            )
+        except psycopg2.Error as error:
+            notes = []
+            st.error(f"Notes could not be loaded from Neon: {error}")
+
+        if notes:
+            for note in notes:
+                role = note.get("author_role", "ATHLETE").upper()
+                role_class = "coach" if role == "COACH" else "athlete"
+                safe_author = html.escape(str(note.get("author_name", "")))
+                safe_role = html.escape(role)
+                safe_time = html.escape(format_note_timestamp(note.get("created_at")))
+                safe_text = html.escape(str(note.get("note_text", ""))).replace("\n", "<br>")
+
+                note_html = (
+                    f'<div class="note-card note-card-{role_class}">'
+                    '<div class="note-header">'
+                    '<div class="note-author-wrap">'
+                    f'<span class="note-author">{safe_author}</span>'
+                    f'<span class="note-role note-role-{role_class}">{safe_role}</span>'
+                    '</div>'
+                    f'<span class="note-time">{safe_time}</span>'
+                    '</div>'
+                    f'<div class="note-body">{safe_text}</div>'
+                    '</div>'
+                )
+                st.markdown(note_html, unsafe_allow_html=True)
+        else:
+            st.info("No notes yet. Add the first training update for this athlete.")
+
+    with notes_compose_col:
+        with st.container(border=True):
+            st.markdown("### Add a note")
+            st.caption("Share how training went or leave a coaching response.")
+
+            with st.form(key=f"shared_note_form_{athlete_key}", clear_on_submit=True):
+                posting_as = st.selectbox(
+                    "Posting as",
+                    options=["Athlete", "Coach"],
+                    key=f"note_posting_as_{athlete_key}",
+                )
+
+                if posting_as == "Athlete":
+                    note_author_name = athlete_name
+                    note_author_role = "ATHLETE"
+                    st.caption(f"Posting as {athlete_name}")
+                else:
+                    note_author_name = "Coach Zarate"
+                    note_author_role = "COACH"
+                    st.caption("Posting as Coach Zarate")
+
+                new_note_text = st.text_area(
+                    "Note",
+                    height=180,
+                    placeholder=(
+                        "How did training go? Include effort, soreness, sleep, "
+                        "lactate, mechanics, recovery, or anything the coach should know."
+                    ),
+                    label_visibility="collapsed",
+                )
+
+                save_shared_note = st.form_submit_button(
+                    "Save Note",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if save_shared_note:
+                try:
+                    save_athlete_note(
+                        athlete_key=athlete_key,
+                        author_name=note_author_name,
+                        author_role=note_author_role,
+                        note_text=new_note_text,
+                    )
+                    st.success("Note added.")
+                    st.rerun()
+                except ValueError as error:
+                    st.warning(str(error))
+                except psycopg2.Error as error:
+                    st.error(f"The note could not be saved to Neon: {error}")
 
 
 
@@ -3233,95 +3261,96 @@ def vekdyn_predict_1500(
     }
 
 
-# =========================================================
-# PERFORMANCE PREDICTIONS — LIVE VEKDYN MODEL
-# =========================================================
+if dashboard_view in {"Dashboard", "Performance"}:
+    # =========================================================
+    # PERFORMANCE PREDICTIONS — LIVE VEKDYN MODEL
+    # =========================================================
 
-threshold_for_prediction = athlete.get("threshold", {})
+    threshold_for_prediction = athlete.get("threshold", {})
 
-# The current model assumes the athlete's elasticity/speed qualities are being
-# preserved unless future athlete/coach data says otherwise.
-elasticity_status = athlete.get("elasticity_status", "Preserved")
+    # The current model assumes the athlete's elasticity/speed qualities are being
+    # preserved unless future athlete/coach data says otherwise.
+    elasticity_status = athlete.get("elasticity_status", "Preserved")
 
-vekdyn_prediction = vekdyn_predict_1500(
-    personal_bests=personal_bests,
-    threshold=threshold_for_prediction,
-    volume_data=volume_data,
-    elasticity_status=elasticity_status,
-)
-
-with st.container(border=True):
-
-    st.subheader("Performance Predictions")
-
-    st.caption(
-        "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
-        "supported by threshold, volume compatibility, and preserved elasticity."
+    vekdyn_prediction = vekdyn_predict_1500(
+        personal_bests=personal_bests,
+        threshold=threshold_for_prediction,
+        volume_data=volume_data,
+        elasticity_status=elasticity_status,
     )
 
-    prediction_col, confidence_col, factors_col = st.columns([2, 1, 2])
+    with st.container(border=True):
 
-    with prediction_col:
-        st.caption("Predicted 1500m Range")
-
-        if vekdyn_prediction["available"]:
-            st.markdown(f"## {vekdyn_prediction['1500_range']}")
-            st.caption(
-                f"Estimated mile capability: {vekdyn_prediction['mile_display']}"
-            )
-        else:
-            st.markdown("## --")
-            st.caption(vekdyn_prediction["reason"])
-
-        st.caption("Prediction updates as athlete and training data change.")
-
-    with confidence_col:
-        confidence = vekdyn_prediction.get("confidence", 0)
-
-        st.metric(
-            "Confidence",
-            f"{confidence}%"
-        )
-
-        if confidence >= 85:
-            confidence_label = "High Confidence"
-        elif confidence >= 70:
-            confidence_label = "Moderate Confidence"
-        else:
-            confidence_label = "Developing Confidence"
-
-        st.caption(confidence_label)
-
-        recent_miles = vekdyn_prediction.get("weekly_miles")
-        if recent_miles is not None:
-            st.caption(f"Recent volume: {recent_miles:.1f} mi/wk")
-
-    with factors_col:
-        st.write("**Performance Factors**")
-
-        st.progress(
-            vekdyn_prediction.get("aerobic_score", 0) / 100,
-            text="Aerobic Fitness"
-        )
-
-        st.progress(
-            vekdyn_prediction.get("threshold_score", 0) / 100,
-            text="Threshold Fitness"
-        )
-
-        st.progress(
-            vekdyn_prediction.get("speed_score", 0) / 100,
-            text="Speed Reserve"
-        )
-
-        st.progress(
-            vekdyn_prediction.get("elasticity_score", 0) / 100,
-            text="Elasticity Preservation"
-        )
+        st.subheader("Performance Predictions")
 
         st.caption(
-            f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}"
+            "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
+            "supported by threshold, volume compatibility, and preserved elasticity."
         )
+
+        prediction_col, confidence_col, factors_col = st.columns([2, 1, 2])
+
+        with prediction_col:
+            st.caption("Predicted 1500m Range")
+
+            if vekdyn_prediction["available"]:
+                st.markdown(f"## {vekdyn_prediction['1500_range']}")
+                st.caption(
+                    f"Estimated mile capability: {vekdyn_prediction['mile_display']}"
+                )
+            else:
+                st.markdown("## --")
+                st.caption(vekdyn_prediction["reason"])
+
+            st.caption("Prediction updates as athlete and training data change.")
+
+        with confidence_col:
+            confidence = vekdyn_prediction.get("confidence", 0)
+
+            st.metric(
+                "Confidence",
+                f"{confidence}%"
+            )
+
+            if confidence >= 85:
+                confidence_label = "High Confidence"
+            elif confidence >= 70:
+                confidence_label = "Moderate Confidence"
+            else:
+                confidence_label = "Developing Confidence"
+
+            st.caption(confidence_label)
+
+            recent_miles = vekdyn_prediction.get("weekly_miles")
+            if recent_miles is not None:
+                st.caption(f"Recent volume: {recent_miles:.1f} mi/wk")
+
+        with factors_col:
+            st.write("**Performance Factors**")
+
+            st.progress(
+                vekdyn_prediction.get("aerobic_score", 0) / 100,
+                text="Aerobic Fitness"
+            )
+
+            st.progress(
+                vekdyn_prediction.get("threshold_score", 0) / 100,
+                text="Threshold Fitness"
+            )
+
+            st.progress(
+                vekdyn_prediction.get("speed_score", 0) / 100,
+                text="Speed Reserve"
+            )
+
+            st.progress(
+                vekdyn_prediction.get("elasticity_score", 0) / 100,
+                text="Elasticity Preservation"
+            )
+
+            st.caption(
+                f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}"
+            )
 
 
 # =========================================================
@@ -3565,44 +3594,46 @@ def render_team_workouts():
             render_team_workout_card(workout)
 
 
-render_team_workouts()
+if dashboard_view in {"Dashboard", "Training"}:
+    render_team_workouts()
 
 
-# =========================================================
-# THRESHOLD LACTATE PROFILE
-# =========================================================
+if dashboard_view in {"Dashboard", "Performance"}:
+    # =========================================================
+    # THRESHOLD LACTATE PROFILE
+    # =========================================================
 
-st.subheader("Threshold Lactate Profile")
+    st.subheader("Threshold Lactate Profile")
 
-threshold = athlete.get("threshold", {})
+    threshold = athlete.get("threshold", {})
 
-with st.container(border=True):
+    with st.container(border=True):
 
-    short_col, medium_col, long_col = st.columns(3)
+        short_col, medium_col, long_col = st.columns(3)
 
-    with short_col:
-        st.metric(
-            "Short Reps (1-3 min)",
-            f"{threshold.get('short_reps', {}).get('lactate', '--')} mmol"
-        )
-        st.caption(
-            threshold.get('short_reps', {}).get('pace', '--')
-        )
+        with short_col:
+            st.metric(
+                "Short Reps (1-3 min)",
+                f"{threshold.get('short_reps', {}).get('lactate', '--')} mmol"
+            )
+            st.caption(
+                threshold.get('short_reps', {}).get('pace', '--')
+            )
 
-    with medium_col:
-        st.metric(
-            "Medium Reps (5-10 min)",
-            f"{threshold.get('medium_reps', {}).get('lactate', '--')} mmol"
-        )
-        st.caption(
-            threshold.get('medium_reps', {}).get('pace', '--')
-        )
+        with medium_col:
+            st.metric(
+                "Medium Reps (5-10 min)",
+                f"{threshold.get('medium_reps', {}).get('lactate', '--')} mmol"
+            )
+            st.caption(
+                threshold.get('medium_reps', {}).get('pace', '--')
+            )
 
-    with long_col:
-        st.metric(
-            "Long Reps (10-15 min)",
-            f"{threshold.get('long_reps', {}).get('lactate', '--')} mmol"
-        )
-        st.caption(
-            threshold.get('long_reps', {}).get('pace', '--')
-        )
+        with long_col:
+            st.metric(
+                "Long Reps (10-15 min)",
+                f"{threshold.get('long_reps', {}).get('lactate', '--')} mmol"
+            )
+            st.caption(
+                threshold.get('long_reps', {}).get('pace', '--')
+            )
