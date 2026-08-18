@@ -2351,6 +2351,10 @@ with st.sidebar:
 
 athlete = athletes[athlete_key]
 profile = athlete["profile"]
+# Define the selected athlete name before any focused view is rendered.
+# This keeps Notes (and other focused pages) from depending on the Profile view
+# having run first.
+athlete_name = profile.get("name", "Unknown Athlete")
 personal_bests = athlete.get("pbs", {})
 xc_results = athlete.get("xc_results", {})
 training = athlete.get("training", {})
