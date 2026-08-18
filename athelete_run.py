@@ -31,8 +31,6 @@ TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
 def get_team_logo(team_id):
     """Return the same team-specific school image used on the landing card."""
     return get_team_image(team_id)
-
-
 def get_team_image(image_id):
     """Return a VEKDYN-controlled image from team_images by its unique ID."""
     for extension in (".png", ".jpg", ".jpeg", ".webp"):
