@@ -1201,11 +1201,21 @@ def lactate_value(threshold_lactate, key):
         return str(value)
 
 
+def remember_recent_team(team_id):
+    """Keep the three most recently opened teams at the top of the landing page."""
+    recent = list(st.session_state.get("recent_team_ids", []))
+    recent = [saved_id for saved_id in recent if saved_id != team_id]
+    recent.insert(0, team_id)
+    st.session_state["recent_team_ids"] = recent[:3]
+
+
 def open_team_workspace(team_id):
     """Send a visitor to the selected team's protected VEKDYN workspace."""
     if team_id not in TEAM_CONFIG:
         st.error("That VEKDYN team workspace is not configured.")
         return
+
+    remember_recent_team(team_id)
 
     # A session authenticated for one school must not silently open another.
     if (
@@ -1601,43 +1611,59 @@ def render_starter_page():
 
         normalized_search = school_search.strip().casefold()
 
+        # -------------------------------------------------
+        # RECENT TEAMS + SEARCH RESULTS
+        # -------------------------------------------------
+        # The landing page shows at most three recent teams. Any other configured
+        # school stays hidden until the coach searches for it.
+        default_recent = [
+            team_id for team_id in ("ollu_distance", "sam_houston")
+            if team_id in TEAM_CONFIG
+        ][:3]
+        recent_team_ids = [
+            team_id for team_id in st.session_state.get("recent_team_ids", default_recent)
+            if team_id in TEAM_CONFIG
+        ][:3]
+
+        def team_search_text(team_id):
+            config = team_config(team_id)
+            return " ".join([
+                team_id.replace("_", " "),
+                str(config.get("name", "")),
+                str(config.get("short_name", "")),
+            ]).casefold()
+
+        def team_meta(team_id):
+            roster_for_team = get_team_athletes(team_id)
+            if roster_for_team:
+                return f"{len(roster_for_team)} athletes connected"
+            return "Team workspace"
+
         if normalized_search:
-            searchable_teams = (
-                "our lady of the lake university ollu distance san antonio "
-                "sam houston state university sam houston shsu distance huntsville"
-            )
-
-            team_matches = any(
-                phrase in searchable_teams
-                for phrase in normalized_search.split()
-            )
-
-            if not team_matches:
-                st.info("No team account matches that search yet.")
-
-        # -------------------------------------------------
-        # RECENTLY ACCESSED — TEAM CARDS WITH IMAGES
-        # -------------------------------------------------
+            display_team_ids = [
+                team_id for team_id in TEAM_CONFIG
+                if all(
+                    word in team_search_text(team_id)
+                    for word in normalized_search.split()
+                )
+            ]
+            section_title = "Search results"
+        else:
+            display_team_ids = recent_team_ids
+            section_title = "Recently accessed"
 
         st.markdown(
-            '<div class="recent-heading">Recently accessed</div>',
+            f'<div class="recent-heading">{section_title}</div>',
             unsafe_allow_html=True,
         )
 
-        team_cards = [
-            (
-                "ollu_distance",
-                f"{len(ollu_athletes)} athletes connected",
-            ),
-            (
-                "sam_houston",
-                "Workspace being built",
-            ),
-        ]
+        if not display_team_ids:
+            st.info("No team account matches that search yet.")
 
-        for team_id, meta_text in team_cards:
+        for team_id in display_team_ids:
             config = team_config(team_id)
             team_image = get_team_image(team_id)
+            meta_text = team_meta(team_id)
 
             with st.container(border=True):
                 image_col, text_col, button_col = st.columns(
@@ -1645,49 +1671,23 @@ def render_starter_page():
                     vertical_alignment="center",
                 )
 
-                # Team-specific running image
                 with image_col:
                     if team_image:
-                        st.image(
-                            str(team_image),
-                            use_container_width=True,
-                        )
+                        st.image(str(team_image), use_container_width=True)
                     else:
-                        # Fallback to the school logo if no team image exists yet.
-                        team_logo = get_team_logo(team_id)
-                        if team_logo:
-                            st.image(str(team_logo), width=90)
-                        else:
-                            st.markdown(
-                                """
-                                <div style="
-                                    height:90px;
-                                    display:flex;
-                                    align-items:center;
-                                    justify-content:center;
-                                    font-size:32px;
-                                ">
-                                    🏃
-                                </div>
-                                """,
-                                unsafe_allow_html=True,
-                            )
+                        st.markdown(
+                            '<div style="height:90px;display:flex;align-items:center;'
+                            'justify-content:center;font-size:32px;">🏃</div>',
+                            unsafe_allow_html=True,
+                        )
 
-                # Team name and status
                 with text_col:
                     st.markdown(
-                        f"""
-                        <div class="recent-team-name">
-                            {config["name"]}
-                        </div>
-                        <div class="recent-team-meta">
-                            {meta_text}
-                        </div>
-                        """,
+                        f'<div class="recent-team-name">{html.escape(config["name"])}</div>'
+                        f'<div class="recent-team-meta">{html.escape(meta_text)}</div>',
                         unsafe_allow_html=True,
                     )
 
-                # Open the correct school workspace
                 with button_col:
                     if st.button(
                         "Open Team →",
@@ -3358,244 +3358,226 @@ if dashboard_view in {"Dashboard", "Performance"}:
 
 
 # =========================================================
-# TEAM WORKOUTS — EXCEL IMPORT
+# TEAM WORKOUTS — VEKDYN COACH PLANNER + NEON
 # =========================================================
 
-TEAM_WORKOUT_COLUMNS = [
-    "Date",
-    "Type",
-    "Warm Up",
-    "Workout",
-    "Cool Down",
-    "Notes",
+WORKOUT_TYPES = [
+    "Easy Run", "Recovery", "Long Run", "Threshold", "Intervals",
+    "Hills", "Race / Time Trial", "Strength", "Rest", "Other",
 ]
 
 
-def load_team_training_plan(uploaded_file):
-    """
-    Read one team-wide Excel training plan.
+def initialize_workouts_database():
+    """Create persistent team/athlete workout storage in Neon."""
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS team_workouts (
+                    id BIGSERIAL PRIMARY KEY,
+                    team_id TEXT NOT NULL,
+                    athlete_key TEXT,
+                    workout_date DATE NOT NULL,
+                    workout_type TEXT NOT NULL,
+                    warm_up TEXT,
+                    workout TEXT NOT NULL,
+                    cool_down TEXT,
+                    notes TEXT,
+                    created_by TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS team_workouts_lookup_idx
+                ON team_workouts (team_id, workout_date, athlete_key)
+                """
+            )
 
-    Expected columns:
-        Date | Type | Warm Up | Workout | Cool Down | Notes
 
-    The plan belongs to the whole team, so there is intentionally
-    no athlete column.
-    """
-    try:
-        plan = pd.read_excel(uploaded_file)
-    except Exception as error:
-        raise ValueError(f"VEKDYN could not read that Excel file: {error}") from error
+def save_team_workout(team_id, athlete_key, workout_date, workout_type,
+                      warm_up, workout, cool_down, notes):
+    """Save one coach-written workout. athlete_key=None means entire team."""
+    main_workout = str(workout).strip()
+    if not main_workout:
+        raise ValueError("Add the main workout before saving.")
 
-    # Normalize accidental leading/trailing spaces in Excel headers.
-    plan.columns = [str(column).strip() for column in plan.columns]
+    initialize_workouts_database()
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO team_workouts (
+                    team_id, athlete_key, workout_date, workout_type,
+                    warm_up, workout, cool_down, notes, created_by
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    team_id, athlete_key, workout_date, str(workout_type).strip(),
+                    str(warm_up).strip(), main_workout, str(cool_down).strip(),
+                    str(notes).strip(), st.session_state.get("logged_in_user", "Coach"),
+                ),
+            )
 
-    missing_columns = [
-        column
-        for column in TEAM_WORKOUT_COLUMNS
-        if column not in plan.columns
+
+def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
+    """Load team-wide workouts plus workouts assigned to the selected athlete."""
+    initialize_workouts_database()
+    today = datetime.now(TEAM_TIMEZONE).date()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            if selected_athlete_key:
+                cursor.execute(
+                    """
+                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                           workout, cool_down, notes
+                    FROM team_workouts
+                    WHERE team_id = %s
+                      AND workout_date >= %s
+                      AND (athlete_key IS NULL OR athlete_key = %s)
+                    ORDER BY workout_date ASC, id ASC
+                    LIMIT %s
+                    """,
+                    (team_id, today, selected_athlete_key, int(limit)),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                           workout, cool_down, notes
+                    FROM team_workouts
+                    WHERE team_id = %s
+                      AND workout_date >= %s
+                      AND athlete_key IS NULL
+                    ORDER BY workout_date ASC, id ASC
+                    LIMIT %s
+                    """,
+                    (team_id, today, int(limit)),
+                )
+            rows = cursor.fetchall()
+
+    return [
+        {
+            "id": row[0], "athlete_key": row[1], "Date": row[2],
+            "Type": row[3], "Warm Up": row[4] or "", "Workout": row[5],
+            "Cool Down": row[6] or "", "Notes": row[7] or "",
+        }
+        for row in rows
     ]
 
-    if missing_columns:
-        raise ValueError(
-            "The training plan is missing these columns: "
-            + ", ".join(missing_columns)
-        )
 
-    plan = plan[TEAM_WORKOUT_COLUMNS].copy()
-
-    plan["Date"] = pd.to_datetime(
-        plan["Date"],
-        errors="coerce",
-    )
-
-    plan = plan.dropna(subset=["Date"])
-
-    for column in ["Type", "Warm Up", "Workout", "Cool Down", "Notes"]:
-        plan[column] = (
-            plan[column]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-        )
-
-    # A workout needs at least the main Workout field.
-    plan = plan[
-        plan["Workout"].str.len() > 0
-    ].copy()
-
-    plan = plan.sort_values("Date").reset_index(drop=True)
-
-    if plan.empty:
-        raise ValueError(
-            "No valid workouts were found. Make sure Date and Workout are filled in."
-        )
-
-    return plan
+def delete_team_workout(workout_id, team_id):
+    """Delete one workout while keeping school data isolated."""
+    initialize_workouts_database()
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM team_workouts WHERE id = %s AND team_id = %s",
+                (int(workout_id), team_id),
+            )
 
 
 def workout_value(value, fallback="—"):
-    """Return a clean display value for workout-card text."""
-    value = str(value).strip()
-
-    if not value or value.lower() == "nan":
-        return fallback
-
-    return value
+    value = "" if value is None else str(value).strip()
+    return fallback if not value or value.lower() == "nan" else value
 
 
-def render_team_workout_card(workout):
-    """Render one workout using the clean VEKDYN card style."""
+def render_team_workout_card(workout, athlete_lookup):
     workout_date = pd.Timestamp(workout["Date"])
     date_label = workout_date.strftime("%a, %b %d")
-
-    workout_type = html.escape(
-        workout_value(workout.get("Type"), "Team Training")
-    )
-    warm_up = html.escape(
-        workout_value(workout.get("Warm Up"))
-    )
-    main_workout = html.escape(
-        workout_value(workout.get("Workout"))
-    )
-    cool_down = html.escape(
-        workout_value(workout.get("Cool Down"))
-    )
-    notes = html.escape(
-        workout_value(workout.get("Notes"), "")
+    assigned_key = workout.get("athlete_key")
+    assigned_name = (
+        athlete_lookup.get(assigned_key, {}).get("profile", {}).get("name", assigned_key)
+        if assigned_key else "Entire Team"
     )
 
-    details_html = (
-        f'<div class="team-workout-detail">'
-        f'<span class="team-workout-label">Warm-up</span>'
-        f'<span>{warm_up}</span>'
-        f'</div>'
-        f'<div class="team-workout-detail">'
-        f'<span class="team-workout-label">Workout</span>'
-        f'<span>{main_workout}</span>'
-        f'</div>'
-        f'<div class="team-workout-detail">'
-        f'<span class="team-workout-label">Cool-down</span>'
-        f'<span>{cool_down}</span>'
-        f'</div>'
-    )
-
-    notes_html = ""
-    if notes:
-        notes_html = (
-            f'<div class="team-workout-notes">'
-            f'<span class="team-workout-label">Coach notes</span><br>'
-            f'{notes}'
-            f'</div>'
-        )
-
-    st.markdown(
-        f"""
-        <div class="team-workout-card">
-            <div class="team-workout-date">{date_label}</div>
-            <div class="team-workout-type">{workout_type}</div>
-            {details_html}
-            {notes_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        st.caption(date_label)
+        st.markdown(f"### {workout_value(workout.get('Type'), 'Team Training')}")
+        st.caption(f"Assigned to: {assigned_name}")
+        st.markdown(f"**Warm-up:** {workout_value(workout.get('Warm Up'))}")
+        st.markdown(f"**Workout:** {workout_value(workout.get('Workout'))}")
+        st.markdown(f"**Cool-down:** {workout_value(workout.get('Cool Down'))}")
+        if workout_value(workout.get("Notes"), ""):
+            st.caption(f"Coach notes: {workout_value(workout.get('Notes'), '')}")
+        if st.button("Delete", key=f"delete_workout_{workout['id']}"):
+            delete_team_workout(workout["id"], active_team)
+            st.rerun()
 
 
 def render_team_workouts():
-    """
-    Import and display the shared OLLU team plan.
-
-    This first version keeps the imported workbook in Streamlit session state.
-    The next persistence step can save the same rows to Neon by team_id.
-    """
+    """Coach writes plans directly in VEKDYN; no Excel step required."""
     st.markdown(
         '<div class="team-workout-title">Upcoming Workouts</div>'
-        '<div class="team-workout-subtitle">'
-        'Team-wide training assigned by the coach.'
-        '</div>',
+        '<div class="team-workout-subtitle">Write and assign training without leaving VEKDYN.</div>',
         unsafe_allow_html=True,
     )
 
-    # Coach import control stays compact so the workout cards remain the focus.
-    with st.expander("Import team training plan (.xlsx)", expanded=False):
-        st.caption(
-            "Excel columns: Date, Type, Warm Up, Workout, Cool Down, Notes. "
-            "The same plan is shown for the entire roster."
-        )
+    team_athletes = get_team_athletes(active_team)
+    athlete_names = {
+        key: value.get("profile", {}).get("name", key)
+        for key, value in team_athletes.items()
+    }
+    name_to_key = {name: key for key, name in athlete_names.items()}
 
-        uploaded_plan = st.file_uploader(
-            "Upload Excel training plan",
-            type=["xlsx"],
-            key="team_training_plan_upload",
-            label_visibility="collapsed",
-        )
+    with st.expander("+ Write a workout", expanded=False):
+        assignment_options = ["Entire Team"] + sorted(name_to_key.keys())
+        with st.form(f"workout_form_{active_team}", clear_on_submit=True):
+            top_left, top_mid, top_right = st.columns(3)
+            with top_left:
+                assignment = st.selectbox("Assign to", assignment_options)
+            with top_mid:
+                workout_date = st.date_input("Date", value=datetime.now(TEAM_TIMEZONE).date())
+            with top_right:
+                workout_type = st.selectbox("Workout type", WORKOUT_TYPES)
 
-        if uploaded_plan is not None:
+            warm_up = st.text_area("Warm Up", placeholder="Example: 2 miles easy + drills")
+            main_workout = st.text_area(
+                "Main Workout",
+                placeholder="Example: 5 × 6 min LT, 1 min recovery",
+            )
+            cool_down = st.text_area("Cool Down", placeholder="Example: 2 miles easy")
+            notes = st.text_area("Coach Notes", placeholder="Optional cues, targets, or instructions")
+            submitted = st.form_submit_button(
+                "Save Workout", type="primary", use_container_width=True
+            )
+
+        if submitted:
+            assigned_key = None if assignment == "Entire Team" else name_to_key[assignment]
             try:
-                preview_plan = load_team_training_plan(uploaded_plan)
-
-                st.dataframe(
-                    preview_plan,
-                    hide_index=True,
-                    use_container_width=True,
+                save_team_workout(
+                    active_team, assigned_key, workout_date, workout_type,
+                    warm_up, main_workout, cool_down, notes,
                 )
-
-                if st.button(
-                    "Import Workouts",
-                    key="import_team_workouts_button",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    plan_key = f"team_training_plan_{active_team}"
-                    plan_name_key = f"team_training_plan_name_{active_team}"
-                    st.session_state[plan_key] = preview_plan
-                    st.session_state[plan_name_key] = uploaded_plan.name
-                    st.success(
-                        f"{len(preview_plan)} team workouts imported into VEKDYN."
-                    )
-                    st.rerun()
-
+                st.success("Workout saved to VEKDYN.")
+                st.rerun()
             except ValueError as error:
                 st.warning(str(error))
 
-    plan_key = f"team_training_plan_{active_team}"
-    training_plan = st.session_state.get(plan_key)
-
-    if training_plan is None or training_plan.empty:
-        st.info(
-            "No team training plan has been imported yet. "
-            "Upload the coach's Excel plan to populate this section."
-        )
+    try:
+        workouts = load_team_workouts(active_team, athlete_key, limit=12)
+    except Exception as error:
+        st.warning(f"VEKDYN could not load workouts: {error}")
         return
 
-    today = pd.Timestamp.now(tz=TEAM_TIMEZONE).tz_localize(None).normalize()
+    if not workouts:
+        st.info("No upcoming workouts have been written yet.")
+        return
 
-    upcoming = training_plan[
-        training_plan["Date"].dt.normalize() >= today
-    ].copy()
-
-    # If the plan has no future dates, show the most recent workouts instead
-    # so the section never looks broken during a demo.
-    if upcoming.empty:
-        upcoming = training_plan.tail(4).copy()
-        st.caption("No future workouts are entered. Showing the most recent sessions.")
-    else:
-        upcoming = upcoming.head(4)
-
-    source_name = st.session_state.get(
-        f"team_training_plan_name_{active_team}"
+    st.caption(
+        "Showing team workouts and any individual sessions assigned to "
+        f"{athlete_names.get(athlete_key, 'the selected athlete')}."
     )
-    if source_name:
-        st.caption(f"Training plan source: {source_name}")
 
-    workout_columns = st.columns(len(upcoming), gap="medium")
-
-    for column, (_, workout) in zip(
-        workout_columns,
-        upcoming.iterrows(),
-    ):
-        with column:
-            render_team_workout_card(workout)
+    for start_index in range(0, len(workouts), 3):
+        row = workouts[start_index:start_index + 3]
+        columns = st.columns(3, gap="medium")
+        for column, workout in zip(columns, row):
+            with column:
+                render_team_workout_card(workout, team_athletes)
 
 
 if dashboard_view in {"Dashboard", "Training"}:
