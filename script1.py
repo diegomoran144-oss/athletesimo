@@ -1,17 +1,12 @@
-a = 1
-b = 2
+athlete = {
+    "name": "Isai",
+    "sleep": 8
+}
 
-temp = a
+def athlete_time(sleep):
+    if athlete["sleep"]>= 8:
+        return 'athlete well rested'
+    else:
+        return 'athlete needs more sleep'
 
-a = b
-
-b = temp
-
-print(a)
-print(b)
-
-
-
-
-
-
+print('Isai is a '+ athlete(8))
