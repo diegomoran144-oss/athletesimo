@@ -476,7 +476,7 @@ STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 
-STRAVA_REDIRECT_URI = "https://atheleterunpy-n8eens7b7gdf4xcsn9vvzf.streamlit.app"
+STRAVA_REDIRECT_URI = "https://vekdyn.streamlit.app"
 
 
 # =========================================================
