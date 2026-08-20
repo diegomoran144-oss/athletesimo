@@ -285,7 +285,37 @@ def get_team_athletes(team_id):
     return {}
 
 
+# =========================================================
+# GLOBAL ATHLETE LOOKUP — USED BY STRAVA OAUTH
+# =========================================================
+# The dashboard still swaps `athletes` to the active team's roster later.
+# Strava OAuth, however, returns to a fresh Streamlit run before that team
+# routing happens. Therefore OAuth needs a lookup containing BOTH schools.
+
+all_athletes = {
+    **ollu_athletes,
+    **sam_houston_athletes,
+}
+
+# Map every athlete key back to the team that owns that profile.
+athlete_team_lookup = {
+    **{athlete_key: "ollu_distance" for athlete_key in ollu_athletes},
+    **{athlete_key: "sam_houston" for athlete_key in sam_houston_athletes},
+}
+
+# Fail early if the same athlete_id exists in both schools. Athlete keys are
+# also the primary keys used by Neon for Strava connections, so they must be
+# globally unique across VEKDYN.
+duplicate_cross_team_ids = set(ollu_athletes).intersection(sam_houston_athletes)
+if duplicate_cross_team_ids:
+    raise RuntimeError(
+        "These athlete_id values are duplicated across OLLU and Sam Houston: "
+        + ", ".join(sorted(duplicate_cross_team_ids))
+        + ". Give each athlete a globally unique athlete_id before using Strava."
+    )
+
 # Used by the public landing page before a private workspace is selected.
+# The private dashboard replaces this with get_team_athletes(active_team).
 athletes = ollu_athletes
 
 
@@ -904,7 +934,7 @@ def save_token_data(athlete_key, token_data):
         connection.get("strava_athlete_id")
     )
     if existing_owner and existing_owner != athlete_key:
-        owner_name = athletes.get(existing_owner, {}).get("profile", {}).get(
+        owner_name = all_athletes.get(existing_owner, {}).get("profile", {}).get(
             "name", existing_owner
         )
         raise RuntimeError(
@@ -927,7 +957,7 @@ def normalized_person_name(name):
 
 def verify_strava_identity(athlete_key, token_data):
     """Prevent one athlete's Strava account from being assigned to another."""
-    expected_name = athletes[athlete_key]["profile"].get("name", "")
+    expected_name = all_athletes[athlete_key]["profile"].get("name", "")
     strava_athlete = token_data.get("athlete", {})
     returned_name = " ".join(
         part
@@ -1744,22 +1774,35 @@ if authorization_code:
             returned_oauth_state
         )
 
-        if connected_athlete_key not in athletes:
+        if connected_athlete_key not in all_athletes:
             raise RuntimeError(
-                "The Strava connection could not be matched to an VEKDYN profile. "
+                "The Strava connection could not be matched to a VEKDYN profile. "
                 "Return to the dashboard and select Connect Strava again."
+            )
+
+        connected_team = athlete_team_lookup.get(connected_athlete_key)
+        if not connected_team:
+            raise RuntimeError(
+                "VEKDYN found the athlete but could not determine which team owns "
+                "the profile."
             )
 
         exchange_authorization_code(
             authorization_code,
             connected_athlete_key,
         )
-        connected_name = athletes[connected_athlete_key]["profile"]["name"]
+
+        connected_name = all_athletes[connected_athlete_key]["profile"]["name"]
+
         st.session_state[
             f"strava_message_{connected_athlete_key}"
         ] = f"{connected_name}'s Strava connected successfully."
+
+        # Return the coach to the same school/athlete that initiated OAuth.
         st.session_state["selected_athlete_key"] = connected_athlete_key
-        st.session_state["active_team"] = "ollu_distance"
+        st.session_state["active_team"] = connected_team
+        st.session_state["page"] = "dashboard"
+
         st.query_params.clear()
         st.rerun()
     except (
@@ -1775,7 +1818,7 @@ if authorization_code:
         oauth_athlete_key = athlete_key_from_oauth_state(returned_oauth_state)
 
         if (
-            oauth_athlete_key in athletes
+            oauth_athlete_key in all_athletes
             and strava_is_connected(oauth_athlete_key)
         ):
             st.session_state.pop(
