@@ -3409,7 +3409,6 @@ WORKOUT_TYPES = [
     "Hills", "Race / Time Trial", "Strength", "Rest", "Other",
 ]
 
-
 def initialize_workouts_database():
     """Create persistent team/athlete workout storage in Neon."""
     with get_database_connection() as database:
@@ -3470,8 +3469,8 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
     initialize_workouts_database()
     today = datetime.now(TEAM_TIMEZONE).date()
 
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
+    with get_database_connection() as database:3
+    with database.cursor() as cursor:
             if selected_athlete_key:
                 cursor.execute(
                     """
@@ -3501,16 +3500,19 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
                     (team_id, today, int(limit)),
                 )
             rows = cursor.fetchall()
-
-    return [
-        {
-            "id": row[0], "athlete_key": row[1], "Date": row[2],
-            "Type": row[3], "Warm Up": row[4] or "", "Workout": row[5],
-            "Cool Down": row[6] or "", "Notes": row[7] or "",
-        }
-        for row in rows
-    ]
-
+            return [
+    {
+        "id": row[0],
+        "athlete_key": row[1],
+        "Date": row[2],
+        "Type": row[3],
+        "Warm Up": row[4] or "",
+        "Workout": row[5],
+        "Cool Down": row[6] or "",
+        "Notes": row[7] or "",
+    }
+    for row in rows
+]
 
 def delete_team_workout(workout_id, team_id):
     """Delete one workout while keeping school data isolated."""
@@ -3629,40 +3631,155 @@ if dashboard_view in {"Dashboard", "Training"}:
 
 if dashboard_view in {"Dashboard", "Performance"}:
     # =========================================================
-    # THRESHOLD LACTATE PROFILE
+    # THRESHOLD LACTATE PROFILE - NEON
     # =========================================================
 
-    st.subheader("Threshold Lactate Profile")
+    def initialize_threshold_database():
+        """Create persistent athlete threshold profile storage in Neon."""
 
-    threshold = athlete.get("threshold", {})
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_threshold_profiles (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id TEXT NOT NULL,
+                        athlete_key TEXT NOT NULL,
 
-    with st.container(border=True):
+                        short_lactate REAL,
+                        short_pace TEXT,
 
-        short_col, medium_col, long_col = st.columns(3)
+                        medium_lactate REAL,
+                        medium_pace TEXT,
 
-        with short_col:
-            st.metric(
-                "Short Reps (1-3 min)",
-                f"{threshold.get('short_reps', {}).get('lactate', '--')} mmol"
-            )
-            st.caption(
-                threshold.get('short_reps', {}).get('pace', '--')
-            )
+                        long_lactate REAL,
+                        long_pace TEXT,
 
-        with medium_col:
-            st.metric(
-                "Medium Reps (5-10 min)",
-                f"{threshold.get('medium_reps', {}).get('lactate', '--')} mmol"
-            )
-            st.caption(
-                threshold.get('medium_reps', {}).get('pace', '--')
-            )
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-        with long_col:
-            st.metric(
-                "Long Reps (10-15 min)",
-                f"{threshold.get('long_reps', {}).get('lactate', '--')} mmol"
-            )
-            st.caption(
-                threshold.get('long_reps', {}).get('pace', '--')
-            )
+                        UNIQUE(team_id, athlete_key)
+                    )
+                    """
+                )
+
+            database.commit()
+
+
+    def save_threshold_profile(
+            team_id,
+            athlete_key,
+            short_lactate,
+            short_pace,
+            medium_lactate,
+            medium_pace,
+            long_lactate,
+            long_pace,
+    ):
+        """Save or update one athlete's threshold profile."""
+
+        initialize_threshold_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO athlete_threshold_profiles (
+                        team_id,
+                        athlete_key,
+                        short_lactate,
+                        short_pace,
+                        medium_lactate,
+                        medium_pace,
+                        long_lactate,
+                        long_pace
+                    )
+
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+
+                    ON CONFLICT (team_id, athlete_key)
+
+                    DO UPDATE SET
+                        short_lactate = EXCLUDED.short_lactate,
+                        short_pace = EXCLUDED.short_pace,
+
+                        medium_lactate = EXCLUDED.medium_lactate,
+                        medium_pace = EXCLUDED.medium_pace,
+
+                        long_lactate = EXCLUDED.long_lactate,
+                        long_pace = EXCLUDED.long_pace,
+
+                        updated_at = NOW()
+                    """,
+                    (
+                        team_id,
+                        athlete_key,
+
+                        short_lactate,
+                        short_pace,
+
+                        medium_lactate,
+                        medium_pace,
+
+                        long_lactate,
+                        long_pace,
+                    ),
+                )
+
+            database.commit()
+
+
+    def load_threshold_profile(team_id, athlete_key):
+        """Load one athlete's threshold profile from Neon."""
+
+        initialize_threshold_database()
+
+        if not athlete_key:
+            return {}
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        short_lactate,
+                        short_pace,
+                        medium_lactate,
+                        medium_pace,
+                        long_lactate,
+                        long_pace
+
+                    FROM athlete_threshold_profiles
+
+                    WHERE team_id = %s
+                      AND athlete_key = %s
+
+                    LIMIT 1
+                    """,
+                    (
+                        team_id,
+                        athlete_key,
+                    ),
+                )
+
+                row = cursor.fetchone()
+
+        if not row:
+            return {}
+
+        return {
+            "short_reps": {
+                "lactate": row[0],
+                "pace": row[1] or "--",
+            },
+
+            "medium_reps": {
+                "lactate": row[2],
+                "pace": row[3] or "--",
+            },
+
+            "long_reps": {
+                "lactate": row[4],
+                "pace": row[5] or "--",
+            },
+        }
+        
