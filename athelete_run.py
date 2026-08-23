@@ -3629,157 +3629,266 @@ if dashboard_view in {"Dashboard", "Training"}:
     render_team_workouts()
 
 
+# =========================================================
+# THRESHOLD LACTATE PROFILE — NEON
+# =========================================================
+
+def initialize_threshold_database():
+    """Create persistent athlete threshold profile storage in Neon."""
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS athlete_threshold_profiles (
+                    id BIGSERIAL PRIMARY KEY,
+                    team_id TEXT NOT NULL,
+                    athlete_key TEXT NOT NULL,
+                    short_lactate REAL,
+                    short_pace TEXT,
+                    medium_lactate REAL,
+                    medium_pace TEXT,
+                    long_lactate REAL,
+                    long_pace TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(team_id, athlete_key)
+                )
+                """
+            )
+        database.commit()
+
+
+def save_threshold_profile(
+    team_id,
+    athlete_key,
+    short_lactate,
+    short_pace,
+    medium_lactate,
+    medium_pace,
+    long_lactate,
+    long_pace,
+):
+    """Save or update one athlete's threshold profile in Neon."""
+    initialize_threshold_database()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO athlete_threshold_profiles (
+                    team_id, athlete_key,
+                    short_lactate, short_pace,
+                    medium_lactate, medium_pace,
+                    long_lactate, long_pace
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (team_id, athlete_key)
+                DO UPDATE SET
+                    short_lactate = EXCLUDED.short_lactate,
+                    short_pace = EXCLUDED.short_pace,
+                    medium_lactate = EXCLUDED.medium_lactate,
+                    medium_pace = EXCLUDED.medium_pace,
+                    long_lactate = EXCLUDED.long_lactate,
+                    long_pace = EXCLUDED.long_pace,
+                    updated_at = NOW()
+                """,
+                (
+                    team_id, athlete_key,
+                    short_lactate, short_pace,
+                    medium_lactate, medium_pace,
+                    long_lactate, long_pace,
+                ),
+            )
+        database.commit()
+
+
+def load_threshold_profile(team_id, athlete_key):
+    """Load one athlete's saved threshold profile from Neon."""
+    initialize_threshold_database()
+
+    if not athlete_key:
+        return {}
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    short_lactate, short_pace,
+                    medium_lactate, medium_pace,
+                    long_lactate, long_pace
+                FROM athlete_threshold_profiles
+                WHERE team_id = %s AND athlete_key = %s
+                LIMIT 1
+                """,
+                (team_id, athlete_key),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return {}
+
+    return {
+        "short_reps": {"lactate": row[0], "pace": row[1] or "--"},
+        "medium_reps": {"lactate": row[2], "pace": row[3] or "--"},
+        "long_reps": {"lactate": row[4], "pace": row[5] or "--"},
+    }
+
+
+# =========================================================
+# THRESHOLD LACTATE PROFILE — DISPLAY + COACH EDITOR
+# =========================================================
+
 if dashboard_view in {"Dashboard", "Performance"}:
-    # =========================================================
-    # THRESHOLD LACTATE PROFILE - NEON
-    # =========================================================
+    st.subheader("Threshold Lactate Profile")
 
-    def initialize_threshold_database():
-        """Create persistent athlete threshold profile storage in Neon."""
+    # Neon is the current source after a coach saves a profile.
+    # Until then, keep showing the original CSV threshold values.
+    try:
+        saved_threshold = load_threshold_profile(active_team, athlete_key)
+    except Exception as error:
+        saved_threshold = {}
+        st.warning(f"VEKDYN could not load saved threshold data: {error}")
 
-        with get_database_connection() as database:
-            with database.cursor() as cursor:
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS athlete_threshold_profiles (
-                        id BIGSERIAL PRIMARY KEY,
-                        team_id TEXT NOT NULL,
-                        athlete_key TEXT NOT NULL,
+    threshold = saved_threshold or athlete.get("threshold", {})
 
-                        short_lactate REAL,
-                        short_pace TEXT,
+    short_data = threshold.get("short_reps", {}) or {}
+    medium_data = threshold.get("medium_reps", {}) or {}
+    long_data = threshold.get("long_reps", {}) or {}
 
-                        medium_lactate REAL,
-                        medium_pace TEXT,
+    def threshold_display_lactate(rep_data):
+        value = rep_data.get("lactate")
+        if value in (None, "", "--"):
+            return "--"
+        try:
+            return f"{float(value):.1f}"
+        except (TypeError, ValueError):
+            return str(value)
 
-                        long_lactate REAL,
-                        long_pace TEXT,
+    def threshold_editor_lactate(rep_data):
+        value = rep_data.get("lactate")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    def threshold_editor_pace(rep_data):
+        value = rep_data.get("pace", "")
+        return "" if value in (None, "--") else str(value)
 
-                        UNIQUE(team_id, athlete_key)
-                    )
-                    """
+    # -----------------------------------------------------
+    # ORIGINAL THREE-CARD THRESHOLD DISPLAY
+    # -----------------------------------------------------
+    with st.container(border=True):
+        short_col, medium_col, long_col = st.columns(3)
+
+        with short_col:
+            st.metric(
+                "Short Reps (1–3 min)",
+                f"{threshold_display_lactate(short_data)} mmol",
+            )
+            st.caption(short_data.get("pace") or "--")
+
+        with medium_col:
+            st.metric(
+                "Medium Reps (5–10 min)",
+                f"{threshold_display_lactate(medium_data)} mmol",
+            )
+            st.caption(medium_data.get("pace") or "--")
+
+        with long_col:
+            st.metric(
+                "Long Reps (10–15 min)",
+                f"{threshold_display_lactate(long_data)} mmol",
+            )
+            st.caption(long_data.get("pace") or "--")
+
+    # -----------------------------------------------------
+    # COACH EDITOR — COLLAPSED UNTIL NEEDED
+    # -----------------------------------------------------
+    with st.expander("Edit Threshold Profile", expanded=False):
+        st.caption(
+            "Update this athlete's threshold values. Saved values persist in Neon."
+        )
+
+        with st.form(
+            f"threshold_profile_form_{active_team}_{athlete_key}",
+            clear_on_submit=False,
+        ):
+            short_col, medium_col, long_col = st.columns(3)
+
+            with short_col:
+                st.markdown("**Short Reps (1–3 min)**")
+                short_lactate = st.number_input(
+                    "Lactate (mmol)",
+                    min_value=0.0,
+                    max_value=20.0,
+                    value=threshold_editor_lactate(short_data),
+                    step=0.1,
+                    format="%.1f",
+                    key=f"short_lactate_{active_team}_{athlete_key}",
+                )
+                short_pace = st.text_input(
+                    "Pace",
+                    value=threshold_editor_pace(short_data),
+                    placeholder="Example: 5:00/mi",
+                    key=f"short_pace_{active_team}_{athlete_key}",
                 )
 
-            database.commit()
-
-
-    def save_threshold_profile(
-            team_id,
-            athlete_key,
-            short_lactate,
-            short_pace,
-            medium_lactate,
-            medium_pace,
-            long_lactate,
-            long_pace,
-    ):
-        """Save or update one athlete's threshold profile."""
-
-        initialize_threshold_database()
-
-        with get_database_connection() as database:
-            with database.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO athlete_threshold_profiles (
-                        team_id,
-                        athlete_key,
-                        short_lactate,
-                        short_pace,
-                        medium_lactate,
-                        medium_pace,
-                        long_lactate,
-                        long_pace
-                    )
-
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-
-                    ON CONFLICT (team_id, athlete_key)
-
-                    DO UPDATE SET
-                        short_lactate = EXCLUDED.short_lactate,
-                        short_pace = EXCLUDED.short_pace,
-
-                        medium_lactate = EXCLUDED.medium_lactate,
-                        medium_pace = EXCLUDED.medium_pace,
-
-                        long_lactate = EXCLUDED.long_lactate,
-                        long_pace = EXCLUDED.long_pace,
-
-                        updated_at = NOW()
-                    """,
-                    (
-                        team_id,
-                        athlete_key,
-
-                        short_lactate,
-                        short_pace,
-
-                        medium_lactate,
-                        medium_pace,
-
-                        long_lactate,
-                        long_pace,
-                    ),
+            with medium_col:
+                st.markdown("**Medium Reps (5–10 min)**")
+                medium_lactate = st.number_input(
+                    "Lactate (mmol)",
+                    min_value=0.0,
+                    max_value=20.0,
+                    value=threshold_editor_lactate(medium_data),
+                    step=0.1,
+                    format="%.1f",
+                    key=f"medium_lactate_{active_team}_{athlete_key}",
+                )
+                medium_pace = st.text_input(
+                    "Pace",
+                    value=threshold_editor_pace(medium_data),
+                    placeholder="Example: 5:10/mi",
+                    key=f"medium_pace_{active_team}_{athlete_key}",
                 )
 
-            database.commit()
-
-
-    def load_threshold_profile(team_id, athlete_key):
-        """Load one athlete's threshold profile from Neon."""
-
-        initialize_threshold_database()
-
-        if not athlete_key:
-            return {}
-
-        with get_database_connection() as database:
-            with database.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        short_lactate,
-                        short_pace,
-                        medium_lactate,
-                        medium_pace,
-                        long_lactate,
-                        long_pace
-
-                    FROM athlete_threshold_profiles
-
-                    WHERE team_id = %s
-                      AND athlete_key = %s
-
-                    LIMIT 1
-                    """,
-                    (
-                        team_id,
-                        athlete_key,
-                    ),
+            with long_col:
+                st.markdown("**Long Reps (10–15 min)**")
+                long_lactate = st.number_input(
+                    "Lactate (mmol)",
+                    min_value=0.0,
+                    max_value=20.0,
+                    value=threshold_editor_lactate(long_data),
+                    step=0.1,
+                    format="%.1f",
+                    key=f"long_lactate_{active_team}_{athlete_key}",
+                )
+                long_pace = st.text_input(
+                    "Pace",
+                    value=threshold_editor_pace(long_data),
+                    placeholder="Example: 5:20/mi",
+                    key=f"long_pace_{active_team}_{athlete_key}",
                 )
 
-                row = cursor.fetchone()
+            save_threshold = st.form_submit_button(
+                "Save Threshold Profile",
+                type="primary",
+                use_container_width=True,
+            )
 
-        if not row:
-            return {}
-
-        return {
-            "short_reps": {
-                "lactate": row[0],
-                "pace": row[1] or "--",
-            },
-
-            "medium_reps": {
-                "lactate": row[2],
-                "pace": row[3] or "--",
-            },
-
-            "long_reps": {
-                "lactate": row[4],
-                "pace": row[5] or "--",
-            },
-        }
-        
+        if save_threshold:
+            try:
+                save_threshold_profile(
+                    active_team,
+                    athlete_key,
+                    short_lactate,
+                    short_pace.strip(),
+                    medium_lactate,
+                    medium_pace.strip(),
+                    long_lactate,
+                    long_pace.strip(),
+                )
+                st.success("Threshold profile saved.")
+                st.rerun()
+            except Exception as error:
+                st.error(f"VEKDYN could not save the threshold profile: {error}")
