@@ -415,9 +415,13 @@ def validate_login_token(token):
         return None
 
     try:
-        team_id, username, expires_at, returned_signature = token.rsplit(":", 3)
+        token_parts = str(token).rsplit(":", 3)
+        if len(token_parts) != 4:
+            return None
+
+        team_id, username, expires_at, returned_signature = token_parts
         expires_at = int(expires_at)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return None
 
     if team_id not in TEAM_CONFIG or time.time() > expires_at:
@@ -504,15 +508,29 @@ def test_neon_connection():
 
 def initialize_athlete_login_database():
     """
-    Create/upgrade the shared athlete login table in Neon.
+    Create/upgrade the ONE shared athlete-login table used by both
+    VEKDYN Coach and VEKDYN Athlete.
 
-    athlete_id is the username used in VEKDYN Athlete.
-    athlete_key is the permanent athlete key already used by
-    workouts, threshold profiles, notes, and Strava.
+    Canonical columns:
+        athlete_id
+        athlete_key
+        team_id
+        display_name
+        event_group
+        password_hash
+        active
+        password_updated_at
+
+    Older columns such as athlete_name / updated_at are preserved if they
+    already exist, but their values are copied into the canonical columns.
     """
 
     with get_database_connection() as database:
         with database.cursor() as cursor:
+
+            # ---------------------------------------------------------
+            # BASE TABLE
+            # ---------------------------------------------------------
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS athlete_logins (
@@ -523,26 +541,30 @@ def initialize_athlete_login_database():
                 """
             )
 
-            # Upgrade the original three-column table without
-            # deleting any existing athlete accounts.
+            # ---------------------------------------------------------
+            # CANONICAL SHARED COLUMNS
+            # ---------------------------------------------------------
             cursor.execute(
                 """
                 ALTER TABLE athlete_logins
                 ADD COLUMN IF NOT EXISTS athlete_key TEXT
                 """
             )
+
             cursor.execute(
                 """
                 ALTER TABLE athlete_logins
                 ADD COLUMN IF NOT EXISTS team_id TEXT
                 """
             )
+
             cursor.execute(
                 """
                 ALTER TABLE athlete_logins
                 ADD COLUMN IF NOT EXISTS display_name TEXT
                 """
             )
+
             cursor.execute(
                 """
                 ALTER TABLE athlete_logins
@@ -550,10 +572,64 @@ def initialize_athlete_login_database():
                 DEFAULT 'Distance'
                 """
             )
+
             cursor.execute(
                 """
                 ALTER TABLE athlete_logins
                 ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ
+                """
+            )
+
+            # ---------------------------------------------------------
+            # MIGRATE VALUES FROM OLDER ATHLETE-APP COLUMN NAMES
+            # ---------------------------------------------------------
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'athlete_logins'
+                """
+            )
+            existing_columns = {row[0] for row in cursor.fetchall()}
+
+            if "athlete_name" in existing_columns:
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET display_name = athlete_name
+                    WHERE (display_name IS NULL OR BTRIM(display_name) = '')
+                      AND athlete_name IS NOT NULL
+                      AND BTRIM(athlete_name) <> ''
+                    """
+                )
+
+            if "updated_at" in existing_columns:
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET password_updated_at = updated_at
+                    WHERE password_updated_at IS NULL
+                      AND updated_at IS NOT NULL
+                    """
+                )
+
+            # Every existing account needs a permanent athlete_key.
+            cursor.execute(
+                """
+                UPDATE athlete_logins
+                SET athlete_key = athlete_id
+                WHERE athlete_key IS NULL
+                   OR BTRIM(athlete_key) = ''
+                """
+            )
+
+            cursor.execute(
+                """
+                UPDATE athlete_logins
+                SET event_group = 'Distance'
+                WHERE event_group IS NULL
+                   OR BTRIM(event_group) = ''
                 """
             )
 
