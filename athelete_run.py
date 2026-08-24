@@ -499,6 +499,315 @@ def test_neon_connection():
 
 
 # =========================================================
+# ATHLETE LOGIN ACCOUNTS — COACH MANAGEMENT
+# =========================================================
+
+def initialize_athlete_login_database():
+    """
+    Create/upgrade the shared athlete login table in Neon.
+
+    athlete_id is the username used in VEKDYN Athlete.
+    athlete_key is the permanent athlete key already used by
+    workouts, threshold profiles, notes, and Strava.
+    """
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS athlete_logins (
+                    athlete_id TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT TRUE
+                )
+                """
+            )
+
+            # Upgrade the original three-column table without
+            # deleting any existing athlete accounts.
+            cursor.execute(
+                """
+                ALTER TABLE athlete_logins
+                ADD COLUMN IF NOT EXISTS athlete_key TEXT
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE athlete_logins
+                ADD COLUMN IF NOT EXISTS team_id TEXT
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE athlete_logins
+                ADD COLUMN IF NOT EXISTS display_name TEXT
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE athlete_logins
+                ADD COLUMN IF NOT EXISTS event_group TEXT
+                DEFAULT 'Distance'
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE athlete_logins
+                ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ
+                """
+            )
+
+        database.commit()
+
+
+def get_athlete_login_account(athlete_key):
+    """Return the current VEKDYN Athlete account for one athlete."""
+
+    initialize_athlete_login_database()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    athlete_id,
+                    athlete_key,
+                    team_id,
+                    display_name,
+                    event_group,
+                    active,
+                    password_updated_at
+                FROM athlete_logins
+                WHERE athlete_key = %s
+                   OR athlete_id = %s
+                LIMIT 1
+                """,
+                (athlete_key, athlete_key),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "athlete_id": row[0],
+        "athlete_key": row[1] or row[0],
+        "team_id": row[2],
+        "display_name": row[3],
+        "event_group": row[4] or "Distance",
+        "active": bool(row[5]),
+        "password_updated_at": row[6],
+    }
+
+
+def generate_temporary_password():
+    """Generate a readable but strong one-time athlete password."""
+
+    alphabet = string.ascii_letters + string.digits
+    groups = [
+        "".join(secrets.choice(alphabet) for _ in range(4)),
+        "".join(secrets.choice(alphabet) for _ in range(4)),
+        "".join(secrets.choice(alphabet) for _ in range(4)),
+    ]
+    return "Vkd-" + "-".join(groups)
+
+
+def create_or_reset_athlete_login(
+    athlete_key,
+    team_id,
+    display_name,
+    event_group="Distance",
+):
+    """
+    Create an athlete account or reset its password.
+
+    Only the bcrypt hash is persisted to Neon. The readable
+    temporary password is returned to the coach for delivery
+    to the athlete.
+    """
+
+    initialize_athlete_login_database()
+
+    athlete_id = str(athlete_key).strip().lower()
+    clean_key = str(athlete_key).strip()
+    clean_name = str(display_name).strip() or clean_key
+    clean_team = str(team_id).strip()
+    clean_event_group = str(event_group).strip() or "Distance"
+
+    if not athlete_id or not clean_key or not clean_team:
+        raise ValueError("Athlete ID, athlete key, and team are required.")
+
+    temporary_password = generate_temporary_password()
+    password_hash = bcrypt.hashpw(
+        temporary_password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO athlete_logins (
+                    athlete_id,
+                    athlete_key,
+                    team_id,
+                    display_name,
+                    event_group,
+                    password_hash,
+                    active,
+                    password_updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW())
+
+                ON CONFLICT (athlete_id)
+                DO UPDATE SET
+                    athlete_key = EXCLUDED.athlete_key,
+                    team_id = EXCLUDED.team_id,
+                    display_name = EXCLUDED.display_name,
+                    event_group = EXCLUDED.event_group,
+                    password_hash = EXCLUDED.password_hash,
+                    active = TRUE,
+                    password_updated_at = NOW()
+                """,
+                (
+                    athlete_id,
+                    clean_key,
+                    clean_team,
+                    clean_name,
+                    clean_event_group,
+                    password_hash,
+                ),
+            )
+
+        database.commit()
+
+    return athlete_id, temporary_password
+
+
+def set_athlete_login_active(athlete_key, active):
+    """Enable or disable an athlete login without deleting its history."""
+
+    initialize_athlete_login_database()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE athlete_logins
+                SET active = %s
+                WHERE athlete_key = %s OR athlete_id = %s
+                """,
+                (bool(active), athlete_key, athlete_key),
+            )
+        database.commit()
+
+
+def render_athlete_account_manager(athlete_key, profile, team_id):
+    """Coach-facing controls for one athlete's VEKDYN Athlete login."""
+
+    athlete_name = profile.get("name", athlete_key)
+    event_group = profile.get("team", "Distance") or "Distance"
+
+    try:
+        account = get_athlete_login_account(athlete_key)
+    except psycopg2.Error as error:
+        st.error(f"VEKDYN could not load this athlete account: {error}")
+        return
+
+    st.subheader("Athlete Account")
+    st.caption(
+        "Create the private login this athlete will use in VEKDYN Athlete. "
+        "The temporary password is never stored in readable form."
+    )
+
+    with st.container(border=True):
+        status_col, id_col = st.columns([1, 2])
+
+        with status_col:
+            if account and account.get("active"):
+                st.success("Login active")
+            elif account:
+                st.warning("Login disabled")
+            else:
+                st.info("No login created")
+
+        with id_col:
+            login_id = account.get("athlete_id") if account else str(athlete_key).lower()
+            st.markdown(f"**Athlete ID:** `{login_id}`")
+            st.caption(f"Linked to {athlete_name} · {team_config(team_id)['short_name']}")
+
+        button_label = (
+            "Reset Temporary Password"
+            if account
+            else "Create Athlete Login"
+        )
+
+        if st.button(
+            button_label,
+            type="primary",
+            use_container_width=True,
+            key=f"athlete_login_create_reset_{team_id}_{athlete_key}",
+        ):
+            try:
+                new_athlete_id, temporary_password = create_or_reset_athlete_login(
+                    athlete_key=athlete_key,
+                    team_id=team_id,
+                    display_name=athlete_name,
+                    event_group=event_group,
+                )
+
+                st.session_state[f"temp_login_id_{athlete_key}"] = new_athlete_id
+                st.session_state[f"temp_password_{athlete_key}"] = temporary_password
+                st.session_state[f"temp_password_notice_{athlete_key}"] = True
+
+                st.rerun()
+
+            except (ValueError, psycopg2.Error) as error:
+                st.error(f"VEKDYN could not create the athlete login: {error}")
+
+        temp_password = st.session_state.get(f"temp_password_{athlete_key}")
+        temp_login_id = st.session_state.get(f"temp_login_id_{athlete_key}")
+
+        if temp_password and temp_login_id:
+            st.success("Temporary athlete credentials generated.")
+            st.code(
+                f"Athlete ID: {temp_login_id}\n"
+                f"Temporary password: {temp_password}",
+                language=None,
+            )
+            st.caption(
+                "Give these credentials directly to the athlete. "
+                "The readable password is only being kept in this coach session."
+            )
+
+            if st.button(
+                "Clear Temporary Password",
+                use_container_width=True,
+                key=f"clear_temp_password_{team_id}_{athlete_key}",
+            ):
+                st.session_state.pop(f"temp_login_id_{athlete_key}", None)
+                st.session_state.pop(f"temp_password_{athlete_key}", None)
+                st.session_state.pop(f"temp_password_notice_{athlete_key}", None)
+                st.rerun()
+
+        if account:
+            st.divider()
+            active_now = bool(account.get("active"))
+            toggle_label = "Disable Athlete Login" if active_now else "Enable Athlete Login"
+
+            if st.button(
+                toggle_label,
+                use_container_width=True,
+                key=f"toggle_athlete_login_{team_id}_{athlete_key}_{active_now}",
+            ):
+                try:
+                    set_athlete_login_active(athlete_key, not active_now)
+                    st.rerun()
+                except psycopg2.Error as error:
+                    st.error(f"VEKDYN could not update login status: {error}")
+
+
+# =========================================================
 # STRAVA SETTINGS
 # =========================================================
 
@@ -2574,6 +2883,18 @@ if dashboard_view in {"Dashboard", "Profile"}:
                     """,
                     unsafe_allow_html=True,
                 )
+
+# =========================================================
+# ATHLETE LOGIN MANAGEMENT
+# =========================================================
+
+if dashboard_view in {"Dashboard", "Profile"}:
+    render_athlete_account_manager(
+        athlete_key=athlete_key,
+        profile=profile,
+        team_id=active_team,
+    )
+
 
 if dashboard_view in {"Dashboard", "Profile", "Performance", "Recovery"}:
     # =========================================================
