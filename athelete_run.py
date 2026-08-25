@@ -4279,7 +4279,6 @@ if dashboard_view in {"Dashboard", "Performance"}:
                 st.rerun()
             except Exception as error:
                 st.error(f"VEKDYN could not save the threshold profile: {error}")
-```
 
 # =========================================================
 # ATHLETE ACCESS & CONNECTIONS — COLLAPSED ADMIN CONTROLS
