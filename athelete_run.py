@@ -2962,18 +2962,6 @@ if dashboard_view in {"Dashboard", "Profile"}:
                     unsafe_allow_html=True,
                 )
 
-# =========================================================
-# ATHLETE LOGIN MANAGEMENT
-# =========================================================
-
-if dashboard_view in {"Dashboard", "Profile"}:
-    render_athlete_account_manager(
-        athlete_key=athlete_key,
-        profile=profile,
-        team_id=active_team,
-    )
-
-
 if dashboard_view in {"Dashboard", "Profile", "Performance", "Recovery"}:
     # =========================================================
     # PERFORMANCE BESTS AND DATA SOURCE
@@ -4291,3 +4279,45 @@ if dashboard_view in {"Dashboard", "Performance"}:
                 st.rerun()
             except Exception as error:
                 st.error(f"VEKDYN could not save the threshold profile: {error}")
+```
+
+# =========================================================
+# ATHLETE ACCESS & CONNECTIONS — COLLAPSED ADMIN CONTROLS
+# =========================================================
+
+if dashboard_view in {"Dashboard", "Performance"}:
+    st.divider()
+    with st.expander("Athlete Access & Connections", expanded=False):
+        st.caption(
+            "Manage this athlete's VEKDYN login and review the connected training account. "
+            "These controls stay collapsed during normal coaching use."
+        )
+
+        # Keep the existing secure account workflow. Readable temporary passwords
+        # only appear immediately after Create/Reset and disappear when cleared.
+        render_athlete_account_manager(
+            athlete_key=athlete_key,
+            profile=profile,
+            team_id=active_team,
+        )
+
+        st.divider()
+        st.markdown("#### Training Connection")
+
+        try:
+            coach_strava_connection = athlete_strava_connection(athlete_key)
+        except Exception as error:
+            coach_strava_connection = {}
+            st.warning(f"VEKDYN could not load this athlete's Strava connection: {error}")
+
+        if coach_strava_connection:
+            connected_name = coach_strava_connection.get("strava_name") or athlete_name
+            st.success(f"Strava connected — {connected_name}")
+            st.caption(
+                "Training data is stored through the athlete's VEKDYN connection and is available to the coach dashboard."
+            )
+        else:
+            st.info("Strava not connected")
+            st.caption(
+                "The athlete can authorize Strava from VEKDYN Athlete. Coach-side connection is only needed as an administrative fallback."
+            )
