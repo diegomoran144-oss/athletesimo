@@ -3354,7 +3354,7 @@ def vekdyn_linear_score(value, slow_value, fast_value, low_score, high_score):
     return int(round(low_score + fraction * (high_score - low_score)))
 
 
-def vekdyn_speed_reserve_score(eight_seconds):
+def vekdyn_male_speed_reserve_score(eight_seconds):
     """Male distance-runner speed-reserve scale discussed for VEKDYN."""
     if eight_seconds is None:
         return 0, "No 800m PB"
@@ -3372,7 +3372,7 @@ def vekdyn_speed_reserve_score(eight_seconds):
     return min(100, vekdyn_linear_score(eight_seconds, 110, 105, 88, 100)), "National"
 
 
-def vekdyn_aerobic_score(five_k_seconds):
+def vekdyn_male_aerobic_score(five_k_seconds):
     """Continuous 5K ability score using the VEKDYN male distance framework."""
     if five_k_seconds is None:
         return 0, "No 5K PB"
@@ -3471,7 +3471,7 @@ def vekdyn_recent_mileage(volume_data):
         return None
 
 
-def vekdyn_volume_compatibility(eight_seconds, weekly_miles):
+def vekdyn_male_volume_compatibility(eight_seconds, weekly_miles):
     """
     VEKDYN volume/speed-reserve compatibility heuristic.
     This is a performance-model assumption, not a safety cutoff.
@@ -3499,6 +3499,116 @@ def vekdyn_volume_compatibility(eight_seconds, weekly_miles):
 
     gap = weekly_miles - target_high
     return max(35, int(round(85 - gap * 2.5))), "Check elasticity"
+
+
+# =========================================================
+# WOMEN'S PERFORMANCE MODEL — V1
+# =========================================================
+# The women's model is intentionally more aerobic-strength weighted than the
+# men's model. Threshold values are displayed as coach data but are not yet
+# used to move the women's prediction until VEKDYN has enough testing data to
+# calibrate that relationship.
+
+def vekdyn_is_female(profile):
+    sex = str((profile or {}).get("sex", "")).strip().casefold()
+    return sex in {"f", "female", "woman", "women", "w"}
+
+
+def vekdyn_women_speed_reserve_score(eight_seconds):
+    if eight_seconds is None:
+        return 0, "No 800m PB"
+    if eight_seconds >= 152:  # 2:32+
+        return 15, "Low"
+    if eight_seconds >= 145:  # 2:25-2:32
+        return vekdyn_linear_score(eight_seconds, 152, 145, 15, 28), "Low"
+    if eight_seconds >= 140:  # 2:20-2:24
+        return vekdyn_linear_score(eight_seconds, 145, 140, 28, 42), "Adequate"
+    if eight_seconds >= 135:  # 2:15-2:19
+        return vekdyn_linear_score(eight_seconds, 140, 135, 42, 58), "Good"
+    if eight_seconds >= 130:  # 2:10-2:14
+        return vekdyn_linear_score(eight_seconds, 135, 130, 58, 74), "High"
+    if eight_seconds >= 125:  # 2:05-2:09
+        return vekdyn_linear_score(eight_seconds, 130, 125, 74, 90), "Very High"
+    return min(100, vekdyn_linear_score(eight_seconds, 125, 120, 90, 100)), "Elite"
+
+
+def vekdyn_women_aerobic_score(five_k_seconds):
+    if five_k_seconds is None:
+        return 0, "No 5K PB"
+    if five_k_seconds >= 1140:       # 19:00+
+        return 18, "Developing"
+    if five_k_seconds >= 1100:       # 19:00-18:20
+        return vekdyn_linear_score(five_k_seconds, 1140, 1100, 20, 35), "Okay"
+    if five_k_seconds >= 1030:       # 18:20-17:10
+        return vekdyn_linear_score(five_k_seconds, 1100, 1030, 35, 58), "Good"
+    if five_k_seconds >= 970:        # 17:10-16:10
+        return vekdyn_linear_score(five_k_seconds, 1030, 970, 58, 78), "Competitive"
+    if five_k_seconds >= 920:        # 16:10-15:20
+        return vekdyn_linear_score(five_k_seconds, 970, 920, 78, 92), "Elite"
+    return min(100, vekdyn_linear_score(five_k_seconds, 920, 870, 92, 100)), "Pro-level"
+
+
+def vekdyn_women_volume_compatibility(eight_seconds, weekly_miles):
+    if weekly_miles is None:
+        return 50, "Unknown"
+    if weekly_miles < 30:
+        return max(35, int(round(65 - (30 - weekly_miles) * 2))), "Below model range"
+    if weekly_miles < 45:
+        # Low for a 5K profile, but reasonable for an 800/1500 athlete.
+        score = 82 if eight_seconds is not None and eight_seconds <= 135 else 72
+        return score, "Low / middle-distance appropriate"
+    if weekly_miles < 60:
+        return 94, "Balanced"
+    if weekly_miles <= 80:
+        return 86, "High"
+    return max(45, int(round(78 - (weekly_miles - 80) * 1.5))), "Very high / specialized"
+
+
+VEKDYN_WOMEN_800_GRID = [152, 145, 140, 135, 130, 125, 120]
+VEKDYN_WOMEN_5K_GRID = [1140, 1100, 1030, 970, 920, 880]
+
+# Women's 1500 capability surface (seconds). 5K strength carries more weight
+# than in the men's surface, while 800 speed remains an important modifier.
+VEKDYN_WOMEN_1500_MATRIX = [
+    [325, 314, 296, 281, 267, 259],  # 2:32
+    [317, 307, 290, 276, 263, 255],  # 2:25
+    [311, 301, 284, 271, 260, 252],  # 2:20
+    [304, 295, 279, 267, 257, 249],  # 2:15
+    [298, 289, 274, 263, 253, 246],  # 2:10
+    [292, 283, 269, 259, 249, 242],  # 2:05
+    [287, 278, 264, 254, 245, 238],  # 2:00
+]
+
+
+def vekdyn_women_base_1500_prediction(eight_seconds, five_k_seconds):
+    if eight_seconds is None or five_k_seconds is None:
+        return None
+
+    eight = max(min(eight_seconds, max(VEKDYN_WOMEN_800_GRID)), min(VEKDYN_WOMEN_800_GRID))
+    five_k = max(min(five_k_seconds, max(VEKDYN_WOMEN_5K_GRID)), min(VEKDYN_WOMEN_5K_GRID))
+
+    e_fast, e_slow = vekdyn_bracket(eight, VEKDYN_WOMEN_800_GRID, descending=False)
+    f_fast, f_slow = vekdyn_bracket(five_k, VEKDYN_WOMEN_5K_GRID, descending=False)
+
+    def matrix_value(e_value, f_value):
+        row = VEKDYN_WOMEN_800_GRID.index(e_value)
+        col = VEKDYN_WOMEN_5K_GRID.index(f_value)
+        return VEKDYN_WOMEN_1500_MATRIX[row][col]
+
+    q11 = matrix_value(e_fast, f_fast)
+    q12 = matrix_value(e_fast, f_slow)
+    q21 = matrix_value(e_slow, f_fast)
+    q22 = matrix_value(e_slow, f_slow)
+
+    if f_fast == f_slow:
+        top, bottom = q11, q21
+    else:
+        top = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q11, q12)
+        bottom = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q21, q22)
+
+    if e_fast == e_slow:
+        return top
+    return vekdyn_interpolate_1d(eight, e_fast, e_slow, top, bottom)
 
 
 VEKDYN_800_GRID = [122, 119, 117, 115, 112, 110, 108]
@@ -3546,7 +3656,7 @@ def vekdyn_bracket(value, grid, descending=False):
     return ordered[-1], ordered[-1]
 
 
-def vekdyn_base_mile_prediction(eight_seconds, five_k_seconds):
+def vekdyn_male_base_mile_prediction(eight_seconds, five_k_seconds):
     """
     Bilinear interpolation across the VEKDYN 800 x 5K matrix.
     This avoids snapping a 1:53.4 / 14:32 athlete to a single box.
@@ -3603,25 +3713,35 @@ def vekdyn_predict_1500(
     threshold,
     volume_data,
     elasticity_status="Preserved",
+    profile=None,
 ):
     eight_seconds = vekdyn_time_to_seconds(personal_bests.get("800"))
     five_k_seconds = vekdyn_time_to_seconds(personal_bests.get("5k"))
-
-    speed_score, speed_label = vekdyn_speed_reserve_score(eight_seconds)
-    aerobic_score, aerobic_label = vekdyn_aerobic_score(five_k_seconds)
-    threshold_score, threshold_label, lt_sample, lt_controlled = (
-        vekdyn_threshold_profile(threshold)
-    )
+    is_female = vekdyn_is_female(profile)
 
     weekly_miles = vekdyn_recent_mileage(volume_data)
-    volume_score, volume_label = vekdyn_volume_compatibility(
-        eight_seconds,
-        weekly_miles,
-    )
 
-    base_mile = vekdyn_base_mile_prediction(eight_seconds, five_k_seconds)
+    if is_female:
+        speed_score, speed_label = vekdyn_women_speed_reserve_score(eight_seconds)
+        aerobic_score, aerobic_label = vekdyn_women_aerobic_score(five_k_seconds)
+        volume_score, volume_label = vekdyn_women_volume_compatibility(eight_seconds, weekly_miles)
+        predicted_1500 = vekdyn_women_base_1500_prediction(eight_seconds, five_k_seconds)
+        threshold_score, threshold_label, lt_sample, lt_controlled = (
+            50, "Coach calibration pending", None, False
+        )
+        model_name = "Women's V1"
+    else:
+        speed_score, speed_label = vekdyn_male_speed_reserve_score(eight_seconds)
+        aerobic_score, aerobic_label = vekdyn_male_aerobic_score(five_k_seconds)
+        threshold_score, threshold_label, lt_sample, lt_controlled = vekdyn_threshold_profile(threshold)
+        volume_score, volume_label = vekdyn_male_volume_compatibility(eight_seconds, weekly_miles)
+        base_mile = vekdyn_male_base_mile_prediction(eight_seconds, five_k_seconds)
+        predicted_1500 = None if base_mile is None else (
+            (base_mile + vekdyn_elasticity_modifier(elasticity_status)) * (1500.0 / 1609.344)
+        )
+        model_name = "Men's model"
 
-    if base_mile is None:
+    if predicted_1500 is None:
         return {
             "available": False,
             "reason": "An 800m PB and 5K PB are needed for the VEKDYN prediction.",
@@ -3630,35 +3750,35 @@ def vekdyn_predict_1500(
             "threshold_score": threshold_score,
             "volume_score": volume_score,
             "elasticity_score": 90 if elasticity_status == "Preserved" else 65,
+            "model_name": model_name,
+            "is_female": is_female,
         }
 
-    adjusted_mile = base_mile + vekdyn_elasticity_modifier(elasticity_status)
-
-    # Convert the predicted mile capability to 1500m at the same average pace.
-    # A small range is shown because the model is a capability estimate, not a guarantee.
-    predicted_1500 = adjusted_mile * (1500.0 / 1609.344)
-
-    evidence = 0
-    evidence += 1 if eight_seconds is not None else 0
-    evidence += 1 if five_k_seconds is not None else 0
-    evidence += 1 if weekly_miles is not None else 0
-    evidence += 1 if lt_sample is not None else 0
+    # Women's V1 uses 5K strength as the primary anchor and 800 speed as a
+    # modifier. Elasticity is retained as a display factor but does not move
+    # the women's prediction until the model is calibrated with more data.
+    if is_female:
+        adjusted_1500 = predicted_1500
+        adjusted_mile = adjusted_1500 * (1609.344 / 1500.0)
+    else:
+        adjusted_1500 = predicted_1500
+        adjusted_mile = adjusted_1500 * (1609.344 / 1500.0)
 
     confidence = 52
     confidence += 12 if eight_seconds is not None else 0
     confidence += 15 if five_k_seconds is not None else 0
     confidence += 8 if weekly_miles is not None else 0
-    confidence += 8 if lt_controlled else (3 if lt_sample is not None else 0)
-    confidence += 4 if volume_label == "Matched" else 0
+    if not is_female:
+        confidence += 8 if lt_controlled else (3 if lt_sample is not None else 0)
+    confidence += 4 if volume_label in {"Matched", "Balanced"} else 0
     confidence += 3 if elasticity_status == "Preserved" else 0
-    confidence = min(95, confidence)
+    confidence = min(95 if not is_female else 88, confidence)
 
-    # Wider range when supporting training data is missing.
-    half_range = 3.0
-    if lt_sample is None:
-        half_range += 1.5
+    half_range = 3.0 if not is_female else 5.0
     if weekly_miles is None:
         half_range += 1.0
+    if not is_female and lt_sample is None:
+        half_range += 1.5
     if elasticity_status in {"Uncertain", "Suppressed"}:
         half_range += 1.5
 
@@ -3666,13 +3786,13 @@ def vekdyn_predict_1500(
         "available": True,
         "mile_seconds": adjusted_mile,
         "mile_display": vekdyn_seconds_to_time(adjusted_mile, 1),
-        "1500_seconds": predicted_1500,
-        "1500_low": vekdyn_seconds_to_time(predicted_1500 - half_range, 1),
-        "1500_mid": vekdyn_seconds_to_time(predicted_1500, 1),
-        "1500_high": vekdyn_seconds_to_time(predicted_1500 + half_range, 1),
+        "1500_seconds": adjusted_1500,
+        "1500_low": vekdyn_seconds_to_time(adjusted_1500 - half_range, 1),
+        "1500_mid": vekdyn_seconds_to_time(adjusted_1500, 1),
+        "1500_high": vekdyn_seconds_to_time(adjusted_1500 + half_range, 1),
         "1500_range": (
-            f"{vekdyn_seconds_to_time(predicted_1500 - half_range, 1)}"
-            f"–{vekdyn_seconds_to_time(predicted_1500 + half_range, 1)}"
+            f"{vekdyn_seconds_to_time(adjusted_1500 - half_range, 1)}"
+            f"–{vekdyn_seconds_to_time(adjusted_1500 + half_range, 1)}"
         ),
         "confidence": confidence,
         "speed_score": speed_score,
@@ -3692,6 +3812,8 @@ def vekdyn_predict_1500(
         ),
         "elasticity_status": elasticity_status,
         "lt_sample": lt_sample,
+        "model_name": model_name,
+        "is_female": is_female,
     }
 
 
@@ -3711,16 +3833,23 @@ if dashboard_view in {"Dashboard", "Performance"}:
         threshold=threshold_for_prediction,
         volume_data=volume_data,
         elasticity_status=elasticity_status,
+        profile=profile,
     )
 
     with st.container(border=True):
 
         st.subheader("Performance Predictions")
 
-        st.caption(
-            "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
-            "supported by threshold, volume compatibility, and preserved elasticity."
-        )
+        if vekdyn_prediction.get("is_female"):
+            st.caption(
+                "VEKDYN Women's V1: 5K aerobic strength is the primary anchor, "
+                "with 800m speed reserve and volume as modifiers. Threshold calibration is pending coach testing data."
+            )
+        else:
+            st.caption(
+                "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
+                "supported by threshold, volume compatibility, and preserved elasticity."
+            )
 
         prediction_col, confidence_col, factors_col = st.columns([2, 1, 2])
 
@@ -3767,10 +3896,16 @@ if dashboard_view in {"Dashboard", "Performance"}:
                 text="Aerobic Fitness"
             )
 
-            st.progress(
-                vekdyn_prediction.get("threshold_score", 0) / 100,
-                text="Threshold Fitness"
-            )
+            if vekdyn_prediction.get("is_female"):
+                st.progress(
+                    vekdyn_prediction.get("threshold_score", 50) / 100,
+                    text="Threshold — calibration pending"
+                )
+            else:
+                st.progress(
+                    vekdyn_prediction.get("threshold_score", 0) / 100,
+                    text="Threshold Fitness"
+                )
 
             st.progress(
                 vekdyn_prediction.get("speed_score", 0) / 100,
