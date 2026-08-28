@@ -582,6 +582,14 @@ def initialize_athlete_login_database():
                 """
             )
 
+            cursor.execute(
+                """
+                ALTER TABLE athlete_logins
+                ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN
+                DEFAULT FALSE
+                """
+            )
+
             # ---------------------------------------------------------
             # MIGRATE VALUES FROM OLDER ATHLETE-APP COLUMN NAMES
             # ---------------------------------------------------------
@@ -654,7 +662,8 @@ def get_athlete_login_account(athlete_key):
                     display_name,
                     event_group,
                     active,
-                    password_updated_at
+                    password_updated_at,
+                    COALESCE(must_change_password, FALSE)
                 FROM athlete_logins
                 WHERE athlete_key = %s
                    OR athlete_id = %s
@@ -675,6 +684,7 @@ def get_athlete_login_account(athlete_key):
         "event_group": row[4] or "Distance",
         "active": bool(row[5]),
         "password_updated_at": row[6],
+        "must_change_password": bool(row[7]),
     }
 
 
@@ -733,9 +743,10 @@ def create_or_reset_athlete_login(
                     event_group,
                     password_hash,
                     active,
-                    password_updated_at
+                    password_updated_at,
+                    must_change_password
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW(), TRUE)
 
                 ON CONFLICT (athlete_id)
                 DO UPDATE SET
@@ -745,7 +756,8 @@ def create_or_reset_athlete_login(
                     event_group = EXCLUDED.event_group,
                     password_hash = EXCLUDED.password_hash,
                     active = TRUE,
-                    password_updated_at = NOW()
+                    password_updated_at = NOW(),
+                    must_change_password = TRUE
                 """,
                 (
                     athlete_id,
