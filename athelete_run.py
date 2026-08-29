@@ -25,6 +25,7 @@ import streamlit as st
 
 OLLU_ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
 SAM_HOUSTON_ROSTER_PATH = Path(__file__).with_name("sam_houston_csv")
+DARK_HORSE_ROSTER_PATH = Path(__file__).with_name("dark_horse_endurance_csv")
 
 TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
 TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
@@ -271,6 +272,18 @@ sam_houston_roster, sam_houston_athletes = load_team_roster(
     default_team="Distance",
 )
 
+# Dark Horse can be deployed before the roster is populated. Replace the
+# header-only template with the real CSV when the coach is ready.
+try:
+    dark_horse_roster, dark_horse_athletes = load_team_roster(
+        DARK_HORSE_ROSTER_PATH,
+        default_school="Dark Horse Endurance",
+        default_team="Endurance",
+    )
+except (FileNotFoundError, RuntimeError):
+    dark_horse_roster = pd.DataFrame()
+    dark_horse_athletes = {}
+
 
 # =========================================================
 # TEAM ROUTING
@@ -283,6 +296,9 @@ def get_team_athletes(team_id):
 
     if team_id == "sam_houston":
         return sam_houston_athletes
+
+    if team_id == "dark_horse_endurance":
+        return dark_horse_athletes
 
     return {}
 
@@ -297,21 +313,34 @@ def get_team_athletes(team_id):
 all_athletes = {
     **ollu_athletes,
     **sam_houston_athletes,
+    **dark_horse_athletes,
 }
 
 # Map every athlete key back to the team that owns that profile.
 athlete_team_lookup = {
     **{athlete_key: "ollu_distance" for athlete_key in ollu_athletes},
     **{athlete_key: "sam_houston" for athlete_key in sam_houston_athletes},
+    **{athlete_key: "dark_horse_endurance" for athlete_key in dark_horse_athletes},
 }
 
 # Fail early if the same athlete_id exists in both schools. Athlete keys are
 # also the primary keys used by Neon for Strava connections, so they must be
 # globally unique across VEKDYN.
-duplicate_cross_team_ids = set(ollu_athletes).intersection(sam_houston_athletes)
+team_roster_ids = {
+    "OLLU": set(ollu_athletes),
+    "Sam Houston": set(sam_houston_athletes),
+    "Dark Horse Endurance": set(dark_horse_athletes),
+}
+duplicate_cross_team_ids = set()
+team_id_sets = list(team_roster_ids.values())
+for left_index in range(len(team_id_sets)):
+    for right_index in range(left_index + 1, len(team_id_sets)):
+        duplicate_cross_team_ids.update(
+            team_id_sets[left_index].intersection(team_id_sets[right_index])
+        )
 if duplicate_cross_team_ids:
     raise RuntimeError(
-        "These athlete_id values are duplicated across OLLU and Sam Houston: "
+        "These athlete_id values are duplicated across VEKDYN teams: "
         + ", ".join(sorted(duplicate_cross_team_ids))
         + ". Give each athlete a globally unique athlete_id before using Strava."
     )
@@ -347,6 +376,10 @@ TEAM_CONFIG = {
     "sam_houston": {
         "name": "Sam Houston Distance",
         "short_name": "Sam Houston",
+    },
+    "dark_horse_endurance": {
+        "name": "Dark Horse Endurance",
+        "short_name": "Dark Horse",
     },
 }
 
@@ -2046,7 +2079,7 @@ def render_starter_page():
         # The landing page shows at most three recent teams. Any other configured
         # school stays hidden until the coach searches for it.
         default_recent = [
-            team_id for team_id in ("ollu_distance", "sam_houston")
+            team_id for team_id in ("ollu_distance", "sam_houston", "dark_horse_endurance")
             if team_id in TEAM_CONFIG
         ][:3]
         recent_team_ids = [
@@ -3970,12 +4003,22 @@ def initialize_workouts_database():
                 ON team_workouts (team_id, workout_date, athlete_key)
                 """
             )
+            cursor.execute(
+                """
+                ALTER TABLE team_workouts
+                ADD COLUMN IF NOT EXISTS video_url TEXT
+                """
+            )
 
 
 def save_team_workout(team_id, athlete_key, workout_date, workout_type,
-                      warm_up, workout, cool_down, notes):
+                      warm_up, workout, cool_down, notes, video_url=""):
     """Save one coach-written workout. athlete_key=None means entire team."""
     main_workout = str(workout).strip()
+    clean_video_url = str(video_url or "").strip()
+    # Video publishing is intentionally restricted to Dark Horse Endurance.
+    if team_id != "dark_horse_endurance":
+        clean_video_url = ""
     if not main_workout:
         raise ValueError("Add the main workout before saving.")
 
@@ -3986,14 +4029,15 @@ def save_team_workout(team_id, athlete_key, workout_date, workout_type,
                 """
                 INSERT INTO team_workouts (
                     team_id, athlete_key, workout_date, workout_type,
-                    warm_up, workout, cool_down, notes, created_by
+                    warm_up, workout, cool_down, notes, video_url, created_by
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     team_id, athlete_key, workout_date, str(workout_type).strip(),
                     str(warm_up).strip(), main_workout, str(cool_down).strip(),
-                    str(notes).strip(), st.session_state.get("logged_in_user", "Coach"),
+                    str(notes).strip(), clean_video_url,
+                    st.session_state.get("logged_in_user", "Coach"),
                 ),
             )
 
@@ -4009,7 +4053,7 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
                 cursor.execute(
                     """
                     SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                           workout, cool_down, notes
+                           workout, cool_down, notes, video_url
                     FROM team_workouts
                     WHERE team_id = %s
                       AND workout_date >= %s
@@ -4023,7 +4067,7 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
                 cursor.execute(
                     """
                     SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                           workout, cool_down, notes
+                           workout, cool_down, notes, video_url
                     FROM team_workouts
                     WHERE team_id = %s
                       AND workout_date >= %s
@@ -4044,6 +4088,7 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
         "Workout": row[5],
         "Cool Down": row[6] or "",
         "Notes": row[7] or "",
+        "Video URL": row[8] or "",
     }
     for row in rows
 ]
@@ -4082,6 +4127,9 @@ def render_team_workout_card(workout, athlete_lookup):
         st.markdown(f"**Cool-down:** {workout_value(workout.get('Cool Down'))}")
         if workout_value(workout.get("Notes"), ""):
             st.caption(f"Coach notes: {workout_value(workout.get('Notes'), '')}")
+        if active_team == "dark_horse_endurance" and workout_value(workout.get("Video URL"), ""):
+            st.markdown("**Coach video:**")
+            st.video(workout_value(workout.get("Video URL"), ""))
         if st.button("Delete", key=f"delete_workout_{workout['id']}"):
             delete_team_workout(workout["id"], active_team)
             st.rerun()
@@ -4120,6 +4168,14 @@ def render_team_workouts():
             )
             cool_down = st.text_area("Cool Down", placeholder="Example: 2 miles easy")
             notes = st.text_area("Coach Notes", placeholder="Optional cues, targets, or instructions")
+            if active_team == "dark_horse_endurance":
+                video_url = st.text_input(
+                    "Coach Video URL",
+                    placeholder="Paste a YouTube or supported video link (optional)",
+                    help="Video publishing is enabled only for the Dark Horse Endurance coach workspace.",
+                )
+            else:
+                video_url = ""
             submitted = st.form_submit_button(
                 "Save Workout", type="primary", use_container_width=True
             )
@@ -4129,7 +4185,7 @@ def render_team_workouts():
             try:
                 save_team_workout(
                     active_team, assigned_key, workout_date, workout_type,
-                    warm_up, main_workout, cool_down, notes,
+                    warm_up, main_workout, cool_down, notes, video_url,
                 )
                 st.success("Workout saved to VEKDYN.")
                 st.rerun()
