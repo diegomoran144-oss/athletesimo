@@ -2496,6 +2496,126 @@ st.markdown(
 
 
 # =========================================================
+# DARK HORSE ENDURANCE — TEAM-ONLY THEME
+# =========================================================
+# This override is deliberately applied only after the authenticated team has
+# been resolved. OLLU and Sam Houston keep the normal VEKDYN light theme.
+if active_team == "dark_horse_endurance":
+    st.markdown(
+        """
+        <style>
+            /* Main page only: keep the Streamlit sidebar/navigation structure
+               intact while giving Dark Horse its own black workspace. */
+            .stApp {
+                background-color: #050505 !important;
+                color: #f9fafb !important;
+            }
+
+            /* Keep the left navigation light so the team's controls and tabs
+               remain visually consistent with the rest of VEKDYN. */
+            [data-testid="stSidebar"] {
+                background-color: #ffffff !important;
+                border-right: 1px solid #e5e7eb !important;
+            }
+
+            /* Dark Horse content cards */
+            div[data-testid="stVerticalBlockBorderWrapper"] {
+                background-color: #0b0b0d !important;
+                border: 1px solid #353039 !important;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28) !important;
+            }
+
+            /* Main-page typography */
+            section.main h1,
+            section.main h2,
+            section.main h3,
+            section.main h4,
+            section.main h5,
+            section.main h6,
+            section.main p,
+            section.main label,
+            section.main span,
+            section.main [data-testid="stMarkdownContainer"],
+            section.main [data-testid="stCaptionContainer"] {
+                color: #f3f4f6;
+            }
+
+            section.main [data-testid="stMetricValue"] {
+                color: #ffffff !important;
+            }
+
+            section.main [data-testid="stMetricLabel"] {
+                color: #aaa3ad !important;
+            }
+
+            /* Existing VEKDYN custom text classes */
+            .athlete-name,
+            .pb-time,
+            .notes-title,
+            .note-author,
+            .team-workout-title,
+            .team-workout-type {
+                color: #ffffff !important;
+            }
+
+            .small-text,
+            .pb-event,
+            .notes-subtitle,
+            .note-time,
+            .team-workout-subtitle,
+            .team-workout-date,
+            .team-workout-notes {
+                color: #aaa3ad !important;
+            }
+
+            .note-body,
+            .team-workout-detail {
+                color: #e5e7eb !important;
+            }
+
+            .team-workout-card {
+                background: #0b0b0d !important;
+                border-color: #353039 !important;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28) !important;
+            }
+
+            .note-card-athlete,
+            .note-card-coach {
+                background: #0d0b10 !important;
+                border-color: #3b3141 !important;
+            }
+
+            /* Dark Horse purple becomes the accent inside the page only. */
+            section.main .green-text,
+            section.main .team-workout-label {
+                color: #a855f7 !important;
+            }
+
+            /* Inputs stay readable on the black page without changing buttons
+               or navigation tabs. */
+            section.main input,
+            section.main textarea,
+            section.main [data-baseweb="select"] > div {
+                background-color: #111113 !important;
+                color: #f9fafb !important;
+                border-color: #3f3f46 !important;
+            }
+
+            section.main input::placeholder,
+            section.main textarea::placeholder {
+                color: #8b8490 !important;
+            }
+
+            section.main hr {
+                border-color: #302b34 !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================================================
 # EMPTY TEAM ROSTER
 # =========================================================
 
