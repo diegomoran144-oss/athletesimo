@@ -2517,6 +2517,22 @@ if active_team == "dark_horse_endurance":
             --dh-purple-bright: #b45cff;
             --dh-purple-soft: #21112f;
         }
+            
+
+    /* Dark Horse top header */
+    [data-testid="stHeader"],
+    [data-testid="stToolbar"],
+    [data-testid="stDecoration"],
+    [data-testid="stStatusWidget"] {
+        background: var(--dh-bg) !important;
+        color: var(--dh-text) !important;
+    }
+
+    header[data-testid="stHeader"] {
+        background: var(--dh-bg) !important;
+    }
+
+    
 
         /* App canvas */
         .stApp,
