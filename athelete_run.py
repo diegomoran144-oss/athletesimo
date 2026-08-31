@@ -2575,30 +2575,44 @@ if active_team == "dark_horse_endurance":
             color: #ffffff !important;
         }
         /* Dark Horse athlete selector */
-[data-testid="stSidebar"] div[data-baseweb="select"] > div {
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] > div {
     background-color: #111116 !important;
-    border: 1px solid var(--dh-purple) !important;
-    color: var(--dh-text) !important;
+    border: 1px solid #9b4de4 !important;
+    color: #f7f7f8 !important;
     border-radius: 10px !important;
 }
 
-[data-testid="stSidebar"] div[data-baseweb="select"] span {
-    color: var(--dh-text) !important;
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] span {
+    color: #f7f7f8 !important;
 }
 
-[data-testid="stSidebar"] div[data-baseweb="select"] svg {
-    fill: var(--dh-purple-bright) !important;
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] input {
+    color: #f7f7f8 !important;
 }
 
-/* Dropdown menu */
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] svg {
+    fill: #b45cff !important;
+}
+
+/* Dropdown when opened */
 div[data-baseweb="popover"] {
     background-color: #111116 !important;
 }
 
-div[data-baseweb="menu"] {
+div[data-baseweb="popover"] ul {
     background-color: #111116 !important;
-    color: var(--dh-text) !important;
 }
+
+div[data-baseweb="popover"] li {
+    background-color: #111116 !important;
+    color: #f7f7f8 !important;
+}
+
+div[data-baseweb="popover"] li:hover {
+    background-color: #21112f !important;
+    color: #ffffff !important;
+}
+       
 
 div[data-baseweb="menu"] li {
     color: var(--dh-text) !important;
