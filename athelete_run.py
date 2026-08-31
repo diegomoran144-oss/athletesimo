@@ -2574,6 +2574,39 @@ if active_team == "dark_horse_endurance":
             border-color: #8e45cf !important;
             color: #ffffff !important;
         }
+        /* Dark Horse athlete selector */
+[data-testid="stSidebar"] div[data-baseweb="select"] > div {
+    background-color: #111116 !important;
+    border: 1px solid var(--dh-purple) !important;
+    color: var(--dh-text) !important;
+    border-radius: 10px !important;
+}
+
+[data-testid="stSidebar"] div[data-baseweb="select"] span {
+    color: var(--dh-text) !important;
+}
+
+[data-testid="stSidebar"] div[data-baseweb="select"] svg {
+    fill: var(--dh-purple-bright) !important;
+}
+
+/* Dropdown menu */
+div[data-baseweb="popover"] {
+    background-color: #111116 !important;
+}
+
+div[data-baseweb="menu"] {
+    background-color: #111116 !important;
+    color: var(--dh-text) !important;
+}
+
+div[data-baseweb="menu"] li {
+    color: var(--dh-text) !important;
+}
+
+div[data-baseweb="menu"] li:hover {
+    background-color: var(--dh-purple-soft) !important;
+}
 
         /* Main content typography */
         .main h1, .main h2, .main h3, .main h4,
