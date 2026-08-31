@@ -19,6 +19,7 @@ import psycopg2
 import requests
 import streamlit as st
 
+
 # =================================================
 # TEAM ROSTERS — CSV FILES ARE THE SOURCE OF TRUTH
 # =================================================
@@ -2494,121 +2495,198 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # =========================================================
-# DARK HORSE ENDURANCE — TEAM-ONLY THEME
+# DARK HORSE ENDURANCE — TEAM-SPECIFIC CONCEPT THEME
 # =========================================================
-# This override is deliberately applied only after the authenticated team has
-# been resolved. OLLU and Sam Houston keep the normal VEKDYN light theme.
+# Keep OLLU and Sam Houston on the normal VEKDYN light theme.
+# Only the authenticated Dark Horse workspace receives this skin.
 if active_team == "dark_horse_endurance":
     st.markdown(
         """
         <style>
-            /* Main page only: keep the Streamlit sidebar/navigation structure
-               intact while giving Dark Horse its own black workspace. */
-            .stApp {
-                background-color: #050505 !important;
-                color: #f9fafb !important;
-            }
+        :root {
+            --dh-bg: #050506;
+            --dh-surface: #09090b;
+            --dh-card: #0d0d10;
+            --dh-card-soft: #111116;
+            --dh-border: #343038;
+            --dh-border-soft: #252329;
+            --dh-text: #f7f7f8;
+            --dh-muted: #aaa6b0;
+            --dh-purple: #9b4de4;
+            --dh-purple-bright: #b45cff;
+            --dh-purple-soft: #21112f;
+        }
 
-            /* Keep the left navigation light so the team's controls and tabs
-               remain visually consistent with the rest of VEKDYN. */
-            [data-testid="stSidebar"] {
-                background-color: #ffffff !important;
-                border-right: 1px solid #e5e7eb !important;
-            }
+        /* App canvas */
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        section.main {
+            background: var(--dh-bg) !important;
+            color: var(--dh-text) !important;
+        }
 
-            /* Dark Horse content cards */
-            div[data-testid="stVerticalBlockBorderWrapper"] {
-                background-color: #0b0b0d !important;
-                border: 1px solid #353039 !important;
-                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28) !important;
-            }
+        /* Sidebar from the approved concept */
+        [data-testid="stSidebar"] {
+            background: #050506 !important;
+            border-right: 1px solid var(--dh-border) !important;
+        }
+        [data-testid="stSidebar"] * {
+            color: var(--dh-text);
+        }
+        [data-testid="stSidebar"] hr {
+            border-color: var(--dh-border) !important;
+        }
+        [data-testid="stSidebar"] .stCaptionContainer,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+            color: var(--dh-muted) !important;
+        }
+        [data-testid="stSidebar"] div.stButton > button {
+            background: transparent !important;
+            color: var(--dh-text) !important;
+            border: 1px solid #48434d !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stSidebar"] div.stButton > button:hover {
+            border-color: var(--dh-purple) !important;
+            color: #ffffff !important;
+        }
+        [data-testid="stSidebar"] div.stButton > button[kind="primary"],
+        [data-testid="stSidebar"] div.stButton > button[data-testid="baseButton-primary"] {
+            background: linear-gradient(135deg, #7131ad, #9b4de4) !important;
+            border-color: #8e45cf !important;
+            color: #ffffff !important;
+        }
 
-            /* Main-page typography */
-            section.main h1,
-            section.main h2,
-            section.main h3,
-            section.main h4,
-            section.main h5,
-            section.main h6,
-            section.main p,
-            section.main label,
-            section.main span,
-            section.main [data-testid="stMarkdownContainer"],
-            section.main [data-testid="stCaptionContainer"] {
-                color: #f3f4f6;
-            }
+        /* Main content typography */
+        .main h1, .main h2, .main h3, .main h4,
+        [data-testid="stMain"] h1, [data-testid="stMain"] h2,
+        [data-testid="stMain"] h3, [data-testid="stMain"] h4,
+        .athlete-name, .notes-title, .team-workout-title,
+        .pb-time, .team-workout-type, .note-author {
+            color: var(--dh-text) !important;
+        }
+        [data-testid="stMain"] p,
+        [data-testid="stMain"] label,
+        [data-testid="stMain"] span,
+        [data-testid="stMain"] div {
+            border-color: inherit;
+        }
+        [data-testid="stMain"] .stCaptionContainer,
+        [data-testid="stMain"] .small-text,
+        [data-testid="stMain"] .pb-event,
+        [data-testid="stMain"] .notes-subtitle,
+        [data-testid="stMain"] .team-workout-subtitle,
+        [data-testid="stMain"] .team-workout-date,
+        [data-testid="stMain"] .note-time {
+            color: var(--dh-muted) !important;
+        }
 
-            section.main [data-testid="stMetricValue"] {
-                color: #ffffff !important;
-            }
+        /* Distinct cards/panels — the key difference from a plain black mode */
+        [data-testid="stMain"] div[data-testid="stVerticalBlockBorderWrapper"] {
+            background: linear-gradient(180deg, var(--dh-card) 0%, #09090b 100%) !important;
+            border: 1px solid var(--dh-border) !important;
+            border-radius: 14px !important;
+            box-shadow: 0 8px 26px rgba(0,0,0,.18) !important;
+        }
+        .team-workout-card, .note-card {
+            background: var(--dh-card) !important;
+            border-color: var(--dh-border) !important;
+            box-shadow: none !important;
+        }
+        .note-card-athlete, .note-card-coach {
+            background: var(--dh-card-soft) !important;
+            border-color: var(--dh-border) !important;
+        }
+        .note-body, .team-workout-detail {
+            color: #ddd9e1 !important;
+        }
+        .team-workout-notes {
+            border-color: var(--dh-border-soft) !important;
+            color: var(--dh-muted) !important;
+        }
 
-            section.main [data-testid="stMetricLabel"] {
-                color: #aaa3ad !important;
-            }
+        /* Metrics */
+        [data-testid="stMetricValue"] {
+            color: var(--dh-text) !important;
+        }
+        [data-testid="stMetricLabel"] {
+            color: var(--dh-muted) !important;
+        }
 
-            /* Existing VEKDYN custom text classes */
-            .athlete-name,
-            .pb-time,
-            .notes-title,
-            .note-author,
-            .team-workout-title,
-            .team-workout-type {
-                color: #ffffff !important;
-            }
+        /* Dark Horse purple replaces green as the workspace accent,
+           while athlete status dots/badges can stay green. */
+        [data-testid="stMain"] a,
+        [data-testid="stMain"] .green-text,
+        .team-workout-label {
+            color: var(--dh-purple-bright) !important;
+        }
+        [data-testid="stMain"] div[role="radiogroup"] label,
+        [data-testid="stMain"] div[role="radiogroup"] label p,
+        [data-testid="stMain"] div[role="radiogroup"] label span {
+            color: #e8e5eb !important;
+        }
+        [data-testid="stMain"] div[role="radiogroup"] input:checked + div {
+            border-color: var(--dh-purple) !important;
+        }
 
-            .small-text,
-            .pb-event,
-            .notes-subtitle,
-            .note-time,
-            .team-workout-subtitle,
-            .team-workout-date,
-            .team-workout-notes {
-                color: #aaa3ad !important;
-            }
+        /* Inputs and forms */
+        [data-testid="stMain"] input,
+        [data-testid="stMain"] textarea,
+        [data-testid="stMain"] [data-baseweb="select"] > div {
+            background: #111116 !important;
+            color: var(--dh-text) !important;
+            border-color: #49434f !important;
+        }
+        [data-testid="stMain"] input::placeholder,
+        [data-testid="stMain"] textarea::placeholder {
+            color: #77727d !important;
+        }
 
-            .note-body,
-            .team-workout-detail {
-                color: #e5e7eb !important;
-            }
+        /* Main-area buttons: subtle dark by default, purple for primary actions */
+        [data-testid="stMain"] div.stButton > button,
+        [data-testid="stMain"] div.stDownloadButton > button {
+            background: #0f0f12 !important;
+            color: var(--dh-text) !important;
+            border: 1px solid #4a454f !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stMain"] div.stButton > button:hover,
+        [data-testid="stMain"] div.stDownloadButton > button:hover {
+            border-color: var(--dh-purple) !important;
+        }
+        [data-testid="stMain"] div.stButton > button[kind="primary"],
+        [data-testid="stMain"] div.stButton > button[data-testid="baseButton-primary"] {
+            background: linear-gradient(135deg, #7131ad, #9b4de4) !important;
+            border-color: #9b4de4 !important;
+            color: #ffffff !important;
+        }
 
-            .team-workout-card {
-                background: #0b0b0d !important;
-                border-color: #353039 !important;
-                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28) !important;
-            }
+        /* Alerts retain readability while fitting the Dark Horse palette */
+        [data-testid="stMain"] [data-testid="stAlert"] {
+            background: #15101d !important;
+            border: 1px solid #39274b !important;
+            color: #eee9f2 !important;
+        }
+        [data-testid="stMain"] [data-testid="stAlert"] * {
+            color: #eee9f2 !important;
+        }
 
-            .note-card-athlete,
-            .note-card-coach {
-                background: #0d0b10 !important;
-                border-color: #3b3141 !important;
-            }
+        /* Dividers and expanders */
+        [data-testid="stMain"] hr {
+            border-color: var(--dh-border-soft) !important;
+        }
+        [data-testid="stMain"] details {
+            background: var(--dh-card) !important;
+            border-color: var(--dh-border) !important;
+        }
 
-            /* Dark Horse purple becomes the accent inside the page only. */
-            section.main .green-text,
-            section.main .team-workout-label {
-                color: #a855f7 !important;
-            }
-
-            /* Inputs stay readable on the black page without changing buttons
-               or navigation tabs. */
-            section.main input,
-            section.main textarea,
-            section.main [data-baseweb="select"] > div {
-                background-color: #111113 !important;
-                color: #f9fafb !important;
-                border-color: #3f3f46 !important;
-            }
-
-            section.main input::placeholder,
-            section.main textarea::placeholder {
-                color: #8b8490 !important;
-            }
-
-            section.main hr {
-                border-color: #302b34 !important;
-            }
+        /* Keep the active badge from the original VEKDYN athlete card. */
+        .active-badge {
+            background-color: #14381d !important;
+            color: #7ee294 !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
