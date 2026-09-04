@@ -2998,10 +2998,11 @@ if active_team == "dark_horse_endurance":
         :root {
             --dh-bg: #050506;
             --dh-surface: #09090b;
-            --dh-card: #0d0d10;
-            --dh-card-soft: #111116;
-            --dh-border: #343038;
-            --dh-border-soft: #252329;
+            --dh-card: #15101d;
+            --dh-card-soft: #1d1328;
+            --dh-card-lift: #241531;
+            --dh-border: #57346f;
+            --dh-border-soft: #382346;
             --dh-text: #f7f7f8;
             --dh-muted: #aaa6b0;
             --dh-purple: #9b4de4;
@@ -3168,18 +3169,18 @@ if active_team == "dark_horse_endurance":
 
         /* Distinct cards/panels — the key difference from a plain black mode */
         [data-testid="stMain"] div[data-testid="stVerticalBlockBorderWrapper"] {
-            background: linear-gradient(180deg, var(--dh-card) 0%, #09090b 100%) !important;
+            background: linear-gradient(145deg, var(--dh-card-lift) 0%, var(--dh-card) 52%, #100b15 100%) !important;
             border: 1px solid var(--dh-border) !important;
             border-radius: 14px !important;
-            box-shadow: 0 8px 26px rgba(0,0,0,.18) !important;
+            box-shadow: 0 10px 30px rgba(0,0,0,.24), inset 0 1px 0 rgba(180,92,255,.06) !important;
         }
         .team-workout-card, .note-card {
-            background: var(--dh-card) !important;
+            background: linear-gradient(145deg, #21142d 0%, var(--dh-card) 65%, #100b15 100%) !important;
             border-color: var(--dh-border) !important;
-            box-shadow: none !important;
+            box-shadow: inset 3px 0 0 rgba(180,92,255,.55) !important;
         }
         .note-card-athlete, .note-card-coach {
-            background: var(--dh-card-soft) !important;
+            background: linear-gradient(145deg, var(--dh-card-soft) 0%, #130d19 100%) !important;
             border-color: var(--dh-border) !important;
         }
         .note-body, .team-workout-detail {
@@ -3263,6 +3264,19 @@ if active_team == "dark_horse_endurance":
         [data-testid="stMain"] details {
             background: var(--dh-card) !important;
             border-color: var(--dh-border) !important;
+        }
+
+        /* Purple-tinted information hierarchy inspired by the Dark Horse training sheet. */
+        [data-testid="stMain"] [data-testid="stMetric"] {
+            background: rgba(155, 77, 228, 0.055) !important;
+            border-radius: 10px !important;
+            padding: .35rem .5rem !important;
+        }
+        [data-testid="stMain"] details {
+            background: linear-gradient(145deg, #1b1224 0%, #100b15 100%) !important;
+        }
+        [data-testid="stMain"] div[data-testid="stVerticalBlockBorderWrapper"]:hover {
+            border-color: #75439a !important;
         }
 
         /* Keep the active badge from the original VEKDYN athlete card. */
