@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import re
 import secrets
 import sqlite3
@@ -964,6 +965,10 @@ def initialize_coros_database():
                 updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (athlete_key, recovery_date))""")
             c.execute("""ALTER TABLE coros_recovery_daily
                 ADD COLUMN IF NOT EXISTS recovery_score INTEGER""")
+            c.execute("""ALTER TABLE coros_recovery_daily
+                ADD COLUMN IF NOT EXISTS sleep_hr_avg INTEGER""")
+            c.execute("""ALTER TABLE coros_recovery_daily
+                ADD COLUMN IF NOT EXISTS sleep_hr_baseline INTEGER""")
         db.commit()
 
 
@@ -1115,49 +1120,110 @@ def get_valid_coros_token(athlete_key):
 
 def _mcp_json(r):
     r.raise_for_status()
-    if "application/json" in r.headers.get("content-type",""): return r.json()
-    import json
+    if "application/json" in r.headers.get("content-type", ""):
+        return r.json()
     for line in r.text.splitlines():
         if line.startswith("data:"):
-            try: return json.loads(line[5:].strip())
-            except Exception: pass
+            try:
+                return json.loads(line[5:].strip())
+            except Exception:
+                pass
     raise RuntimeError("COROS MCP returned an unreadable response.")
 
 
+def _normalize_coros_text(value):
+    """Turn MCP text content into real newlines before parsing COROS summaries."""
+    if value is None:
+        return ""
+    text_value = str(value).strip()
+
+    # COROS MCP can return the tool text as a JSON-encoded string, e.g.
+    # "Sleep Data\\n...". Decode that wrapper first.
+    if len(text_value) >= 2 and text_value[0] == '"' and text_value[-1] == '"':
+        try:
+            decoded = json.loads(text_value)
+            if isinstance(decoded, str):
+                text_value = decoded
+        except Exception:
+            pass
+
+    # Defensive fallback for literal escape sequences left by an MCP transport.
+    text_value = text_value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    return text_value.strip()
+
+
 def coros_mcp_tool_call(token, name, arguments):
-    headers={"Authorization":f"Bearer {token}","Content-Type":"application/json",
-             "Accept":"application/json, text/event-stream","MCP-Protocol-Version":COROS_PROTOCOL_VERSION}
-    init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":COROS_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"VEKDYN","version":"1.0"}}}
-    r=requests.post(COROS_MCP_URL,headers=headers,json=init,timeout=25); data=_mcp_json(r)
-    if data.get("error"): raise RuntimeError(str(data["error"]))
-    if r.headers.get("Mcp-Session-Id"): headers["Mcp-Session-Id"]=r.headers["Mcp-Session-Id"]
-    call={"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}
-    data=_mcp_json(requests.post(COROS_MCP_URL,headers=headers,json=call,timeout=30))
-    if data.get("error"): raise RuntimeError(str(data["error"]))
-    return "\n".join(x.get("text","") for x in data.get("result",{}).get("content",[]) if isinstance(x,dict))
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": COROS_PROTOCOL_VERSION,
+    }
+    init = {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": COROS_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "VEKDYN", "version": "1.1"},
+        },
+    }
+    r = requests.post(COROS_MCP_URL, headers=headers, json=init, timeout=25)
+    data = _mcp_json(r)
+    if data.get("error"):
+        raise RuntimeError(str(data["error"]))
+
+    session_id = r.headers.get("Mcp-Session-Id")
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+
+    # Complete the MCP handshake before tools/call.
+    initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+    ready = requests.post(COROS_MCP_URL, headers=headers, json=initialized, timeout=15)
+    ready.raise_for_status()
+
+    call = {
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }
+    response = requests.post(COROS_MCP_URL, headers=headers, json=call, timeout=30)
+    data = _mcp_json(response)
+    if data.get("error"):
+        raise RuntimeError(str(data["error"]))
+
+    text_parts = [
+        _normalize_coros_text(item.get("text", ""))
+        for item in data.get("result", {}).get("content", [])
+        if isinstance(item, dict) and item.get("text") is not None
+    ]
+    return "\n".join(part for part in text_parts if part)
 
 
 def _parse_coros_sleep(text):
-    """Parse COROS sleep summaries into {date: values} without depending on one exact spacing style."""
+    """Parse COROS sleep summaries keyed by wake-up date."""
+    text = _normalize_coros_text(text)
     records = {}
     date_pattern = re.compile(r"(?m)^(\d{4}-\d{2}-\d{2}):?\s*$")
-    matches = list(date_pattern.finditer(text or ""))
+    matches = list(date_pattern.finditer(text))
     for i, match in enumerate(matches):
         day = match.group(1)
-        block = (text or "")[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text or "")]
+        block = text[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text)]
         score_match = re.search(r"Sleep Score:\s*(\d+)", block, re.I)
         sleep_match = re.search(r"Main Sleep:\s*(?:(\d+)h\s*)?(\d+)min", block, re.I)
         if score_match or sleep_match:
             records[day] = {
                 "sleep_score": int(score_match.group(1)) if score_match else None,
-                "sleep_minutes": ((int(sleep_match.group(1) or 0) * 60) + int(sleep_match.group(2))) if sleep_match else None,
+                "sleep_minutes": (
+                    int(sleep_match.group(1) or 0) * 60 + int(sleep_match.group(2))
+                    if sleep_match else None
+                ),
             }
     return records
 
 
 def _parse_coros_hrv(text):
-    """Parse only COROS's official HRV Assessment section, never the raw time-series points."""
-    assessment = (text or "").split("Sleep HRV Time Series", 1)[0]
+    """Parse the official COROS HRV assessment, not raw HRV samples."""
+    text = _normalize_coros_text(text)
+    assessment = text.split("Sleep HRV Time Series", 1)[0]
     pattern = re.compile(
         r"(?m)^(\d{4}-\d{2}-\d{2}):\s*\n"
         r"\s*HRV Avg:\s*(\d+)\s*ms\s*[—-]\s*([^\n]+)\n"
@@ -1177,43 +1243,107 @@ def _parse_coros_hrv(text):
     return records
 
 
-def vekdyn_recovery_score(sleep_score, hrv_avg, hrv_baseline, hrv_low=None, hrv_high=None):
-    """VEKDYN v1 recovery: 55% COROS sleep score + 45% HRV readiness.
+def _parse_coros_daily_health(text):
+    """Parse COROS average sleeping heart rate from daily health summaries."""
+    text = _normalize_coros_text(text)
+    records = {}
+    # Daily Health dates are usually rendered as --- 20260904 ---.
+    date_pattern = re.compile(r"(?m)^---\s*(\d{8})\s*---\s*$")
+    matches = list(date_pattern.finditer(text))
+    for i, match in enumerate(matches):
+        raw_day = match.group(1)
+        day = f"{raw_day[:4]}-{raw_day[4:6]}-{raw_day[6:]}"
+        block = text[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+        sleep_hr = re.search(r"Sleep HR:\s*Avg\s*(\d+)\s*bpm", block, re.I)
+        if sleep_hr:
+            records[day] = {"sleep_hr_avg": int(sleep_hr.group(1))}
+    return records
 
-    HRV is individualized to the athlete's COROS normal range/baseline rather than
-    compared across athletes. Missing inputs return None instead of inventing a score.
+
+def _median_int(values):
+    clean = sorted(int(v) for v in values if v is not None)
+    if not clean:
+        return None
+    n = len(clean)
+    if n % 2:
+        return clean[n // 2]
+    return int(round((clean[n // 2 - 1] + clean[n // 2]) / 2))
+
+
+def vekdyn_recovery_score(
+    sleep_score,
+    hrv_avg,
+    hrv_baseline,
+    hrv_low=None,
+    hrv_high=None,
+    sleep_hr_avg=None,
+    sleep_hr_baseline=None,
+):
+    """VEKDYN Recovery v2 using the athlete's own sleep, HRV and sleeping-HR norms.
+
+    Target weights: sleep 45%, HRV 40%, average sleeping HR 15%.
+    If one input is unavailable, available components are reweighted instead of
+    inventing missing physiological data.
     """
-    if sleep_score is None or hrv_avg is None or hrv_baseline in (None, 0):
+    components = []
+
+    if sleep_score is not None:
+        components.append((0.45, max(0.0, min(100.0, float(sleep_score)))))
+
+    if hrv_avg is not None and hrv_baseline not in (None, 0):
+        if hrv_low is not None and hrv_high is not None and hrv_low <= hrv_avg <= hrv_high:
+            hrv_component = 100.0
+        elif hrv_low not in (None, 0) and hrv_avg < hrv_low:
+            hrv_component = max(0.0, min(100.0, 100.0 * float(hrv_avg) / float(hrv_low)))
+        else:
+            reference = float(hrv_baseline)
+            deviation = abs(float(hrv_avg) - reference) / max(reference, 1.0)
+            hrv_component = max(60.0, 100.0 - deviation * 100.0)
+        components.append((0.40, hrv_component))
+
+    if sleep_hr_avg is not None and sleep_hr_baseline not in (None, 0):
+        # A modestly lower sleeping HR is not penalized; elevations above personal
+        # baseline progressively reduce the HR component.
+        ratio = float(sleep_hr_avg) / float(sleep_hr_baseline)
+        if ratio <= 1.02:
+            hr_component = 100.0
+        else:
+            hr_component = max(40.0, 100.0 - (ratio - 1.02) * 250.0)
+        components.append((0.15, hr_component))
+
+    if not components:
         return None
 
-    sleep_component = max(0.0, min(100.0, float(sleep_score)))
-
-    # Being inside the athlete's established normal range is treated as fully ready.
-    if hrv_low is not None and hrv_high is not None and hrv_low <= hrv_avg <= hrv_high:
-        hrv_component = 100.0
-    elif hrv_avg < (hrv_low if hrv_low is not None else hrv_baseline):
-        reference = float(hrv_low if hrv_low not in (None, 0) else hrv_baseline)
-        hrv_component = max(0.0, min(100.0, 100.0 * float(hrv_avg) / reference))
-    else:
-        # High HRV is not automatically "better"; avoid rewarding extreme deviations.
-        upper = float(hrv_high if hrv_high not in (None, 0) else hrv_baseline * 1.20)
-        hrv_component = max(70.0, 100.0 - max(0.0, float(hrv_avg) - upper) / max(upper, 1.0) * 100.0)
-
-    return int(round(0.55 * sleep_component + 0.45 * hrv_component))
+    weight_total = sum(weight for weight, _ in components)
+    return int(round(sum(weight * score for weight, score in components) / weight_total))
 
 
 def sync_coros_recovery(athlete_key):
-    """Sync up to seven recent COROS recovery days for one VEKDYN athlete."""
+    """Sync seven recent COROS recovery days for one athlete."""
     token = get_valid_coros_token(athlete_key)
     args = {"startDate": "", "endDate": "", "days": 7, "timezone": COROS_TIMEZONE}
+
     sleep_text = coros_mcp_tool_call(token, "querySleepData", args)
     hrv_text = coros_mcp_tool_call(token, "querySleepHrv", args)
+    health_text = coros_mcp_tool_call(
+        token,
+        "queryDailyHealthData",
+        {"days": 7, "timezone": COROS_TIMEZONE},
+    )
 
     sleep_days = _parse_coros_sleep(sleep_text)
     hrv_days = _parse_coros_hrv(hrv_text)
-    all_days = sorted(set(sleep_days) | set(hrv_days))
+    health_days = _parse_coros_daily_health(health_text)
+    all_days = sorted(set(sleep_days) | set(hrv_days) | set(health_days))
+
     if not all_days:
-        raise RuntimeError("No recent COROS sleep/HRV record was returned.")
+        raise RuntimeError(
+            "COROS returned data, but VEKDYN could not parse the recent recovery records."
+        )
+
+    sleep_hr_baseline = _median_int(
+        record.get("sleep_hr_avg") for record in health_days.values()
+    )
 
     initialize_coros_database()
     with get_database_connection() as db:
@@ -1221,27 +1351,41 @@ def sync_coros_recovery(athlete_key):
             for day in all_days:
                 sv = sleep_days.get(day, {})
                 hv = hrv_days.get(day, {})
+                dv = health_days.get(day, {})
                 score = vekdyn_recovery_score(
-                    sv.get("sleep_score"), hv.get("hrv_avg"), hv.get("hrv_baseline"),
-                    hv.get("hrv_normal_low"), hv.get("hrv_normal_high"),
+                    sv.get("sleep_score"),
+                    hv.get("hrv_avg"),
+                    hv.get("hrv_baseline"),
+                    hv.get("hrv_normal_low"),
+                    hv.get("hrv_normal_high"),
+                    dv.get("sleep_hr_avg"),
+                    sleep_hr_baseline,
                 )
-                c.execute("""INSERT INTO coros_recovery_daily(
-                        athlete_key,recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
-                        hrv_normal_low,hrv_normal_high,hrv_status,recovery_score)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
-                        sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),
-                        sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
-                        hrv_avg=COALESCE(EXCLUDED.hrv_avg,coros_recovery_daily.hrv_avg),
-                        hrv_baseline=COALESCE(EXCLUDED.hrv_baseline,coros_recovery_daily.hrv_baseline),
-                        hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),
-                        hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
-                        hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),
-                        recovery_score=COALESCE(EXCLUDED.recovery_score,coros_recovery_daily.recovery_score),
-                        updated_at=NOW()""",
-                    (athlete_key, day, sv.get("sleep_minutes"), sv.get("sleep_score"),
-                     hv.get("hrv_avg"), hv.get("hrv_baseline"), hv.get("hrv_normal_low"),
-                     hv.get("hrv_normal_high"), hv.get("hrv_status"), score))
+                c.execute(
+                    """INSERT INTO coros_recovery_daily(
+                            athlete_key,recovery_date,sleep_minutes,sleep_score,
+                            hrv_avg,hrv_baseline,hrv_normal_low,hrv_normal_high,
+                            hrv_status,recovery_score,sleep_hr_avg,sleep_hr_baseline)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
+                            sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),
+                            sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
+                            hrv_avg=COALESCE(EXCLUDED.hrv_avg,coros_recovery_daily.hrv_avg),
+                            hrv_baseline=COALESCE(EXCLUDED.hrv_baseline,coros_recovery_daily.hrv_baseline),
+                            hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),
+                            hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
+                            hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),
+                            recovery_score=COALESCE(EXCLUDED.recovery_score,coros_recovery_daily.recovery_score),
+                            sleep_hr_avg=COALESCE(EXCLUDED.sleep_hr_avg,coros_recovery_daily.sleep_hr_avg),
+                            sleep_hr_baseline=COALESCE(EXCLUDED.sleep_hr_baseline,coros_recovery_daily.sleep_hr_baseline),
+                            updated_at=NOW()""",
+                    (
+                        athlete_key, day, sv.get("sleep_minutes"), sv.get("sleep_score"),
+                        hv.get("hrv_avg"), hv.get("hrv_baseline"), hv.get("hrv_normal_low"),
+                        hv.get("hrv_normal_high"), hv.get("hrv_status"), score,
+                        dv.get("sleep_hr_avg"), sleep_hr_baseline,
+                    ),
+                )
         db.commit()
     return load_latest_coros_recovery(athlete_key)
 
@@ -1250,16 +1394,24 @@ def load_latest_coros_recovery(athlete_key):
     initialize_coros_database()
     with get_database_connection() as db:
         with db.cursor() as c:
-            c.execute("""SELECT recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
-                        hrv_normal_low,hrv_normal_high,hrv_status,recovery_score
-                        FROM coros_recovery_daily WHERE athlete_key=%s
-                        ORDER BY recovery_date DESC LIMIT 1""", (athlete_key,))
+            c.execute(
+                """SELECT recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
+                          hrv_normal_low,hrv_normal_high,hrv_status,recovery_score,
+                          sleep_hr_avg,sleep_hr_baseline
+                   FROM coros_recovery_daily
+                   WHERE athlete_key=%s
+                   ORDER BY recovery_date DESC LIMIT 1""",
+                (athlete_key,),
+            )
             r = c.fetchone()
     if not r:
         return {}
-    return {"date":r[0],"sleep_minutes":r[1],"sleep_score":r[2],"hrv_avg":r[3],
-            "hrv_baseline":r[4],"hrv_normal_low":r[5],"hrv_normal_high":r[6],
-            "hrv_status":r[7],"recovery_score":r[8]}
+    return {
+        "date": r[0], "sleep_minutes": r[1], "sleep_score": r[2], "hrv_avg": r[3],
+        "hrv_baseline": r[4], "hrv_normal_low": r[5], "hrv_normal_high": r[6],
+        "hrv_status": r[7], "recovery_score": r[8], "sleep_hr_avg": r[9],
+        "sleep_hr_baseline": r[10],
+    }
 
 
 # =========================================================
@@ -3336,7 +3488,7 @@ with st.sidebar:
             if st.button(f"Sync {athlete_first_name}'s COROS recovery", use_container_width=True, key=f"sync_coros_{active_team}_{athlete_key}"):
                 try:
                     sync_coros_recovery(athlete_key)
-                    st.session_state[coros_message_key] = f"{athlete_name_for_button}'s sleep and HRV synced from COROS."
+                    st.session_state[coros_message_key] = f"{athlete_name_for_button}'s recovery data synced from COROS."
                     st.session_state.pop(coros_error_key, None)
                     st.rerun()
                 except Exception as error:
@@ -3842,19 +3994,22 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
             sleep_left, sleep_right = st.columns(2)
 
             with sleep_left:
-                sleeping_hr = recovery.get(
-                    "sleep_heart_rate",
-                    recovery.get("resting_hr", "--"),
+                sleep_hr_value = coros_recovery.get("sleep_hr_avg")
+                st.metric(
+                    "Average Sleeping HR",
+                    f"{sleep_hr_value} bpm" if sleep_hr_value is not None else "None",
                 )
-                st.metric("Sleeping HR", f"{sleeping_hr} bpm")
-                if coros_is_connected(athlete_key):
-                    st.caption("COROS connected · HRV shown below")
-                else:
-                    st.caption("Connect COROS to add recovery data")
+                if coros_recovery.get("sleep_hr_baseline") is not None:
+                    st.caption(f"7-day sleeping-HR baseline: {coros_recovery['sleep_hr_baseline']} bpm")
+                elif coros_is_connected(athlete_key):
+                    st.caption("COROS connected")
 
             with sleep_right:
                 coros_sleep_minutes = coros_recovery.get("sleep_minutes")
-                sleep_display = (f"{coros_sleep_minutes // 60}h {coros_sleep_minutes % 60}m" if coros_sleep_minutes is not None else f"{recovery.get('sleep_hours', '--')}h {recovery.get('sleep_minutes', '--')}m")
+                sleep_display = (
+                    f"{coros_sleep_minutes // 60}h {coros_sleep_minutes % 60}m"
+                    if coros_sleep_minutes is not None else "None"
+                )
                 st.metric("Sleep Time", sleep_display)
                 if coros_recovery.get("sleep_score") is not None:
                     st.caption(f"COROS sleep score: {coros_recovery['sleep_score']}")
@@ -3864,22 +4019,26 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
             recovery_left, recovery_right = st.columns(2)
 
             with recovery_left:
-                hrv_value = coros_recovery.get("hrv_avg", recovery.get("average_hrv", "--"))
-                st.metric("Average HRV", f"{hrv_value} ms")
+                hrv_value = coros_recovery.get("hrv_avg")
+                st.metric(
+                    "Average HRV",
+                    f"{hrv_value} ms" if hrv_value is not None else "None",
+                )
                 if coros_recovery.get("hrv_status"):
                     detail = f"COROS: {coros_recovery['hrv_status']}"
-                    if coros_recovery.get("hrv_baseline") is not None: detail += f" · baseline {coros_recovery['hrv_baseline']} ms"
-                    if coros_recovery.get("hrv_normal_low") is not None and coros_recovery.get("hrv_normal_high") is not None: detail += f" · normal {coros_recovery['hrv_normal_low']}–{coros_recovery['hrv_normal_high']} ms"
+                    if coros_recovery.get("hrv_baseline") is not None:
+                        detail += f" · baseline {coros_recovery['hrv_baseline']} ms"
+                    if (coros_recovery.get("hrv_normal_low") is not None
+                            and coros_recovery.get("hrv_normal_high") is not None):
+                        detail += f" · normal {coros_recovery['hrv_normal_low']}–{coros_recovery['hrv_normal_high']} ms"
                     st.caption(detail)
 
             with recovery_right:
-                recovery_score = coros_recovery.get(
-                    "recovery_score", recovery.get("recovery_score")
-                )
-                recovery_display = f"{recovery_score}%" if recovery_score is not None else "--"
+                recovery_score = coros_recovery.get("recovery_score")
+                recovery_display = f"{recovery_score}%" if recovery_score is not None else "None"
                 st.metric("VEKDYN Recovery Score", recovery_display)
                 if recovery_score is not None:
-                    st.caption("55% sleep score · 45% individualized HRV readiness")
+                    st.caption("Sleep + individualized HRV + average sleeping HR")
 
 if dashboard_view in {"Dashboard", "Notes"}:
     # =========================================================
