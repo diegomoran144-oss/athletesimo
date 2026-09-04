@@ -932,6 +932,242 @@ def render_athlete_account_manager(athlete_key, profile, team_id):
 
 
 # =========================================================
+# COROS MCP — COACH-SIDE OAUTH + SLEEP / HRV
+# =========================================================
+# Each athlete authorizes their own COROS account. VEKDYN stores that OAuth
+# connection against the athlete_key selected by the coach.
+
+COROS_MCP_URL = "https://mcpus.coros.com/mcp"
+COROS_REDIRECT_URI = "https://vekdyn.streamlit.app"
+COROS_TIMEZONE = "America/Chicago"
+COROS_PROTOCOL_VERSION = "2025-06-18"
+
+
+def initialize_coros_database():
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS coros_oauth_client (
+                id SMALLINT PRIMARY KEY DEFAULT 1, client_id TEXT NOT NULL,
+                client_secret TEXT, registration_json JSONB, updated_at TIMESTAMPTZ DEFAULT NOW())""")
+            c.execute("""CREATE TABLE IF NOT EXISTS coros_oauth_pending (
+                state TEXT PRIMARY KEY, athlete_key TEXT NOT NULL, code_verifier TEXT NOT NULL,
+                token_endpoint TEXT NOT NULL, client_id TEXT NOT NULL, client_secret TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW())""")
+            c.execute("""CREATE TABLE IF NOT EXISTS coros_connections (
+                athlete_key TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT,
+                token_type TEXT, scope TEXT, expires_at BIGINT, updated_at TIMESTAMPTZ DEFAULT NOW())""")
+            c.execute("""CREATE TABLE IF NOT EXISTS coros_recovery_daily (
+                athlete_key TEXT NOT NULL, recovery_date DATE NOT NULL, sleep_minutes INTEGER,
+                sleep_score INTEGER, hrv_avg INTEGER, hrv_baseline INTEGER,
+                hrv_normal_low INTEGER, hrv_normal_high INTEGER, hrv_status TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (athlete_key, recovery_date))""")
+        db.commit()
+
+
+def _coros_auth_metadata():
+    origin = COROS_MCP_URL.split('/mcp', 1)[0]
+    resource = None
+    for url in (f"{origin}/.well-known/oauth-protected-resource/mcp",
+                f"{origin}/.well-known/oauth-protected-resource"):
+        r = requests.get(url, timeout=15)
+        if r.ok:
+            resource = r.json(); break
+    if not resource or not resource.get("authorization_servers"):
+        raise RuntimeError("COROS OAuth discovery failed.")
+    issuer = str(resource["authorization_servers"][0]).rstrip('/')
+    for url in (f"{issuer}/.well-known/oauth-authorization-server",
+                f"{issuer}/.well-known/openid-configuration"):
+        r = requests.get(url, timeout=15)
+        if r.ok:
+            return r.json()
+    raise RuntimeError("COROS authorization metadata could not be loaded.")
+
+
+def _coros_client():
+    initialize_coros_database()
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("SELECT client_id, client_secret FROM coros_oauth_client WHERE id=1")
+            row = c.fetchone()
+    if row:
+        return {"client_id": row[0], "client_secret": row[1]}
+
+    meta = _coros_auth_metadata()
+    endpoint = meta.get("registration_endpoint")
+    if not endpoint:
+        raise RuntimeError("COROS did not advertise dynamic client registration for this server.")
+    r = requests.post(endpoint, json={
+        "client_name": "VEKDYN",
+        "redirect_uris": [COROS_REDIRECT_URI],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }, timeout=15)
+    r.raise_for_status(); data = r.json()
+    if not data.get("client_id"):
+        raise RuntimeError("COROS registration did not return a client ID.")
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("""INSERT INTO coros_oauth_client(id,client_id,client_secret,registration_json)
+                VALUES(1,%s,%s,%s::jsonb) ON CONFLICT(id) DO UPDATE SET
+                client_id=EXCLUDED.client_id, client_secret=EXCLUDED.client_secret,
+                registration_json=EXCLUDED.registration_json, updated_at=NOW()""",
+                (data["client_id"], data.get("client_secret"), r.text))
+        db.commit()
+    return {"client_id": data["client_id"], "client_secret": data.get("client_secret")}
+
+
+def create_coros_login_url(athlete_key):
+    meta, client = _coros_auth_metadata(), _coros_client()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
+    payload = f"coros.{athlete_key}.{secrets.token_urlsafe(18)}"
+    sig = hmac.new(get_login_signing_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    state = f"{payload}.{sig}"
+    token_endpoint = meta.get("token_endpoint")
+    if not meta.get("authorization_endpoint") or not token_endpoint:
+        raise RuntimeError("COROS OAuth endpoints are incomplete.")
+    initialize_coros_database()
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("DELETE FROM coros_oauth_pending WHERE created_at < NOW()-INTERVAL '30 minutes'")
+            c.execute("""INSERT INTO coros_oauth_pending
+                (state,athlete_key,code_verifier,token_endpoint,client_id,client_secret)
+                VALUES(%s,%s,%s,%s,%s,%s)""",
+                (state, athlete_key, verifier, token_endpoint, client["client_id"], client.get("client_secret")))
+        db.commit()
+    params = {"response_type":"code", "client_id":client["client_id"],
+              "redirect_uri":COROS_REDIRECT_URI, "state":state,
+              "code_challenge":challenge, "code_challenge_method":"S256", "resource":COROS_MCP_URL}
+    scopes = meta.get("scopes_supported") or []
+    if scopes: params["scope"] = " ".join(scopes)
+    return f"{meta['authorization_endpoint']}?{urlencode(params)}"
+
+
+def coros_state_athlete_key(state):
+    if not state or not str(state).startswith("coros."): return None
+    parts = str(state).split('.')
+    if len(parts) < 4: return None
+    payload, returned = '.'.join(parts[:-1]), parts[-1]
+    expected = hmac.new(get_login_signing_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return parts[1] if hmac.compare_digest(returned, expected) else None
+
+
+def exchange_coros_authorization_code(code, state):
+    athlete_key = coros_state_athlete_key(state)
+    if athlete_key not in all_athletes: raise RuntimeError("COROS callback did not match a VEKDYN athlete.")
+    initialize_coros_database()
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("SELECT code_verifier,token_endpoint,client_id,client_secret FROM coros_oauth_pending WHERE state=%s",(state,))
+            row = c.fetchone()
+    if not row: raise RuntimeError("COROS authorization expired. Select Connect COROS again.")
+    verifier, endpoint, client_id, secret = row
+    form = {"grant_type":"authorization_code","code":code,"redirect_uri":COROS_REDIRECT_URI,
+            "client_id":client_id,"code_verifier":verifier,"resource":COROS_MCP_URL}
+    if secret: form["client_secret"] = secret
+    r = requests.post(endpoint, data=form, timeout=20); r.raise_for_status(); token = r.json()
+    if not token.get("access_token"): raise RuntimeError("COROS returned no access token.")
+    expires_at = int(time.time()) + int(token.get("expires_in") or 0) if token.get("expires_in") else None
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("""INSERT INTO coros_connections(athlete_key,access_token,refresh_token,token_type,scope,expires_at)
+                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(athlete_key) DO UPDATE SET
+                access_token=EXCLUDED.access_token,refresh_token=EXCLUDED.refresh_token,
+                token_type=EXCLUDED.token_type,scope=EXCLUDED.scope,expires_at=EXCLUDED.expires_at,updated_at=NOW()""",
+                (athlete_key,token["access_token"],token.get("refresh_token"),token.get("token_type"),token.get("scope"),expires_at))
+            c.execute("DELETE FROM coros_oauth_pending WHERE state=%s",(state,))
+        db.commit()
+    return athlete_key
+
+
+def load_coros_connection(athlete_key):
+    initialize_coros_database()
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("SELECT access_token,refresh_token,expires_at FROM coros_connections WHERE athlete_key=%s",(athlete_key,)); row=c.fetchone()
+    return {"access_token":row[0],"refresh_token":row[1],"expires_at":row[2]} if row else {}
+
+
+def coros_is_connected(athlete_key): return bool(load_coros_connection(athlete_key).get("access_token"))
+
+
+def get_valid_coros_token(athlete_key):
+    con = load_coros_connection(athlete_key)
+    if not con: raise RuntimeError("This athlete has not connected COROS.")
+    if not con.get("expires_at") or int(con["expires_at"]) > int(time.time())+120: return con["access_token"]
+    if not con.get("refresh_token"): raise RuntimeError("COROS session expired. Reconnect COROS.")
+    meta, client = _coros_auth_metadata(), _coros_client()
+    form={"grant_type":"refresh_token","refresh_token":con["refresh_token"],"client_id":client["client_id"],"resource":COROS_MCP_URL}
+    if client.get("client_secret"): form["client_secret"]=client["client_secret"]
+    r=requests.post(meta["token_endpoint"],data=form,timeout=20); r.raise_for_status(); t=r.json()
+    expires=int(time.time())+int(t.get("expires_in") or 0) if t.get("expires_in") else None
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("UPDATE coros_connections SET access_token=%s,refresh_token=COALESCE(%s,refresh_token),expires_at=%s,updated_at=NOW() WHERE athlete_key=%s",
+                      (t["access_token"],t.get("refresh_token"),expires,athlete_key))
+        db.commit()
+    return t["access_token"]
+
+
+def _mcp_json(r):
+    r.raise_for_status()
+    if "application/json" in r.headers.get("content-type",""): return r.json()
+    import json
+    for line in r.text.splitlines():
+        if line.startswith("data:"):
+            try: return json.loads(line[5:].strip())
+            except Exception: pass
+    raise RuntimeError("COROS MCP returned an unreadable response.")
+
+
+def coros_mcp_tool_call(token, name, arguments):
+    headers={"Authorization":f"Bearer {token}","Content-Type":"application/json",
+             "Accept":"application/json, text/event-stream","MCP-Protocol-Version":COROS_PROTOCOL_VERSION}
+    init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":COROS_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"VEKDYN","version":"1.0"}}}
+    r=requests.post(COROS_MCP_URL,headers=headers,json=init,timeout=25); data=_mcp_json(r)
+    if data.get("error"): raise RuntimeError(str(data["error"]))
+    if r.headers.get("Mcp-Session-Id"): headers["Mcp-Session-Id"]=r.headers["Mcp-Session-Id"]
+    call={"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}
+    data=_mcp_json(requests.post(COROS_MCP_URL,headers=headers,json=call,timeout=30))
+    if data.get("error"): raise RuntimeError(str(data["error"]))
+    return "\n".join(x.get("text","") for x in data.get("result",{}).get("content",[]) if isinstance(x,dict))
+
+
+def sync_coros_recovery(athlete_key):
+    token=get_valid_coros_token(athlete_key); args={"startDate":"","endDate":"","days":7,"timezone":COROS_TIMEZONE}
+    sleep=coros_mcp_tool_call(token,"querySleepData",args); hrv=coros_mcp_tool_call(token,"querySleepHrv",args)
+    sleep_matches=list(re.finditer(r"(\d{4}-\d{2}-\d{2})[\s\S]*?Sleep Score:\s*(\d+)[\s\S]*?Main Sleep:\s*(?:(\d+)h\s*)?(\d+)min",sleep))
+    hrv_matches=list(re.finditer(r"(\d{4}-\d{2}-\d{2}):\s*\n\s*HRV Avg:\s*(\d+)\s*ms\s*—\s*([^\n]+)\s*\n\s*Normal Range:\s*(\d+)\s*-\s*(\d+)\s*ms\s*\n\s*Baseline:\s*(\d+)\s*ms",hrv))
+    if not sleep_matches and not hrv_matches: raise RuntimeError("No recent COROS sleep/HRV record was returned.")
+    sm=sleep_matches[-1] if sleep_matches else None; hm=hrv_matches[-1] if hrv_matches else None
+    dates=[m.group(1) for m in (sm,hm) if m]; day=max(dates)
+    sleep_minutes=(int(sm.group(3) or 0)*60+int(sm.group(4))) if sm and sm.group(1)==day else None
+    sleep_score=int(sm.group(2)) if sm and sm.group(1)==day else None
+    hv=(int(hm.group(2)),int(hm.group(6)),int(hm.group(4)),int(hm.group(5)),hm.group(3).strip()) if hm and hm.group(1)==day else (None,)*5
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("""INSERT INTO coros_recovery_daily(athlete_key,recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,hrv_normal_low,hrv_normal_high,hrv_status)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
+                sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
+                hrv_avg=COALESCE(EXCLUDED.hrv_avg,coros_recovery_daily.hrv_avg),hrv_baseline=COALESCE(EXCLUDED.hrv_baseline,coros_recovery_daily.hrv_baseline),
+                hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
+                hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),updated_at=NOW()""",
+                (athlete_key,day,sleep_minutes,sleep_score,hv[0],hv[1],hv[2],hv[3],hv[4]))
+        db.commit()
+    return load_latest_coros_recovery(athlete_key)
+
+
+def load_latest_coros_recovery(athlete_key):
+    initialize_coros_database()
+    with get_database_connection() as db:
+        with db.cursor() as c:
+            c.execute("SELECT recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,hrv_normal_low,hrv_normal_high,hrv_status FROM coros_recovery_daily WHERE athlete_key=%s ORDER BY recovery_date DESC LIMIT 1",(athlete_key,)); r=c.fetchone()
+    if not r: return {}
+    return {"date":r[0],"sleep_minutes":r[1],"sleep_score":r[2],"hrv_avg":r[3],"hrv_baseline":r[4],"hrv_normal_low":r[5],"hrv_normal_high":r[6],"hrv_status":r[7]}
+
+
+# =========================================================
 # STRAVA SETTINGS
 # =========================================================
 
@@ -2195,10 +2431,26 @@ authorization_error = st.query_params.get("error")
 returned_oauth_state = st.query_params.get("state")
 
 if authorization_error:
-    st.error("Strava authorization was cancelled or denied.")
+    provider_name = "COROS" if str(returned_oauth_state or "").startswith("coros.") else "Strava"
+    st.error(f"{provider_name} authorization was cancelled or denied.")
     st.query_params.clear()
 
-if authorization_code:
+if authorization_code and str(returned_oauth_state or "").startswith("coros."):
+    try:
+        connected_athlete_key = exchange_coros_authorization_code(authorization_code, returned_oauth_state)
+        connected_team = athlete_team_lookup.get(connected_athlete_key)
+        connected_name = all_athletes[connected_athlete_key]["profile"]["name"]
+        st.session_state[f"coros_message_{connected_athlete_key}"] = f"{connected_name}'s COROS connected successfully."
+        st.session_state["selected_athlete_key"] = connected_athlete_key
+        st.session_state["active_team"] = connected_team
+        st.session_state["page"] = "dashboard"
+        st.query_params.clear()
+        st.rerun()
+    except Exception as error:
+        st.error(f"COROS authorization failed: {error}")
+        st.stop()
+
+if authorization_code and not str(returned_oauth_state or "").startswith("coros."):
     try:
         connected_athlete_key = athlete_key_from_oauth_state(
             returned_oauth_state
@@ -2979,6 +3231,31 @@ with st.sidebar:
             "This athlete has not connected Strava yet."
         )
 
+    # COROS connection lives on the coach side, directly under the selected athlete.
+    coros_message_key = f"coros_message_{athlete_key}"
+    coros_error_key = f"coros_error_{athlete_key}"
+    try:
+        coros_connected = coros_is_connected(athlete_key)
+        if coros_connected:
+            st.caption("COROS connected")
+            if st.button(f"Sync {athlete_first_name}'s COROS recovery", use_container_width=True, key=f"sync_coros_{active_team}_{athlete_key}"):
+                try:
+                    sync_coros_recovery(athlete_key)
+                    st.session_state[coros_message_key] = f"{athlete_name_for_button}'s sleep and HRV synced from COROS."
+                    st.session_state.pop(coros_error_key, None)
+                    st.rerun()
+                except Exception as error:
+                    st.session_state[coros_error_key] = str(error)
+        else:
+            coros_login_url = create_coros_login_url(athlete_key)
+            st.link_button(f"Connect {athlete_first_name}'s COROS", coros_login_url, use_container_width=True)
+            st.caption(f"{athlete_first_name} must authorize their own COROS account.")
+    except Exception as error:
+        st.session_state[coros_error_key] = str(error)
+
+    if st.session_state.get(coros_message_key): st.success(st.session_state[coros_message_key])
+    if st.session_state.get(coros_error_key): st.warning(f"COROS: {st.session_state[coros_error_key]}")
+
     st.divider()
 
     # -----------------------------------------------------
@@ -3115,6 +3392,11 @@ recovery = athlete.get(
     "recovery",
     training.get("recovery", {}),
 )
+
+try:
+    coros_recovery = load_latest_coros_recovery(athlete_key) if coros_is_connected(athlete_key) else {}
+except Exception:
+    coros_recovery = {}
 threshold_lactate = athlete.get(
     "threshold_lactate",
     training.get("threshold_lactate", {}),
@@ -3473,28 +3755,24 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
                 st.caption("COROS connection pending")
 
             with sleep_right:
-                st.metric(
-                    "Sleep Time",
-                    f"{recovery.get('sleep_hours', '--')}h {recovery.get('sleep_minutes', '--')}m",
-                )
-                st.markdown(
-                    "<span class='status-dot'>● Good</span>",
-                    unsafe_allow_html=True,
-                )
+                coros_sleep_minutes = coros_recovery.get("sleep_minutes")
+                sleep_display = (f"{coros_sleep_minutes // 60}h {coros_sleep_minutes % 60}m" if coros_sleep_minutes is not None else f"{recovery.get('sleep_hours', '--')}h {recovery.get('sleep_minutes', '--')}m")
+                st.metric("Sleep Time", sleep_display)
+                if coros_recovery.get("sleep_score") is not None:
+                    st.caption(f"COROS sleep score: {coros_recovery['sleep_score']}")
 
             st.divider()
 
             recovery_left, recovery_right = st.columns(2)
 
             with recovery_left:
-                st.metric(
-                    "Average HRV",
-                    f"{recovery.get('average_hrv', '--')} ms",
-                )
-                st.markdown(
-                    "<span class='status-dot'>● Optimal</span>",
-                    unsafe_allow_html=True,
-                )
+                hrv_value = coros_recovery.get("hrv_avg", recovery.get("average_hrv", "--"))
+                st.metric("Average HRV", f"{hrv_value} ms")
+                if coros_recovery.get("hrv_status"):
+                    detail = f"COROS: {coros_recovery['hrv_status']}"
+                    if coros_recovery.get("hrv_baseline") is not None: detail += f" · baseline {coros_recovery['hrv_baseline']} ms"
+                    if coros_recovery.get("hrv_normal_low") is not None and coros_recovery.get("hrv_normal_high") is not None: detail += f" · normal {coros_recovery['hrv_normal_low']}–{coros_recovery['hrv_normal_high']} ms"
+                    st.caption(detail)
 
             with recovery_right:
                 st.metric(

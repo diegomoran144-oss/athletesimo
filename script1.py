@@ -1,12 +1,8 @@
-athlete = {
-    "name": "Isai",
-    "sleep": 8
-}
+athletes = ["Diego", "Isai", "Jose", "Will"]
 
-def athlete_time(sleep):
-    if athlete["sleep"]>= 8:
-        return 'athlete well rested'
-    else:
-        return 'athlete needs more sleep'
+for athlete in athletes:
+    print(athlete)
+if athlete == "Will":
+    print("Dark Horse athlete found")
 
-print('Isai is a '+ athlete(8))
+
