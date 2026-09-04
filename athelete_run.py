@@ -960,10 +960,14 @@ def initialize_coros_database():
                 athlete_key TEXT NOT NULL, recovery_date DATE NOT NULL, sleep_minutes INTEGER,
                 sleep_score INTEGER, hrv_avg INTEGER, hrv_baseline INTEGER,
                 hrv_normal_low INTEGER, hrv_normal_high INTEGER, hrv_status TEXT,
-                recovery_score INTEGER,
+                sleep_hr_avg INTEGER, sleep_hr_baseline INTEGER, recovery_score INTEGER,
                 updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (athlete_key, recovery_date))""")
             c.execute("""ALTER TABLE coros_recovery_daily
                 ADD COLUMN IF NOT EXISTS recovery_score INTEGER""")
+            c.execute("""ALTER TABLE coros_recovery_daily
+                ADD COLUMN IF NOT EXISTS sleep_hr_avg INTEGER""")
+            c.execute("""ALTER TABLE coros_recovery_daily
+                ADD COLUMN IF NOT EXISTS sleep_hr_baseline INTEGER""")
         db.commit()
 
 
@@ -1177,30 +1181,75 @@ def _parse_coros_hrv(text):
     return records
 
 
-def vekdyn_recovery_score(sleep_score, hrv_avg, hrv_baseline, hrv_low=None, hrv_high=None):
-    """VEKDYN v1 recovery: 55% COROS sleep score + 45% HRV readiness.
+def _parse_coros_daily_health_sleep_hr(text):
+    """Parse COROS Daily Health sleep HR into {YYYY-MM-DD: {sleep_hr_avg: bpm}}."""
+    records = {}
+    raw = text or ""
+    day_pattern = re.compile(r"---\s*(\d{8})\s*---")
+    matches = list(day_pattern.finditer(raw))
+    for i, match in enumerate(matches):
+        compact_day = match.group(1)
+        day = f"{compact_day[:4]}-{compact_day[4:6]}-{compact_day[6:]}"
+        block = raw[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(raw)]
+        hr_match = re.search(r"Sleep HR:\s*Avg\s*(\d+)\s*bpm", block, re.I)
+        if hr_match:
+            records[day] = {"sleep_hr_avg": int(hr_match.group(1))}
+    return records
 
-    HRV is individualized to the athlete's COROS normal range/baseline rather than
-    compared across athletes. Missing inputs return None instead of inventing a score.
+
+def _sleep_hr_baseline(health_days, day):
+    """Use the athlete's other recent sleep-HR days as a short personal baseline."""
+    values = [
+        int(v["sleep_hr_avg"])
+        for d, v in health_days.items()
+        if d != day and v.get("sleep_hr_avg") is not None
+    ]
+    if not values:
+        current = health_days.get(day, {}).get("sleep_hr_avg")
+        return int(current) if current is not None else None
+    values.sort()
+    n = len(values)
+    return values[n // 2] if n % 2 else int(round((values[n // 2 - 1] + values[n // 2]) / 2))
+
+
+def vekdyn_recovery_score(sleep_score, hrv_avg, hrv_baseline, hrv_low=None, hrv_high=None,
+                           sleep_hr_avg=None, sleep_hr_baseline=None):
+    """VEKDYN Recovery v2: individualized sleep, HRV, and sleeping-HR readiness.
+
+    Target weights are 45% sleep score, 40% HRV readiness, and 15% sleeping HR.
+    If COROS does not provide one metric, VEKDYN re-normalizes the available weights
+    instead of displaying a made-up value or dropping the entire recovery score.
     """
-    if sleep_score is None or hrv_avg is None or hrv_baseline in (None, 0):
+    components = []
+
+    if sleep_score is not None:
+        sleep_component = max(0.0, min(100.0, float(sleep_score)))
+        components.append((0.45, sleep_component))
+
+    if hrv_avg is not None and hrv_baseline not in (None, 0):
+        if hrv_low is not None and hrv_high is not None and hrv_low <= hrv_avg <= hrv_high:
+            hrv_component = 100.0
+        elif hrv_avg < (hrv_low if hrv_low is not None else hrv_baseline):
+            reference = float(hrv_low if hrv_low not in (None, 0) else hrv_baseline)
+            hrv_component = max(0.0, min(100.0, 100.0 * float(hrv_avg) / reference))
+        else:
+            upper = float(hrv_high if hrv_high not in (None, 0) else hrv_baseline * 1.20)
+            hrv_component = max(70.0, 100.0 - max(0.0, float(hrv_avg) - upper) / max(upper, 1.0) * 100.0)
+        components.append((0.40, hrv_component))
+
+    if sleep_hr_avg is not None and sleep_hr_baseline not in (None, 0):
+        # Lower/equal to the athlete's recent sleeping-HR baseline is not penalized.
+        # Rising above baseline progressively reduces this component; the comparison
+        # is athlete-specific rather than using a population heart-rate cutoff.
+        delta_pct = (float(sleep_hr_avg) - float(sleep_hr_baseline)) / float(sleep_hr_baseline)
+        sleep_hr_component = 100.0 if delta_pct <= 0 else max(0.0, 100.0 - delta_pct * 500.0)
+        components.append((0.15, sleep_hr_component))
+
+    if not components:
         return None
 
-    sleep_component = max(0.0, min(100.0, float(sleep_score)))
-
-    # Being inside the athlete's established normal range is treated as fully ready.
-    if hrv_low is not None and hrv_high is not None and hrv_low <= hrv_avg <= hrv_high:
-        hrv_component = 100.0
-    elif hrv_avg < (hrv_low if hrv_low is not None else hrv_baseline):
-        reference = float(hrv_low if hrv_low not in (None, 0) else hrv_baseline)
-        hrv_component = max(0.0, min(100.0, 100.0 * float(hrv_avg) / reference))
-    else:
-        # High HRV is not automatically "better"; avoid rewarding extreme deviations.
-        upper = float(hrv_high if hrv_high not in (None, 0) else hrv_baseline * 1.20)
-        hrv_component = max(70.0, 100.0 - max(0.0, float(hrv_avg) - upper) / max(upper, 1.0) * 100.0)
-
-    return int(round(0.55 * sleep_component + 0.45 * hrv_component))
-
+    available_weight = sum(weight for weight, _ in components)
+    return int(round(sum(weight * value for weight, value in components) / available_weight))
 
 def sync_coros_recovery(athlete_key):
     """Sync up to seven recent COROS recovery days for one VEKDYN athlete."""
@@ -1208,10 +1257,12 @@ def sync_coros_recovery(athlete_key):
     args = {"startDate": "", "endDate": "", "days": 7, "timezone": COROS_TIMEZONE}
     sleep_text = coros_mcp_tool_call(token, "querySleepData", args)
     hrv_text = coros_mcp_tool_call(token, "querySleepHrv", args)
+    health_text = coros_mcp_tool_call(token, "queryDailyHealthData", {"days": 7, "timezone": COROS_TIMEZONE})
 
     sleep_days = _parse_coros_sleep(sleep_text)
     hrv_days = _parse_coros_hrv(hrv_text)
-    all_days = sorted(set(sleep_days) | set(hrv_days))
+    health_days = _parse_coros_daily_health_sleep_hr(health_text)
+    all_days = sorted(set(sleep_days) | set(hrv_days) | set(health_days))
     if not all_days:
         raise RuntimeError("No recent COROS sleep/HRV record was returned.")
 
@@ -1221,14 +1272,18 @@ def sync_coros_recovery(athlete_key):
             for day in all_days:
                 sv = sleep_days.get(day, {})
                 hv = hrv_days.get(day, {})
+                health = health_days.get(day, {})
+                sleep_hr_avg = health.get("sleep_hr_avg")
+                sleep_hr_baseline = _sleep_hr_baseline(health_days, day)
                 score = vekdyn_recovery_score(
                     sv.get("sleep_score"), hv.get("hrv_avg"), hv.get("hrv_baseline"),
                     hv.get("hrv_normal_low"), hv.get("hrv_normal_high"),
+                    sleep_hr_avg, sleep_hr_baseline,
                 )
                 c.execute("""INSERT INTO coros_recovery_daily(
                         athlete_key,recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
-                        hrv_normal_low,hrv_normal_high,hrv_status,recovery_score)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        hrv_normal_low,hrv_normal_high,hrv_status,sleep_hr_avg,sleep_hr_baseline,recovery_score)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
                         sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),
                         sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
@@ -1237,11 +1292,14 @@ def sync_coros_recovery(athlete_key):
                         hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),
                         hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
                         hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),
+                        sleep_hr_avg=COALESCE(EXCLUDED.sleep_hr_avg,coros_recovery_daily.sleep_hr_avg),
+                        sleep_hr_baseline=COALESCE(EXCLUDED.sleep_hr_baseline,coros_recovery_daily.sleep_hr_baseline),
                         recovery_score=COALESCE(EXCLUDED.recovery_score,coros_recovery_daily.recovery_score),
                         updated_at=NOW()""",
                     (athlete_key, day, sv.get("sleep_minutes"), sv.get("sleep_score"),
                      hv.get("hrv_avg"), hv.get("hrv_baseline"), hv.get("hrv_normal_low"),
-                     hv.get("hrv_normal_high"), hv.get("hrv_status"), score))
+                     hv.get("hrv_normal_high"), hv.get("hrv_status"), sleep_hr_avg,
+                     sleep_hr_baseline, score))
         db.commit()
     return load_latest_coros_recovery(athlete_key)
 
@@ -1251,7 +1309,7 @@ def load_latest_coros_recovery(athlete_key):
     with get_database_connection() as db:
         with db.cursor() as c:
             c.execute("""SELECT recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
-                        hrv_normal_low,hrv_normal_high,hrv_status,recovery_score
+                        hrv_normal_low,hrv_normal_high,hrv_status,sleep_hr_avg,sleep_hr_baseline,recovery_score
                         FROM coros_recovery_daily WHERE athlete_key=%s
                         ORDER BY recovery_date DESC LIMIT 1""", (athlete_key,))
             r = c.fetchone()
@@ -1259,7 +1317,8 @@ def load_latest_coros_recovery(athlete_key):
         return {}
     return {"date":r[0],"sleep_minutes":r[1],"sleep_score":r[2],"hrv_avg":r[3],
             "hrv_baseline":r[4],"hrv_normal_low":r[5],"hrv_normal_high":r[6],
-            "hrv_status":r[7],"recovery_score":r[8]}
+            "hrv_status":r[7],"sleep_hr_avg":r[8],"sleep_hr_baseline":r[9],
+            "recovery_score":r[10]}
 
 
 # =========================================================
@@ -3842,11 +3901,11 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
             sleep_left, sleep_right = st.columns(2)
 
             with sleep_left:
-                sleeping_hr = recovery.get(
-                    "sleep_heart_rate",
-                    recovery.get("resting_hr", "--"),
-                )
-                st.metric("Sleeping HR", f"{sleeping_hr} bpm")
+                sleeping_hr = coros_recovery.get("sleep_hr_avg")
+                if sleeping_hr is None:
+                    sleeping_hr = recovery.get("sleep_heart_rate", recovery.get("resting_hr"))
+                sleeping_hr_display = f"{sleeping_hr} bpm" if sleeping_hr is not None and sleeping_hr != "--" else "None"
+                st.metric("Average Sleeping HR", sleeping_hr_display)
                 if coros_is_connected(athlete_key):
                     st.caption("COROS connected · HRV shown below")
                 else:
@@ -3864,8 +3923,11 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
             recovery_left, recovery_right = st.columns(2)
 
             with recovery_left:
-                hrv_value = coros_recovery.get("hrv_avg", recovery.get("average_hrv", "--"))
-                st.metric("Average HRV", f"{hrv_value} ms")
+                hrv_value = coros_recovery.get("hrv_avg")
+                if hrv_value is None:
+                    hrv_value = recovery.get("average_hrv")
+                hrv_display = f"{hrv_value} ms" if hrv_value is not None and hrv_value != "--" else "None"
+                st.metric("Average HRV", hrv_display)
                 if coros_recovery.get("hrv_status"):
                     detail = f"COROS: {coros_recovery['hrv_status']}"
                     if coros_recovery.get("hrv_baseline") is not None: detail += f" · baseline {coros_recovery['hrv_baseline']} ms"
@@ -3879,7 +3941,7 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
                 recovery_display = f"{recovery_score}%" if recovery_score is not None else "--"
                 st.metric("VEKDYN Recovery Score", recovery_display)
                 if recovery_score is not None:
-                    st.caption("55% sleep score · 45% individualized HRV readiness")
+                    st.caption("VEKDYN v2 · sleep + individualized HRV + average sleeping HR")
 
 if dashboard_view in {"Dashboard", "Notes"}:
     # =========================================================
