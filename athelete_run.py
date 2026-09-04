@@ -960,7 +960,10 @@ def initialize_coros_database():
                 athlete_key TEXT NOT NULL, recovery_date DATE NOT NULL, sleep_minutes INTEGER,
                 sleep_score INTEGER, hrv_avg INTEGER, hrv_baseline INTEGER,
                 hrv_normal_low INTEGER, hrv_normal_high INTEGER, hrv_status TEXT,
+                recovery_score INTEGER,
                 updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (athlete_key, recovery_date))""")
+            c.execute("""ALTER TABLE coros_recovery_daily
+                ADD COLUMN IF NOT EXISTS recovery_score INTEGER""")
         db.commit()
 
 
@@ -1134,26 +1137,111 @@ def coros_mcp_tool_call(token, name, arguments):
     return "\n".join(x.get("text","") for x in data.get("result",{}).get("content",[]) if isinstance(x,dict))
 
 
+def _parse_coros_sleep(text):
+    """Parse COROS sleep summaries into {date: values} without depending on one exact spacing style."""
+    records = {}
+    date_pattern = re.compile(r"(?m)^(\d{4}-\d{2}-\d{2}):?\s*$")
+    matches = list(date_pattern.finditer(text or ""))
+    for i, match in enumerate(matches):
+        day = match.group(1)
+        block = (text or "")[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text or "")]
+        score_match = re.search(r"Sleep Score:\s*(\d+)", block, re.I)
+        sleep_match = re.search(r"Main Sleep:\s*(?:(\d+)h\s*)?(\d+)min", block, re.I)
+        if score_match or sleep_match:
+            records[day] = {
+                "sleep_score": int(score_match.group(1)) if score_match else None,
+                "sleep_minutes": ((int(sleep_match.group(1) or 0) * 60) + int(sleep_match.group(2))) if sleep_match else None,
+            }
+    return records
+
+
+def _parse_coros_hrv(text):
+    """Parse only COROS's official HRV Assessment section, never the raw time-series points."""
+    assessment = (text or "").split("Sleep HRV Time Series", 1)[0]
+    pattern = re.compile(
+        r"(?m)^(\d{4}-\d{2}-\d{2}):\s*\n"
+        r"\s*HRV Avg:\s*(\d+)\s*ms\s*[—-]\s*([^\n]+)\n"
+        r"\s*Normal Range:\s*(\d+)\s*-\s*(\d+)\s*ms\s*\n"
+        r"\s*Baseline:\s*(\d+)\s*ms",
+        re.I,
+    )
+    records = {}
+    for m in pattern.finditer(assessment):
+        records[m.group(1)] = {
+            "hrv_avg": int(m.group(2)),
+            "hrv_status": m.group(3).strip(),
+            "hrv_normal_low": int(m.group(4)),
+            "hrv_normal_high": int(m.group(5)),
+            "hrv_baseline": int(m.group(6)),
+        }
+    return records
+
+
+def vekdyn_recovery_score(sleep_score, hrv_avg, hrv_baseline, hrv_low=None, hrv_high=None):
+    """VEKDYN v1 recovery: 55% COROS sleep score + 45% HRV readiness.
+
+    HRV is individualized to the athlete's COROS normal range/baseline rather than
+    compared across athletes. Missing inputs return None instead of inventing a score.
+    """
+    if sleep_score is None or hrv_avg is None or hrv_baseline in (None, 0):
+        return None
+
+    sleep_component = max(0.0, min(100.0, float(sleep_score)))
+
+    # Being inside the athlete's established normal range is treated as fully ready.
+    if hrv_low is not None and hrv_high is not None and hrv_low <= hrv_avg <= hrv_high:
+        hrv_component = 100.0
+    elif hrv_avg < (hrv_low if hrv_low is not None else hrv_baseline):
+        reference = float(hrv_low if hrv_low not in (None, 0) else hrv_baseline)
+        hrv_component = max(0.0, min(100.0, 100.0 * float(hrv_avg) / reference))
+    else:
+        # High HRV is not automatically "better"; avoid rewarding extreme deviations.
+        upper = float(hrv_high if hrv_high not in (None, 0) else hrv_baseline * 1.20)
+        hrv_component = max(70.0, 100.0 - max(0.0, float(hrv_avg) - upper) / max(upper, 1.0) * 100.0)
+
+    return int(round(0.55 * sleep_component + 0.45 * hrv_component))
+
+
 def sync_coros_recovery(athlete_key):
-    token=get_valid_coros_token(athlete_key); args={"startDate":"","endDate":"","days":7,"timezone":COROS_TIMEZONE}
-    sleep=coros_mcp_tool_call(token,"querySleepData",args); hrv=coros_mcp_tool_call(token,"querySleepHrv",args)
-    sleep_matches=list(re.finditer(r"(\d{4}-\d{2}-\d{2})[\s\S]*?Sleep Score:\s*(\d+)[\s\S]*?Main Sleep:\s*(?:(\d+)h\s*)?(\d+)min",sleep))
-    hrv_matches=list(re.finditer(r"(\d{4}-\d{2}-\d{2}):\s*\n\s*HRV Avg:\s*(\d+)\s*ms\s*—\s*([^\n]+)\s*\n\s*Normal Range:\s*(\d+)\s*-\s*(\d+)\s*ms\s*\n\s*Baseline:\s*(\d+)\s*ms",hrv))
-    if not sleep_matches and not hrv_matches: raise RuntimeError("No recent COROS sleep/HRV record was returned.")
-    sm=sleep_matches[-1] if sleep_matches else None; hm=hrv_matches[-1] if hrv_matches else None
-    dates=[m.group(1) for m in (sm,hm) if m]; day=max(dates)
-    sleep_minutes=(int(sm.group(3) or 0)*60+int(sm.group(4))) if sm and sm.group(1)==day else None
-    sleep_score=int(sm.group(2)) if sm and sm.group(1)==day else None
-    hv=(int(hm.group(2)),int(hm.group(6)),int(hm.group(4)),int(hm.group(5)),hm.group(3).strip()) if hm and hm.group(1)==day else (None,)*5
+    """Sync up to seven recent COROS recovery days for one VEKDYN athlete."""
+    token = get_valid_coros_token(athlete_key)
+    args = {"startDate": "", "endDate": "", "days": 7, "timezone": COROS_TIMEZONE}
+    sleep_text = coros_mcp_tool_call(token, "querySleepData", args)
+    hrv_text = coros_mcp_tool_call(token, "querySleepHrv", args)
+
+    sleep_days = _parse_coros_sleep(sleep_text)
+    hrv_days = _parse_coros_hrv(hrv_text)
+    all_days = sorted(set(sleep_days) | set(hrv_days))
+    if not all_days:
+        raise RuntimeError("No recent COROS sleep/HRV record was returned.")
+
+    initialize_coros_database()
     with get_database_connection() as db:
         with db.cursor() as c:
-            c.execute("""INSERT INTO coros_recovery_daily(athlete_key,recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,hrv_normal_low,hrv_normal_high,hrv_status)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
-                sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
-                hrv_avg=COALESCE(EXCLUDED.hrv_avg,coros_recovery_daily.hrv_avg),hrv_baseline=COALESCE(EXCLUDED.hrv_baseline,coros_recovery_daily.hrv_baseline),
-                hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
-                hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),updated_at=NOW()""",
-                (athlete_key,day,sleep_minutes,sleep_score,hv[0],hv[1],hv[2],hv[3],hv[4]))
+            for day in all_days:
+                sv = sleep_days.get(day, {})
+                hv = hrv_days.get(day, {})
+                score = vekdyn_recovery_score(
+                    sv.get("sleep_score"), hv.get("hrv_avg"), hv.get("hrv_baseline"),
+                    hv.get("hrv_normal_low"), hv.get("hrv_normal_high"),
+                )
+                c.execute("""INSERT INTO coros_recovery_daily(
+                        athlete_key,recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
+                        hrv_normal_low,hrv_normal_high,hrv_status,recovery_score)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
+                        sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),
+                        sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
+                        hrv_avg=COALESCE(EXCLUDED.hrv_avg,coros_recovery_daily.hrv_avg),
+                        hrv_baseline=COALESCE(EXCLUDED.hrv_baseline,coros_recovery_daily.hrv_baseline),
+                        hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),
+                        hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
+                        hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),
+                        recovery_score=COALESCE(EXCLUDED.recovery_score,coros_recovery_daily.recovery_score),
+                        updated_at=NOW()""",
+                    (athlete_key, day, sv.get("sleep_minutes"), sv.get("sleep_score"),
+                     hv.get("hrv_avg"), hv.get("hrv_baseline"), hv.get("hrv_normal_low"),
+                     hv.get("hrv_normal_high"), hv.get("hrv_status"), score))
         db.commit()
     return load_latest_coros_recovery(athlete_key)
 
@@ -1162,9 +1250,16 @@ def load_latest_coros_recovery(athlete_key):
     initialize_coros_database()
     with get_database_connection() as db:
         with db.cursor() as c:
-            c.execute("SELECT recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,hrv_normal_low,hrv_normal_high,hrv_status FROM coros_recovery_daily WHERE athlete_key=%s ORDER BY recovery_date DESC LIMIT 1",(athlete_key,)); r=c.fetchone()
-    if not r: return {}
-    return {"date":r[0],"sleep_minutes":r[1],"sleep_score":r[2],"hrv_avg":r[3],"hrv_baseline":r[4],"hrv_normal_low":r[5],"hrv_normal_high":r[6],"hrv_status":r[7]}
+            c.execute("""SELECT recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
+                        hrv_normal_low,hrv_normal_high,hrv_status,recovery_score
+                        FROM coros_recovery_daily WHERE athlete_key=%s
+                        ORDER BY recovery_date DESC LIMIT 1""", (athlete_key,))
+            r = c.fetchone()
+    if not r:
+        return {}
+    return {"date":r[0],"sleep_minutes":r[1],"sleep_score":r[2],"hrv_avg":r[3],
+            "hrv_baseline":r[4],"hrv_normal_low":r[5],"hrv_normal_high":r[6],
+            "hrv_status":r[7],"recovery_score":r[8]}
 
 
 # =========================================================
@@ -3752,7 +3847,10 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
                     recovery.get("resting_hr", "--"),
                 )
                 st.metric("Sleeping HR", f"{sleeping_hr} bpm")
-                st.caption("COROS connection pending")
+                if coros_is_connected(athlete_key):
+                    st.caption("COROS connected · HRV shown below")
+                else:
+                    st.caption("Connect COROS to add recovery data")
 
             with sleep_right:
                 coros_sleep_minutes = coros_recovery.get("sleep_minutes")
@@ -3775,10 +3873,13 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
                     st.caption(detail)
 
             with recovery_right:
-                st.metric(
-                    "Recovery Score",
-                    f"{recovery.get('recovery_score', '--')}%",
+                recovery_score = coros_recovery.get(
+                    "recovery_score", recovery.get("recovery_score")
                 )
+                recovery_display = f"{recovery_score}%" if recovery_score is not None else "--"
+                st.metric("VEKDYN Recovery Score", recovery_display)
+                if recovery_score is not None:
+                    st.caption("55% sleep score · 45% individualized HRV readiness")
 
 if dashboard_view in {"Dashboard", "Notes"}:
     # =========================================================
@@ -4519,17 +4620,22 @@ if dashboard_view in {"Dashboard", "Performance"}:
             )
 
 # =========================================================
-# TEAM WORKOUTS — VEKDYN COACH PLANNER + NEON
+# TEAM WORKOUTS — WEEKLY COACH PLANNER + NEON
 # =========================================================
+# The coach planner uses a Sunday-Saturday grid like a traditional training
+# spreadsheet while keeping every session in Neon. Existing VEKDYN Athlete
+# reads remain compatible because the original workout columns are preserved.
 
 WORKOUT_TYPES = [
     "Easy Run", "Recovery", "Long Run", "Threshold", "Intervals",
     "Hills", "Race / Time Trial", "Strength", "Rest", "Other",
 ]
 
+SESSION_SLOTS = ["AM", "PM"]
+
 
 def initialize_workouts_database():
-    """Create persistent team/athlete workout storage in Neon."""
+    """Create/upgrade persistent team/athlete workout storage in Neon."""
     with get_database_connection() as database:
         with database.cursor() as cursor:
             cursor.execute(
@@ -4561,18 +4667,69 @@ def initialize_workouts_database():
                 ADD COLUMN IF NOT EXISTS video_url TEXT
                 """
             )
+            cursor.execute(
+                """
+                ALTER TABLE team_workouts
+                ADD COLUMN IF NOT EXISTS session_slot TEXT DEFAULT 'AM'
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE team_workouts
+                ADD COLUMN IF NOT EXISTS effort_level TEXT
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE team_workouts
+                ADD COLUMN IF NOT EXISTS planned_miles REAL
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE team_workouts
+                SET session_slot = 'AM'
+                WHERE session_slot IS NULL OR BTRIM(session_slot) = ''
+                """
+            )
+        database.commit()
 
 
-def save_team_workout(team_id, athlete_key, workout_date, workout_type,
-                      warm_up, workout, cool_down, notes, video_url=""):
-    """Save one coach-written workout. athlete_key=None means entire team."""
+def save_team_workout(
+        team_id,
+        athlete_key,
+        workout_date,
+        workout_type,
+        warm_up,
+        workout,
+        cool_down,
+        notes,
+        video_url="",
+        session_slot="AM",
+        effort_level="",
+        planned_miles=None,
+):
+    """Save one coach-written session. athlete_key=None means entire team."""
     main_workout = str(workout).strip()
     clean_video_url = str(video_url or "").strip()
-    # Video publishing is intentionally restricted to Dark Horse Endurance.
+    clean_session = str(session_slot or "AM").strip().upper()
+    clean_effort = str(effort_level or "").strip()
+
     if team_id != "dark_horse_endurance":
         clean_video_url = ""
+
     if not main_workout:
         raise ValueError("Add the main workout before saving.")
+
+    if clean_session not in SESSION_SLOTS:
+        clean_session = "AM"
+
+    if planned_miles in (None, ""):
+        clean_miles = None
+    else:
+        clean_miles = float(planned_miles)
+        if clean_miles < 0:
+            raise ValueError("Planned mileage cannot be negative.")
 
     initialize_workouts_database()
     with get_database_connection() as database:
@@ -4581,70 +4738,137 @@ def save_team_workout(team_id, athlete_key, workout_date, workout_type,
                 """
                 INSERT INTO team_workouts (
                     team_id, athlete_key, workout_date, workout_type,
-                    warm_up, workout, cool_down, notes, video_url, created_by
+                    warm_up, workout, cool_down, notes, video_url, created_by,
+                    session_slot, effort_level, planned_miles
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    team_id, athlete_key, workout_date, str(workout_type).strip(),
-                    str(warm_up).strip(), main_workout, str(cool_down).strip(),
-                    str(notes).strip(), clean_video_url,
+                    team_id,
+                    athlete_key,
+                    workout_date,
+                    str(workout_type).strip(),
+                    str(warm_up).strip(),
+                    main_workout,
+                    str(cool_down).strip(),
+                    str(notes).strip(),
+                    clean_video_url,
                     st.session_state.get("logged_in_user", "Coach"),
+                    clean_session,
+                    clean_effort,
+                    clean_miles,
                 ),
             )
+        database.commit()
+
+
+def _workout_rows_to_dicts(rows):
+    return [
+        {
+            "id": row[0],
+            "athlete_key": row[1],
+            "Date": row[2],
+            "Type": row[3],
+            "Warm Up": row[4] or "",
+            "Workout": row[5] or "",
+            "Cool Down": row[6] or "",
+            "Notes": row[7] or "",
+            "Video URL": row[8] or "",
+            "Session": (row[9] or "AM").upper(),
+            "Effort": row[10] or "",
+            "Planned Miles": row[11],
+        }
+        for row in rows
+    ]
 
 
 def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
-    """Load team-wide workouts plus workouts assigned to the selected athlete."""
+    """Load upcoming team sessions plus sessions assigned to one athlete."""
     initialize_workouts_database()
     today = datetime.now(TEAM_TIMEZONE).date()
 
     with get_database_connection() as database:
-        3
-    with database.cursor() as cursor:
-        if selected_athlete_key:
-            cursor.execute(
-                """
-                SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                       workout, cool_down, notes, video_url
-                FROM team_workouts
-                WHERE team_id = %s
-                  AND workout_date >= %s
-                  AND (athlete_key IS NULL OR athlete_key = %s)
-                ORDER BY workout_date ASC, id ASC
-                LIMIT %s
-                """,
-                (team_id, today, selected_athlete_key, int(limit)),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                       workout, cool_down, notes, video_url
-                FROM team_workouts
-                WHERE team_id = %s
-                  AND workout_date >= %s
-                  AND athlete_key IS NULL
-                ORDER BY workout_date ASC, id ASC
-                LIMIT %s
-                """,
-                (team_id, today, int(limit)),
-            )
-        rows = cursor.fetchall()
-        return [
-            {
-                "id": row[0],
-                "athlete_key": row[1],
-                "Date": row[2],
-                "Type": row[3],
-                "Warm Up": row[4] or "",
-                "Workout": row[5],
-                "Cool Down": row[6] or "",
-                "Notes": row[7] or "",
-                "Video URL": row[8] or "",
-            }
-            for row in rows
-        ]
+        with database.cursor() as cursor:
+            if selected_athlete_key:
+                cursor.execute(
+                    """
+                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                           workout, cool_down, notes, video_url,
+                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                    FROM team_workouts
+                    WHERE team_id = %s
+                      AND workout_date >= %s
+                      AND (athlete_key IS NULL OR athlete_key = %s)
+                    ORDER BY workout_date ASC,
+                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                             id ASC
+                    LIMIT %s
+                    """,
+                    (team_id, today, selected_athlete_key, int(limit)),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                           workout, cool_down, notes, video_url,
+                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                    FROM team_workouts
+                    WHERE team_id = %s
+                      AND workout_date >= %s
+                      AND athlete_key IS NULL
+                    ORDER BY workout_date ASC,
+                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                             id ASC
+                    LIMIT %s
+                    """,
+                    (team_id, today, int(limit)),
+                )
+            rows = cursor.fetchall()
+
+    return _workout_rows_to_dicts(rows)
+
+
+def load_team_workouts_range(team_id, start_date, end_date, selected_athlete_key=None):
+    """Load a complete Sunday-Saturday planning window for the selected athlete."""
+    initialize_workouts_database()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            if selected_athlete_key:
+                cursor.execute(
+                    """
+                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                           workout, cool_down, notes, video_url,
+                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                    FROM team_workouts
+                    WHERE team_id = %s
+                      AND workout_date BETWEEN %s AND %s
+                      AND (athlete_key IS NULL OR athlete_key = %s)
+                    ORDER BY workout_date ASC,
+                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                             id ASC
+                    """,
+                    (team_id, start_date, end_date, selected_athlete_key),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                           workout, cool_down, notes, video_url,
+                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                    FROM team_workouts
+                    WHERE team_id = %s
+                      AND workout_date BETWEEN %s AND %s
+                      AND athlete_key IS NULL
+                    ORDER BY workout_date ASC,
+                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                             id ASC
+                    """,
+                    (team_id, start_date, end_date),
+                )
+            rows = cursor.fetchall()
+
+    return _workout_rows_to_dicts(rows)
 
 
 def delete_team_workout(workout_id, team_id):
@@ -4656,6 +4880,7 @@ def delete_team_workout(workout_id, team_id):
                 "DELETE FROM team_workouts WHERE id = %s AND team_id = %s",
                 (int(workout_id), team_id),
             )
+        database.commit()
 
 
 def workout_value(value, fallback="—"):
@@ -4663,7 +4888,88 @@ def workout_value(value, fallback="—"):
     return fallback if not value or value.lower() == "nan" else value
 
 
+def _session_description(workout):
+    """Compact description for one spreadsheet-style weekly cell."""
+    pieces = []
+    warmup = workout_value(workout.get("Warm Up"), "")
+    main = workout_value(workout.get("Workout"), "")
+    cooldown = workout_value(workout.get("Cool Down"), "")
+    notes = workout_value(workout.get("Notes"), "")
+
+    if warmup:
+        pieces.append(f"WU: {warmup}")
+    if main:
+        pieces.append(main)
+    if cooldown:
+        pieces.append(f"CD: {cooldown}")
+    if notes:
+        pieces.append(f"Note: {notes}")
+
+    return " | ".join(pieces) if pieces else "—"
+
+
+def _weekly_workout_matrix(workouts, week_start):
+    """Build the Sunday-Saturday matrix shown to the coach."""
+    dates = [week_start + timedelta(days=i) for i in range(7)]
+    by_day_slot = {(day, slot): [] for day in dates for slot in SESSION_SLOTS}
+
+    for workout in workouts:
+        day = workout.get("Date")
+        if hasattr(day, "date"):
+            day = day.date()
+        slot = str(workout.get("Session") or "AM").upper()
+        if slot not in SESSION_SLOTS:
+            slot = "AM"
+        if (day, slot) in by_day_slot:
+            by_day_slot[(day, slot)].append(workout)
+
+    def join_for(day, slot, field):
+        sessions = by_day_slot[(day, slot)]
+        if not sessions:
+            return "—"
+        if field == "title":
+            return " / ".join(workout_value(item.get("Type"), "Training") for item in sessions)
+        if field == "description":
+            return " || ".join(_session_description(item) for item in sessions)
+        if field == "effort":
+            values = [workout_value(item.get("Effort"), "") for item in sessions]
+            values = [value for value in values if value]
+            return " / ".join(values) if values else "—"
+        return "—"
+
+    columns = [day.strftime("%a\n%b %-d") for day in dates]
+    rows = {
+        "AM Session": [join_for(day, "AM", "title") for day in dates],
+        "PM Session": [join_for(day, "PM", "title") for day in dates],
+        "AM Description": [join_for(day, "AM", "description") for day in dates],
+        "PM Description": [join_for(day, "PM", "description") for day in dates],
+        "AM Effort": [join_for(day, "AM", "effort") for day in dates],
+        "PM Effort": [join_for(day, "PM", "effort") for day in dates],
+    }
+
+    daily_miles = []
+    for day in dates:
+        miles = [
+            float(item["Planned Miles"])
+            for slot in SESSION_SLOTS
+            for item in by_day_slot[(day, slot)]
+            if item.get("Planned Miles") is not None
+        ]
+        daily_miles.append(round(sum(miles), 1) if miles else None)
+
+    rows["Total Day Mileage"] = [
+        f"{value:g}" if value is not None else "—"
+        for value in daily_miles
+    ]
+
+    matrix = pd.DataFrame(rows, index=columns).T
+    weekly_total = round(sum(value for value in daily_miles if value is not None), 1)
+    has_mileage = any(value is not None for value in daily_miles)
+    return matrix, (weekly_total if has_mileage else None)
+
+
 def render_team_workout_card(workout, athlete_lookup):
+    """Detailed saved-session card used inside the management expander."""
     workout_date = pd.Timestamp(workout["Date"])
     date_label = workout_date.strftime("%a, %b %d")
     assigned_key = workout.get("athlete_key")
@@ -4673,9 +4979,13 @@ def render_team_workout_card(workout, athlete_lookup):
     )
 
     with st.container(border=True):
-        st.caption(date_label)
+        st.caption(f"{date_label} · {workout.get('Session', 'AM')}")
         st.markdown(f"### {workout_value(workout.get('Type'), 'Team Training')}")
         st.caption(f"Assigned to: {assigned_name}")
+        if workout.get("Planned Miles") is not None:
+            st.caption(f"Planned mileage: {float(workout['Planned Miles']):g} mi")
+        if workout_value(workout.get("Effort"), ""):
+            st.caption(f"Effort: {workout_value(workout.get('Effort'), '')}")
         st.markdown(f"**Warm-up:** {workout_value(workout.get('Warm Up'))}")
         st.markdown(f"**Workout:** {workout_value(workout.get('Workout'))}")
         st.markdown(f"**Cool-down:** {workout_value(workout.get('Cool Down'))}")
@@ -4690,10 +5000,10 @@ def render_team_workout_card(workout, athlete_lookup):
 
 
 def render_team_workouts():
-    """Coach writes plans directly in VEKDYN; no Excel step required."""
+    """Sunday-Saturday coach planner with AM/PM sessions and weekly mileage."""
     st.markdown(
-        '<div class="team-workout-title">Upcoming Workouts</div>'
-        '<div class="team-workout-subtitle">Write and assign training without leaving VEKDYN.</div>',
+        '<div class="team-workout-title">Weekly Training Plan</div>'
+        '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, effort and planned mileage.</div>',
         unsafe_allow_html=True,
     )
 
@@ -4704,16 +5014,68 @@ def render_team_workouts():
     }
     name_to_key = {name: key for key, name in athlete_names.items()}
 
+    today = datetime.now(TEAM_TIMEZONE).date()
+    current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+    week_state_key = f"coach_workout_week_offset_{active_team}_{athlete_key}"
+    if week_state_key not in st.session_state:
+        st.session_state[week_state_key] = 0
+
+    nav_left, nav_mid, nav_right = st.columns([1, 1, 1])
+    with nav_left:
+        if st.button("← Previous week", key=f"prev_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+            st.session_state[week_state_key] -= 1
+            st.rerun()
+    with nav_mid:
+        if st.button("This week", key=f"this_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+            st.session_state[week_state_key] = 0
+            st.rerun()
+    with nav_right:
+        if st.button("Next week →", key=f"next_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+            st.session_state[week_state_key] += 1
+            st.rerun()
+
+    week_start = current_sunday + timedelta(weeks=int(st.session_state[week_state_key]))
+    week_end = week_start + timedelta(days=6)
+
+    title_left, title_right = st.columns([3, 1])
+    with title_left:
+        st.markdown(
+            f"### {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
+        )
+        st.caption(
+            "Showing team-wide sessions plus individual sessions for "
+            f"{athlete_names.get(athlete_key, 'the selected athlete')}."
+        )
+
     with st.expander("+ Write a workout", expanded=False):
         assignment_options = ["Entire Team"] + sorted(name_to_key.keys())
-        with st.form(f"workout_form_{active_team}", clear_on_submit=True):
-            top_left, top_mid, top_right = st.columns(3)
+        with st.form(f"workout_form_{active_team}_{athlete_key}", clear_on_submit=True):
+            top_left, top_mid, top_right, top_slot = st.columns([1.4, 1, 1.1, .7])
             with top_left:
                 assignment = st.selectbox("Assign to", assignment_options)
             with top_mid:
-                workout_date = st.date_input("Date", value=datetime.now(TEAM_TIMEZONE).date())
+                workout_date = st.date_input("Date", value=week_start)
             with top_right:
                 workout_type = st.selectbox("Workout type", WORKOUT_TYPES)
+            with top_slot:
+                session_slot = st.selectbox("Session", SESSION_SLOTS)
+
+            effort_col, miles_col = st.columns(2)
+            with effort_col:
+                effort_level = st.selectbox(
+                    "Effort (1–10)",
+                    ["—"] + [str(value) for value in range(1, 11)],
+                    help="Optional coach target. Use 1 for very easy and 10 for maximal.",
+                )
+            with miles_col:
+                planned_miles = st.number_input(
+                    "Planned mileage",
+                    min_value=0.0,
+                    max_value=50.0,
+                    value=0.0,
+                    step=0.5,
+                    help="Use 0 if you do not want mileage included for this session.",
+                )
 
             warm_up = st.text_area("Warm Up", placeholder="Example: 2 miles easy + drills")
             main_workout = st.text_area(
@@ -4722,6 +5084,7 @@ def render_team_workouts():
             )
             cool_down = st.text_area("Cool Down", placeholder="Example: 2 miles easy")
             notes = st.text_area("Coach Notes", placeholder="Optional cues, targets, or instructions")
+
             if active_team == "dark_horse_endurance":
                 video_url = st.text_input(
                     "Coach Video URL",
@@ -4730,6 +5093,7 @@ def render_team_workouts():
                 )
             else:
                 video_url = ""
+
             submitted = st.form_submit_button(
                 "Save Workout", type="primary", use_container_width=True
             )
@@ -4738,35 +5102,63 @@ def render_team_workouts():
             assigned_key = None if assignment == "Entire Team" else name_to_key[assignment]
             try:
                 save_team_workout(
-                    active_team, assigned_key, workout_date, workout_type,
-                    warm_up, main_workout, cool_down, notes, video_url,
+                    active_team,
+                    assigned_key,
+                    workout_date,
+                    workout_type,
+                    warm_up,
+                    main_workout,
+                    cool_down,
+                    notes,
+                    video_url,
+                    session_slot=session_slot,
+                    effort_level="" if effort_level == "—" else effort_level,
+                    planned_miles=None if planned_miles == 0 else planned_miles,
                 )
                 st.success("Workout saved to VEKDYN.")
                 st.rerun()
-            except ValueError as error:
+            except (ValueError, psycopg2.Error) as error:
                 st.warning(str(error))
 
     try:
-        workouts = load_team_workouts(active_team, athlete_key, limit=12)
+        workouts = load_team_workouts_range(
+            active_team,
+            week_start,
+            week_end,
+            athlete_key,
+        )
     except Exception as error:
         st.warning(f"VEKDYN could not load workouts: {error}")
         return
 
-    if not workouts:
-        st.info("No upcoming workouts have been written yet.")
-        return
+    matrix, weekly_miles = _weekly_workout_matrix(workouts, week_start)
 
-    st.caption(
-        "Showing team workouts and any individual sessions assigned to "
-        f"{athlete_names.get(athlete_key, 'the selected athlete')}."
+    with title_right:
+        if weekly_miles is None:
+            st.metric("Planned Week", "— mi")
+        else:
+            st.metric("Planned Week", f"{weekly_miles:g} mi")
+
+    # Spreadsheet-style overview. Long descriptions get extra row height instead
+    # of forcing the coach to open seven separate cards.
+    st.dataframe(
+        matrix,
+        use_container_width=True,
+        height=500,
+        row_height=62,
     )
 
-    for start_index in range(0, len(workouts), 3):
-        row = workouts[start_index:start_index + 3]
-        columns = st.columns(3, gap="medium")
-        for column, workout in zip(columns, row):
-            with column:
-                render_team_workout_card(workout, team_athletes)
+    if not workouts:
+        st.info("No sessions are saved for this week yet.")
+        return
+
+    with st.expander("Manage saved sessions", expanded=False):
+        for start_index in range(0, len(workouts), 3):
+            row = workouts[start_index:start_index + 3]
+            columns = st.columns(3, gap="medium")
+            for column, workout in zip(columns, row):
+                with column:
+                    render_team_workout_card(workout, team_athletes)
 
 
 if dashboard_view in {"Dashboard", "Training"}:
