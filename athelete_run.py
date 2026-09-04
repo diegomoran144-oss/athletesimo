@@ -5169,6 +5169,32 @@ def _dark_horse_workout_calendar_style(matrix):
     return styler
 
 
+
+def _render_dark_horse_workout_calendar(matrix):
+    """Render Dark Horse weekly plan with guaranteed branded colors."""
+    headers = "".join(f'<th>{html.escape(str(c)).replace(chr(10), "<br>")}</th>' for c in matrix.columns)
+    body = []
+    for n, (label, row) in enumerate(matrix.iterrows()):
+        cls = "dh-total" if str(label) == "Total Day Mileage" else ("dh-alt" if n % 2 else "")
+        cells = "".join(f'<td>{html.escape(str(v if v not in (None, "") else "—")).replace(chr(10), "<br>")}</td>' for v in row.tolist())
+        body.append(f'<tr class="{cls}"><th>{html.escape(str(label))}</th>{cells}</tr>')
+    markup = """
+<style>
+.dh-wrap{width:100%;overflow-x:auto;border:1px solid #8f45c2;border-radius:10px;background:#0e0912}
+.dh-cal{width:100%;min-width:900px;border-collapse:collapse;table-layout:fixed}
+.dh-cal th,.dh-cal td{padding:16px 12px;border-right:1px solid #613878;border-bottom:1px solid #513062;font-size:14px;line-height:1.35}
+.dh-cal thead th{background:#7d3caf;color:#fff;font-weight:800;text-align:center}
+.dh-cal thead th:first-child{background:#321a40;width:150px}
+.dh-cal tbody th{background:#2b1836;color:#f8efff;font-weight:750;text-align:left;width:150px}
+.dh-cal td{background:#18111f;color:#fff;font-weight:550}
+.dh-cal tr.dh-alt td{background:#23152c}.dh-cal tr.dh-alt th{background:#372044}
+.dh-cal tr.dh-total td{background:#422154;font-weight:800}.dh-cal tr.dh-total th{background:#632b7d;color:#fff}
+.dh-cal tr:last-child th,.dh-cal tr:last-child td{border-bottom:0}.dh-cal th:last-child,.dh-cal td:last-child{border-right:0}
+</style>
+<div class="dh-wrap"><table class="dh-cal"><thead><tr><th>Guide</th>__HEADERS__</tr></thead><tbody>__BODY__</tbody></table></div>
+""".replace("__HEADERS__", headers).replace("__BODY__", "".join(body))
+    st.markdown(markup, unsafe_allow_html=True)
+
 def render_team_workout_card(workout, athlete_lookup):
     """Detailed saved-session card used inside the management expander."""
     workout_date = pd.Timestamp(workout["Date"])
@@ -5342,17 +5368,10 @@ def render_team_workouts():
 
     # Spreadsheet-style overview. Long descriptions get extra row height instead
     # of forcing the coach to open seven separate cards.
-    calendar_display = (
-        _dark_horse_workout_calendar_style(matrix)
-        if active_team == "dark_horse_endurance"
-        else matrix
-    )
-    st.dataframe(
-        calendar_display,
-        use_container_width=True,
-        height=500,
-        row_height=62,
-    )
+    if active_team == "dark_horse_endurance":
+        _render_dark_horse_workout_calendar(matrix)
+    else:
+        st.dataframe(matrix, use_container_width=True, height=500, row_height=62)
 
     if not workouts:
         st.info("No sessions are saved for this week yet.")
