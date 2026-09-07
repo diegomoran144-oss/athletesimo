@@ -744,70 +744,7 @@ if pricing_mode:
             st.query_params.clear()
             st.rerun()
 
-    pricing_html = """\
-<div class="pricing-page">
-    <div class="pricing-brand">VEK<span>DYN</span></div>
-    <div class="pricing-kicker">DATA DRIVES DEVELOPMENT</div>
-
-    <div class="pricing-heading">Simple team pricing.</div>
-    <div class="pricing-subheading">
-        One VEKDYN team license gives a program access to the coach platform
-        and athlete experience. Choose annual or monthly billing.
-    </div>
-
-    <div class="plan-grid">
-        <div class="plan-card featured">
-            <div class="plan-label">Annual Team License</div>
-            <div class="plan-price">$500 <small>/ year</small></div>
-            <div class="save-pill">Save $100 annually</div>
-            <div class="plan-copy">
-                Best value for programs using VEKDYN throughout the full season
-                and academic year.
-            </div>
-        </div>
-
-        <div class="plan-card">
-            <div class="plan-label">Monthly Team License</div>
-            <div class="plan-price">$50 <small>/ month</small></div>
-            <div class="plan-copy">
-                Flexible month-to-month access for programs that want to start
-                with a shorter commitment.
-            </div>
-        </div>
-    </div>
-
-    <div class="included-box">
-        <div class="included-title">Included with either plan</div>
-        <div class="included-grid">
-            <div>✓ Team dashboard & analytics</div>
-            <div>✓ Athlete performance profiles</div>
-            <div>✓ Training calendar & workout planning</div>
-            <div>✓ Threshold & training analytics</div>
-            <div>✓ Race predictions</div>
-            <div>✓ Recovery tracking</div>
-            <div>✓ Athlete data integrations</div>
-            <div>✓ Secure team workspace</div>
-        </div>
-    </div>
-
-    <div class="purchase-box">
-        <div class="purchase-title">Purchasing Information</div>
-        <div class="purchase-row"><span>Vendor / Company</span><strong>VEKDYN</strong></div>
-        <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div>
-        <div class="purchase-row"><span>License</span><strong>Annual or Monthly Team License</strong></div>
-        <div class="purchase-row"><span>Published Pricing</span><strong>$500/year or $50/month</strong></div>
-        <div class="purchase-row"><span>Billing</span><strong>Annual invoice or monthly billing</strong></div>
-        <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div>
-    </div>
-
-    <div class="pricing-cta">
-        <div class="pricing-cta-title">Ready to bring VEKDYN to your program?</div>
-        <div class="pricing-cta-copy">
-            Request program access or prepare the information needed for an invoice.
-        </div>
-    </div>
-</div>
-"""
+    pricing_html = '<div class="pricing-page"> <div class="pricing-brand">VEK<span>DYN</span></div> <div class="pricing-kicker">DATA DRIVES DEVELOPMENT</div> <div class="pricing-heading">Simple team pricing.</div> <div class="pricing-subheading"> One VEKDYN team license gives a program access to the coach platform and athlete experience. Choose annual or monthly billing. </div> <div class="plan-grid"> <div class="plan-card featured"> <div class="plan-label">Annual Team License</div> <div class="plan-price">$500 <small>/ year</small></div> <div class="save-pill">Save $100 annually</div> <div class="plan-copy"> Best value for programs using VEKDYN throughout the full season and academic year. </div> </div> <div class="plan-card"> <div class="plan-label">Monthly Team License</div> <div class="plan-price">$50 <small>/ month</small></div> <div class="plan-copy"> Flexible month-to-month access for programs that want to start with a shorter commitment. </div> </div> </div> <div class="included-box"> <div class="included-title">Included with either plan</div> <div class="included-grid"> <div>✓ Team dashboard & analytics</div> <div>✓ Athlete performance profiles</div> <div>✓ Training calendar & workout planning</div> <div>✓ Threshold & training analytics</div> <div>✓ Race predictions</div> <div>✓ Recovery tracking</div> <div>✓ Athlete data integrations</div> <div>✓ Secure team workspace</div> </div> </div> <div class="purchase-box"> <div class="purchase-title">Purchasing Information</div> <div class="purchase-row"><span>Vendor / Company</span><strong>VEKDYN</strong></div> <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div> <div class="purchase-row"><span>License</span><strong>Annual or Monthly Team License</strong></div> <div class="purchase-row"><span>Published Pricing</span><strong>$500/year or $50/month</strong></div> <div class="purchase-row"><span>Billing</span><strong>Annual invoice or monthly billing</strong></div> <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div> </div> <div class="pricing-cta"> <div class="pricing-cta-title">Ready to bring VEKDYN to your program?</div> <div class="pricing-cta-copy"> Request program access or prepare the information needed for an invoice. </div> </div> </div>'
     st.markdown(pricing_html, unsafe_allow_html=True)
 
     st.markdown("### Request an Invoice")
