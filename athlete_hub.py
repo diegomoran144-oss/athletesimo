@@ -1713,6 +1713,20 @@ st.markdown(
     """
     <style>
 
+    /* Athlete daily feedback: entered note text should be clearly readable. */
+    div[data-testid="stTextArea"] textarea {
+        color: #111111 !important;
+        -webkit-text-fill-color: #111111 !important;
+        caret-color: #111111 !important;
+    }
+
+    div[data-testid="stTextArea"] textarea::placeholder {
+        color: #9ca3af !important;
+        -webkit-text-fill-color: #9ca3af !important;
+        opacity: 1 !important;
+    }
+
+
     /* -----------------------------------------------------
        APP SHELL
     ----------------------------------------------------- */
