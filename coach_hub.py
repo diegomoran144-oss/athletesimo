@@ -478,6 +478,12 @@ def validate_login_token(token):
 
 def restore_login_session():
     """Restore the correct team workspace after a browser refresh."""
+
+    # The unified VEKDYN entry point is now the source of truth for login.
+    # If the coach deliberately logged out, do not revive an older token.
+    if st.session_state.get("just_logged_out"):
+        return
+
     if st.session_state.get("logged_in"):
         return
 
@@ -493,16 +499,31 @@ def restore_login_session():
 
 
 def log_out():
-    """End the current VEKDYN login session."""
+    """Completely end both the Coach Hub and unified VEKDYN session."""
+
+    # Mark this as an intentional logout before the rerun.
+    st.session_state["just_logged_out"] = True
+
+    # Clear authentication and routing state from both layers.
+    for key in [
+        "logged_in_user",
+        "active_team",
+        "pending_team",
+        "vekdyn_authenticated_user",
+        "vekdyn_role",
+        "athlete_id",
+        "password_change_required",
+    ]:
+        st.session_state.pop(key, None)
+
     st.session_state["logged_in"] = False
-    st.session_state.pop("logged_in_user", None)
-    st.session_state.pop("active_team", None)
-    st.session_state.pop("pending_team", None)
-
-    if "session" in st.query_params:
-        del st.query_params["session"]
-
     st.session_state["page"] = "home"
+
+    # Remove the old Coach Hub token and the new unified token, then tell
+    # vekdyn_unified.py that this rerun is a deliberate logout.
+    st.query_params.clear()
+    st.query_params["logout"] = "1"
+
     st.rerun()
 
 
@@ -2227,6 +2248,7 @@ def render_login_page():
                 st.session_state["active_team"] = pending_team
                 st.session_state["pending_team"] = None
                 st.session_state["page"] = "dashboard"
+                st.session_state.pop("just_logged_out", None)
 
                 st.query_params["session"] = create_login_token(
                     username,
@@ -3517,7 +3539,6 @@ with st.sidebar:
         ("♨ Training", "Training"),
         ("↗ Performance", "Performance"),
         ("♡ Recovery", "Recovery"),
-        ("📝 Notes", "Notes"),
     ]
 
     for label, view_name in nav_items:
@@ -3530,6 +3551,12 @@ with st.sidebar:
             st.session_state["dashboard_view"] = view_name
 
     dashboard_view = st.session_state.get("dashboard_view", "Dashboard")
+
+    # Notes is no longer a standalone coach view. Normalize older sessions
+    # that may still have Notes selected from a previous version.
+    if dashboard_view == "Notes":
+        dashboard_view = "Dashboard"
+        st.session_state["dashboard_view"] = "Dashboard"
 
     # -----------------------------------------------------
     # CONTACT / FEEDBACK
@@ -4040,122 +4067,6 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
                 st.metric("VEKDYN Recovery Score", recovery_display)
                 if recovery_score is not None:
                     st.caption("Sleep + individualized HRV + average sleeping HR")
-
-if dashboard_view in {"Dashboard", "Notes"}:
-    # =========================================================
-    # ATHLETE + COACH NOTES
-    # =========================================================
-
-    st.write("")
-
-    notes_feed_col, notes_compose_col = st.columns([1.75, 1], gap="large")
-
-    with notes_feed_col:
-        st.markdown(
-            '<div class="notes-title">Notes</div>'
-            '<div class="notes-subtitle">Athlete feedback and coach responses in one timeline.</div>',
-            unsafe_allow_html=True,
-        )
-
-        note_filter_label = st.selectbox(
-            "Note filter",
-            options=["All Notes", "Athlete", "Coach"],
-            key=f"note_filter_{athlete_key}",
-            label_visibility="collapsed",
-        )
-        role_filter = {
-            "All Notes": None,
-            "Athlete": "ATHLETE",
-            "Coach": "COACH",
-        }[note_filter_label]
-
-        try:
-            notes = load_athlete_notes(
-                athlete_key,
-                limit=40,
-                role_filter=role_filter,
-            )
-        except psycopg2.Error as error:
-            notes = []
-            st.error(f"Notes could not be loaded from Neon: {error}")
-
-        if notes:
-            for note in notes:
-                role = note.get("author_role", "ATHLETE").upper()
-                role_class = "coach" if role == "COACH" else "athlete"
-                safe_author = html.escape(str(note.get("author_name", "")))
-                safe_role = html.escape(role)
-                safe_time = html.escape(format_note_timestamp(note.get("created_at")))
-                safe_text = html.escape(str(note.get("note_text", ""))).replace("\n", "<br>")
-
-                note_html = (
-                    f'<div class="note-card note-card-{role_class}">'
-                    '<div class="note-header">'
-                    '<div class="note-author-wrap">'
-                    f'<span class="note-author">{safe_author}</span>'
-                    f'<span class="note-role note-role-{role_class}">{safe_role}</span>'
-                    '</div>'
-                    f'<span class="note-time">{safe_time}</span>'
-                    '</div>'
-                    f'<div class="note-body">{safe_text}</div>'
-                    '</div>'
-                )
-                st.markdown(note_html, unsafe_allow_html=True)
-        else:
-            st.info("No notes yet. Add the first training update for this athlete.")
-
-    with notes_compose_col:
-        with st.container(border=True):
-            st.markdown("### Add a note")
-            st.caption("Share how training went or leave a coaching response.")
-
-            with st.form(key=f"shared_note_form_{athlete_key}", clear_on_submit=True):
-                posting_as = st.selectbox(
-                    "Posting as",
-                    options=["Athlete", "Coach"],
-                    key=f"note_posting_as_{athlete_key}",
-                )
-
-                if posting_as == "Athlete":
-                    note_author_name = athlete_name
-                    note_author_role = "ATHLETE"
-                    st.caption(f"Posting as {athlete_name}")
-                else:
-                    note_author_name = "Coach Zarate"
-                    note_author_role = "COACH"
-                    st.caption("Posting as Coach Zarate")
-
-                new_note_text = st.text_area(
-                    "Note",
-                    height=180,
-                    placeholder=(
-                        "How did training go? Include effort, soreness, sleep, "
-                        "lactate, mechanics, recovery, or anything the coach should know."
-                    ),
-                    label_visibility="collapsed",
-                )
-
-                save_shared_note = st.form_submit_button(
-                    "Save Note",
-                    type="primary",
-                    use_container_width=True,
-                )
-
-            if save_shared_note:
-                try:
-                    save_athlete_note(
-                        athlete_key=athlete_key,
-                        author_name=note_author_name,
-                        author_role=note_author_role,
-                        note_text=new_note_text,
-                    )
-                    st.success("Note added.")
-                    st.rerun()
-                except ValueError as error:
-                    st.warning(str(error))
-                except psycopg2.Error as error:
-                    st.error(f"The note could not be saved to Neon: {error}")
-
 
 # =========================================================
 # VEKDYN PERFORMANCE PREDICTION ENGINE
@@ -5068,7 +4979,72 @@ def _session_description(workout):
     return " | ".join(pieces) if pieces else "—"
 
 
-def _weekly_workout_matrix(workouts, week_start):
+def initialize_daily_feedback_database():
+    """
+    Shared athlete day-feedback storage.
+
+    The Athlete Hub will write one short note per athlete/date.
+    The Coach Hub only reads it and displays it in the weekly training plan.
+    """
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS athlete_daily_feedback (
+                    id BIGSERIAL PRIMARY KEY,
+                    team_id TEXT NOT NULL,
+                    athlete_key TEXT NOT NULL,
+                    feedback_date DATE NOT NULL,
+                    note_text TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (team_id, athlete_key, feedback_date)
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_athlete_daily_feedback_lookup
+                ON athlete_daily_feedback (team_id, athlete_key, feedback_date);
+                """
+            )
+        database.commit()
+
+
+def load_daily_feedback_range(team_id, selected_athlete_key, start_date, end_date):
+    """Load the selected athlete's day-specific feedback for the visible week."""
+    if not selected_athlete_key:
+        return {}
+
+    initialize_daily_feedback_database()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT feedback_date, note_text
+                FROM athlete_daily_feedback
+                WHERE team_id = %s
+                  AND athlete_key = %s
+                  AND feedback_date BETWEEN %s AND %s
+                ORDER BY feedback_date ASC;
+                """,
+                (
+                    team_id,
+                    selected_athlete_key,
+                    start_date,
+                    end_date,
+                ),
+            )
+            rows = cursor.fetchall()
+
+    return {
+        row[0]: (row[1] or "").strip()
+        for row in rows
+        if row[1] and str(row[1]).strip()
+    }
+
+
+def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
     """Build the Sunday-Saturday matrix shown to the coach."""
     dates = [week_start + timedelta(days=i) for i in range(7)]
     by_day_slot = {(day, slot): [] for day in dates for slot in SESSION_SLOTS}
@@ -5121,6 +5097,14 @@ def _weekly_workout_matrix(workouts, week_start):
         f"{value:g}" if value is not None else "—"
         for value in daily_miles
     ]
+
+    # Day-specific athlete feedback replaces the old standalone Notes area.
+    # It stays attached to the exact training day where it is useful.
+    if athlete_feedback is not None:
+        rows["Athlete Feedback"] = [
+            workout_value(athlete_feedback.get(day), "—")
+            for day in dates
+        ]
 
     matrix = pd.DataFrame(rows, index=columns).T
     weekly_total = round(sum(value for value in daily_miles if value is not None), 1)
@@ -5358,7 +5342,22 @@ def render_team_workouts():
         st.warning(f"VEKDYN could not load workouts: {error}")
         return
 
-    matrix, weekly_miles = _weekly_workout_matrix(workouts, week_start)
+    try:
+        athlete_feedback = load_daily_feedback_range(
+            active_team,
+            athlete_key,
+            week_start,
+            week_end,
+        )
+    except Exception as error:
+        athlete_feedback = {}
+        st.warning(f"VEKDYN could not load athlete day feedback: {error}")
+
+    matrix, weekly_miles = _weekly_workout_matrix(
+        workouts,
+        week_start,
+        athlete_feedback=athlete_feedback,
+    )
 
     with title_right:
         if weekly_miles is None:
@@ -5375,16 +5374,19 @@ def render_team_workouts():
 
     if not workouts:
         st.info("No sessions are saved for this week yet.")
+    else:
+        with st.expander("Manage saved sessions", expanded=False):
+            for start_index in range(0, len(workouts), 3):
+                row = workouts[start_index:start_index + 3]
+                columns = st.columns(3, gap="medium")
+                for column, workout in zip(columns, row):
+                    with column:
+                        render_team_workout_card(workout, team_athletes)
         return
 
-    with st.expander("Manage saved sessions", expanded=False):
-        for start_index in range(0, len(workouts), 3):
-            row = workouts[start_index:start_index + 3]
-            columns = st.columns(3, gap="medium")
-            for column, workout in zip(columns, row):
-                with column:
-                    render_team_workout_card(workout, team_athletes)
-
+    # No saved sessions to manage. The weekly calendar above can still show
+    # athlete feedback on rest/unassigned days.
+    return
 
 if dashboard_view in {"Dashboard", "Training"}:
     render_team_workouts()
