@@ -497,54 +497,62 @@ if landing_image.exists():
         unsafe_allow_html=True,
     )
 
-# Public Programs / Pricing button in the white Streamlit header.
-# For now it routes to ?pricing=1. The next step is connecting that route
-# directly to the existing pricing page.
+# =========================================================
+# PUBLIC PROGRAMS / PRICING
+# =========================================================
+pricing_mode = st.query_params.get("pricing") == "1"
+
 st.markdown(
     """
     <style>
-        .program-pricing-button {
-            position: fixed;
-            top: 17px;
-            right: 92px;
-            z-index: 999999;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 34px;
-            padding: 0 14px;
-            background: #ffffff;
-            color: #111827 !important;
-            border: 1px solid #d1d5db;
-            border-radius: 9px;
-            font-size: 14px;
-            font-weight: 700;
-            line-height: 1;
-            text-decoration: none !important;
-            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+        [data-testid="stToolbar"] { visibility: hidden !important; }
+        .program-pricing-button, .back-login-button {
+            position: fixed; top: 15px; right: 22px; z-index: 999999;
+            display: inline-flex; align-items: center; justify-content: center;
+            min-height: 36px; padding: 0 16px; background: #ffffff;
+            color: #111827 !important; border: 1px solid #d1d5db;
+            border-radius: 9px; font-size: 14px; font-weight: 750;
+            text-decoration: none !important; box-shadow: 0 1px 4px rgba(0,0,0,.10);
         }
-
-        .program-pricing-button:hover {
-            background: #f3f4f6;
-            border-color: #9ca3af;
-            color: #111827 !important;
+        .pricing-shell {
+            background: rgba(255,255,255,.97); border-radius: 20px;
+            padding: 34px 30px; box-shadow: 0 12px 38px rgba(0,0,0,.22);
         }
-
-        @media (max-width: 720px) {
-            .program-pricing-button {
-                right: 78px;
-                font-size: 12px;
-                padding: 0 10px;
-            }
-        }
+        .pricing-eyebrow { color:#2f9e44; font-size:13px; font-weight:850; letter-spacing:1.8px; text-transform:uppercase; }
+        .pricing-title { color:#111827; font-size:34px; font-weight:850; line-height:1.12; margin:8px 0 10px; }
+        .pricing-copy { color:#6b7280; font-size:16px; line-height:1.6; margin-bottom:24px; }
+        .pricing-card { border:1px solid #e5e7eb; border-radius:14px; padding:22px; margin-top:14px; background:#fff; }
+        .pricing-card h3 { color:#111827; margin:0 0 8px; font-size:20px; }
+        .pricing-card p { color:#4b5563; margin:0; line-height:1.55; }
     </style>
-
-    <a class="program-pricing-button"
-       href="?pricing=1"
-       target="_self">
-        For Programs / Pricing
-    </a>
     """,
+    unsafe_allow_html=True,
+)
+
+if pricing_mode:
+    st.markdown(
+        """
+        <a class="back-login-button" href="?" target="_self">Back to Sign In</a>
+        <div class="pricing-shell">
+            <div class="pricing-eyebrow">VEKDYN FOR PROGRAMS</div>
+            <div class="pricing-title">Build a stronger distance program with better data.</div>
+            <div class="pricing-copy">VEKDYN gives coaches one place to organize training,
+            monitor athlete development, review performance and recovery information,
+            and keep athletes connected to the plan.</div>
+            <div class="pricing-card"><h3>Program access</h3><p>Coach dashboard, athlete accounts,
+            training calendars, workout delivery, threshold tracking, performance tools,
+            recovery data, and supported athlete-data integrations.</p></div>
+            <div class="pricing-card"><h3>Pilot / pricing</h3><p>Program pricing is set up directly
+            with VEKDYN so the package can match the size and needs of the team. Contact
+            VEKDYN to discuss program access and pilot availability.</p></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+st.markdown(
+    """<a class="program-pricing-button" href="?pricing=1" target="_self">Programs / Pricing</a>""",
     unsafe_allow_html=True,
 )
 
