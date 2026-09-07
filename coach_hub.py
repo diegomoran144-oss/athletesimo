@@ -2833,6 +2833,26 @@ st.markdown(
             color: #111827;
         }
         [data-testid="stMetricLabel"] { color: #6b7280; }
+
+        /* Keep recovery/metric text fully visible on narrower dashboard cards. */
+        [data-testid="stMetricValue"],
+        [data-testid="stMetricValue"] > div,
+        [data-testid="stMetricValue"] p {
+            overflow: visible !important;
+            text-overflow: clip !important;
+            white-space: nowrap !important;
+            max-width: none !important;
+        }
+
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricLabel"] > div,
+        [data-testid="stMetricLabel"] p {
+            overflow: visible !important;
+            text-overflow: clip !important;
+            white-space: normal !important;
+            max-width: none !important;
+            line-height: 1.2 !important;
+        }
         div[data-testid="stVerticalBlockBorderWrapper"] {
             background-color: #ffffff;
             border: 1px solid #e5e7eb;
@@ -3938,7 +3958,7 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
     # WEEKLY TRAINING VOLUME + HEART RATE & RECOVERY
     # =========================================================
 
-    volume_card, recovery_card = st.columns([2, 1])
+    volume_card, recovery_card = st.columns([3, 2])
 
     with volume_card:
         with st.container(border=True):
