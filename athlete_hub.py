@@ -1886,9 +1886,9 @@ st.markdown(
     ----------------------------------------------------- */
 
     div[data-testid="stTextArea"] textarea {
-        color: #ffffff !important;
-        -webkit-text-fill-color: #ffffff !important;
-        caret-color: #ffffff !important;
+        color: #111111 !important;
+        -webkit-text-fill-color: #111111 !important;
+        caret-color: #111111 !important;
     }
 
     div[data-testid="stTextArea"] textarea::placeholder {
@@ -3291,12 +3291,7 @@ def shifted_month(base_date, offset):
 
 
 def render_month_training_calendar(month_first, workouts):
-    """
-    Native Streamlit month calendar.
-
-    Avoids a large raw-HTML grid so Streamlit cannot display the calendar
-    markup as literal text.
-    """
+    """Responsive month calendar: 7-column grid on desktop, agenda cards on phones."""
     cal = calendar.Calendar(firstweekday=6)
     weeks = cal.monthdatescalendar(month_first.year, month_first.month)
 
@@ -3305,79 +3300,99 @@ def render_month_training_calendar(month_first, workouts):
         workout_date = workout_day_value(item)
         workouts_by_day.setdefault(workout_date, []).append(item)
 
-    # Sunday-Saturday header.
-    header_cols = st.columns(7)
-    for col, label in zip(
-        header_cols,
-        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
-    ):
-        with col:
-            st.markdown(
-                f"<div style='text-align:center;font-weight:800;"
-                f"font-size:13px;padding:6px 0;'>{label}</div>",
-                unsafe_allow_html=True,
-            )
-
     today = date.today()
+    weekday_labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    for week_index, week in enumerate(weeks):
-        day_cols = st.columns(7)
+    def workout_lines(day_value):
+        lines = []
+        for item in workouts_by_day.get(day_value, []):
+            title = html.escape(str(item.get("title") or "Training"))
+            session = html.escape(str(item.get("session") or "AM").upper())
+            effort = html.escape(str(item.get("effort") or "").strip())
+            lines.append(f'<div class="cal-workout"><b>{session}</b> · {title}</div>')
+            if effort and effort.lower() != title.lower():
+                lines.append(f'<div class="cal-effort">{effort}</div>')
+        return "".join(lines) or '<div class="cal-empty">—</div>'
 
-        for col, day_value in zip(day_cols, week):
-            with col:
-                in_month = day_value.month == month_first.month
-                is_today = day_value == today
-                day_workouts = workouts_by_day.get(day_value, [])
-
-                if not in_month:
-                    st.markdown(
-                        f"<div style='text-align:right;color:#a3a3a3;"
-                        f"font-size:12px;padding:4px 2px;'>"
-                        f"{day_value.day}</div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(
-                        "<div style='height:76px'></div>",
-                        unsafe_allow_html=True,
-                    )
-                    continue
-
-                if is_today:
-                    st.markdown(
-                        f"<div style='text-align:right;font-weight:900;"
-                        f"font-size:14px;'>● {day_value.day}</div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f"<div style='text-align:right;font-weight:800;"
-                        f"font-size:13px;'>{day_value.day}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                if day_workouts:
-                    for item in day_workouts:
-                        title = str(item.get("title") or "Training")
-                        session = str(item.get("session") or "AM").upper()
-                        effort = str(item.get("effort") or "").strip()
-
-                        st.caption(f"{session} · {title}")
-                        if effort and effort.lower() != title.lower():
-                            st.caption(effort)
-                else:
-                    st.caption("—")
-
-                st.markdown(
-                    "<div style='min-height:42px'></div>",
-                    unsafe_allow_html=True,
-                )
-
-        if week_index < len(weeks) - 1:
-            st.markdown(
-                "<hr style='margin:2px 0 8px;border:none;"
-                "border-top:1px solid rgba(128,128,128,.18);'>",
-                unsafe_allow_html=True,
+    desktop_headers = "".join(
+        f'<div class="cal-head">{label}</div>' for label in weekday_labels
+    )
+    desktop_days = []
+    for week in weeks:
+        for day_value in week:
+            in_month = day_value.month == month_first.month
+            classes = "cal-day"
+            if not in_month:
+                classes += " outside"
+            if day_value == today:
+                classes += " today"
+            dot = '<span class="today-dot">●</span>' if day_value == today else ""
+            content = workout_lines(day_value) if in_month else ""
+            desktop_days.append(
+                f'<div class="{classes}">'
+                f'<div class="cal-date">{dot}{day_value.day}</div>{content}</div>'
             )
+
+    mobile_days = []
+    for day_number in range(1, calendar.monthrange(month_first.year, month_first.month)[1] + 1):
+        day_value = date(month_first.year, month_first.month, day_number)
+        day_workouts = workouts_by_day.get(day_value, [])
+        if not day_workouts and day_value != today:
+            continue
+        today_class = " mobile-today" if day_value == today else ""
+        mobile_days.append(
+            f'<div class="mobile-day{today_class}">'
+            f'<div class="mobile-date"><b>{day_value.strftime("%a")}</b>'
+            f'<span>{day_value.strftime("%b %d")}</span></div>'
+            f'<div class="mobile-workouts">{workout_lines(day_value)}</div></div>'
+        )
+
+    if not mobile_days:
+        mobile_days.append('<div class="mobile-no-workouts">No workouts scheduled this month.</div>')
+
+    calendar_html = f"""
+    <style>
+      .training-calendar-desktop {{
+        display:grid; grid-template-columns:repeat(7,minmax(0,1fr));
+        border:1px solid #dfe5df; border-radius:14px; overflow:hidden;
+        background:#fff;
+      }}
+      .cal-head {{padding:10px 5px;text-align:center;font-weight:800;font-size:13px;
+        border-bottom:1px solid #dfe5df;background:#f8faf8;color:#111827;}}
+      .cal-day {{min-height:112px;padding:8px;border-right:1px solid #e5e7eb;
+        border-bottom:1px solid #e5e7eb;min-width:0;}}
+      .cal-day:nth-child(7n) {{border-right:none;}}
+      .cal-day.outside {{background:#fafafa;color:#a3a3a3;}}
+      .cal-day.today {{background:#f0faf2;}}
+      .cal-date {{text-align:right;font-weight:800;font-size:13px;color:#111827;margin-bottom:7px;}}
+      .outside .cal-date {{color:#a3a3a3;}}
+      .today-dot {{color:#2f9e44;margin-right:4px;}}
+      .cal-workout {{font-size:11px;line-height:1.35;color:#374151;overflow-wrap:anywhere;margin-top:4px;}}
+      .cal-effort {{font-size:10px;line-height:1.3;color:#6b7280;overflow-wrap:anywhere;margin-top:2px;}}
+      .cal-empty {{font-size:12px;color:#9ca3af;}}
+      .training-calendar-mobile {{display:none;}}
+
+      @media (max-width:720px) {{
+        .training-calendar-desktop {{display:none;}}
+        .training-calendar-mobile {{display:block;}}
+        .mobile-day {{display:grid;grid-template-columns:82px minmax(0,1fr);gap:12px;
+          padding:14px 4px;border-bottom:1px solid #e5e7eb;}}
+        .mobile-day.mobile-today {{background:#f0faf2;border-radius:12px;padding-left:10px;padding-right:10px;}}
+        .mobile-date {{display:flex;flex-direction:column;font-size:14px;color:#111827;}}
+        .mobile-date span {{font-size:12px;color:#6b7280;margin-top:2px;}}
+        .mobile-workouts .cal-workout {{font-size:14px;line-height:1.4;margin-top:0;margin-bottom:3px;}}
+        .mobile-workouts .cal-effort {{font-size:12px;margin-bottom:4px;}}
+        .mobile-no-workouts {{padding:18px 0;color:#6b7280;text-align:center;}}
+      }}
+    </style>
+    <div class="training-calendar-desktop">
+      {desktop_headers}{''.join(desktop_days)}
+    </div>
+    <div class="training-calendar-mobile">
+      {''.join(mobile_days)}
+    </div>
+    """
+    st.markdown(calendar_html, unsafe_allow_html=True)
 
 
 with tab_training:
