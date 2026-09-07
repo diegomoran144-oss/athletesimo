@@ -499,62 +499,349 @@ if landing_image.exists():
 
 # =========================================================
 # PUBLIC PROGRAMS / PRICING
+# Uses native Streamlit buttons so navigation is reliable in Community Cloud.
 # =========================================================
+
 pricing_mode = st.query_params.get("pricing") == "1"
 
 st.markdown(
     """
     <style>
-        [data-testid="stToolbar"] { visibility: hidden !important; }
-        .program-pricing-button, .back-login-button {
-            position: fixed; top: 15px; right: 22px; z-index: 999999;
-            display: inline-flex; align-items: center; justify-content: center;
-            min-height: 36px; padding: 0 16px; background: #ffffff;
-            color: #111827 !important; border: 1px solid #d1d5db;
-            border-radius: 9px; font-size: 14px; font-weight: 750;
-            text-decoration: none !important; box-shadow: 0 1px 4px rgba(0,0,0,.10);
+        /* Hide Streamlit's public toolbar so VEKDYN owns the top-right action area. */
+        [data-testid="stToolbar"] {
+            display: none !important;
         }
-        .pricing-shell {
-            background: rgba(255,255,255,.97); border-radius: 20px;
-            padding: 34px 30px; box-shadow: 0 12px 38px rgba(0,0,0,.22);
+
+        .pricing-page {
+            background: rgba(255,255,255,.97);
+            border: 1px solid rgba(229,231,235,.95);
+            border-radius: 20px;
+            padding: 34px 30px 30px 30px;
+            box-shadow: 0 12px 38px rgba(0,0,0,.22);
+            color: #111827;
         }
-        .pricing-eyebrow { color:#2f9e44; font-size:13px; font-weight:850; letter-spacing:1.8px; text-transform:uppercase; }
-        .pricing-title { color:#111827; font-size:34px; font-weight:850; line-height:1.12; margin:8px 0 10px; }
-        .pricing-copy { color:#6b7280; font-size:16px; line-height:1.6; margin-bottom:24px; }
-        .pricing-card { border:1px solid #e5e7eb; border-radius:14px; padding:22px; margin-top:14px; background:#fff; }
-        .pricing-card h3 { color:#111827; margin:0 0 8px; font-size:20px; }
-        .pricing-card p { color:#4b5563; margin:0; line-height:1.55; }
+
+        .pricing-brand {
+            text-align: center;
+            font-size: 38px;
+            font-weight: 900;
+            letter-spacing: 1px;
+            margin-bottom: 2px;
+        }
+
+        .pricing-brand span {
+            color: #2f9e44;
+        }
+
+        .pricing-kicker {
+            text-align: center;
+            color: #6b7280;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 2px;
+            margin-bottom: 24px;
+        }
+
+        .pricing-heading {
+            text-align: center;
+            font-size: 30px;
+            font-weight: 850;
+            line-height: 1.2;
+            margin-bottom: 8px;
+        }
+
+        .pricing-subheading {
+            text-align: center;
+            color: #6b7280;
+            font-size: 15px;
+            line-height: 1.6;
+            margin: 0 auto 26px auto;
+            max-width: 680px;
+        }
+
+        .plan-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin: 14px 0 10px 0;
+        }
+
+        .plan-card {
+            border: 1px solid #dfe3e8;
+            border-radius: 16px;
+            background: #ffffff;
+            padding: 24px 22px;
+            min-height: 210px;
+        }
+
+        .plan-card.featured {
+            border: 2px solid #2f9e44;
+            box-shadow: 0 8px 24px rgba(47,158,68,.10);
+        }
+
+        .plan-label {
+            color: #6b7280;
+            font-size: 12px;
+            font-weight: 850;
+            letter-spacing: 1.3px;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .plan-price {
+            font-size: 35px;
+            font-weight: 900;
+            color: #111827;
+            line-height: 1;
+            margin-bottom: 8px;
+        }
+
+        .plan-price small {
+            font-size: 15px;
+            font-weight: 700;
+            color: #6b7280;
+        }
+
+        .plan-copy {
+            color: #4b5563;
+            font-size: 14px;
+            line-height: 1.5;
+            margin-top: 12px;
+        }
+
+        .save-pill {
+            display: inline-block;
+            background: #eaf7ed;
+            color: #237a35;
+            border-radius: 999px;
+            padding: 5px 9px;
+            font-size: 12px;
+            font-weight: 800;
+            margin-top: 8px;
+        }
+
+        .included-box {
+            margin-top: 20px;
+            border-top: 1px solid #e5e7eb;
+            padding-top: 20px;
+        }
+
+        .included-title {
+            font-size: 18px;
+            font-weight: 850;
+            margin-bottom: 10px;
+        }
+
+        .included-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px 24px;
+            color: #374151;
+            font-size: 14px;
+            line-height: 1.55;
+        }
+
+        .purchase-box {
+            margin-top: 22px;
+            background: #f7f9f7;
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 18px 20px;
+        }
+
+        .purchase-title {
+            font-size: 17px;
+            font-weight: 850;
+            margin-bottom: 10px;
+        }
+
+        .purchase-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 7px 0;
+            border-bottom: 1px solid #e5e7eb;
+            font-size: 14px;
+        }
+
+        .purchase-row:last-child {
+            border-bottom: 0;
+        }
+
+        .pricing-cta {
+            text-align: center;
+            margin: 28px 0 8px 0;
+        }
+
+        .pricing-cta-title {
+            font-size: 22px;
+            font-weight: 900;
+            margin-bottom: 6px;
+        }
+
+        .pricing-cta-copy {
+            color: #6b7280;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+
+        @media (max-width: 720px) {
+            .plan-grid,
+            .included-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .pricing-page {
+                padding: 26px 20px;
+            }
+
+            .pricing-heading {
+                font-size: 26px;
+            }
+        }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 if pricing_mode:
+    back_left, back_right = st.columns([3.2, 1])
+    with back_right:
+        if st.button(
+            "← Back to Sign In",
+            key="back_to_login",
+            use_container_width=True,
+        ):
+            st.query_params.clear()
+            st.rerun()
+
     st.markdown(
         """
-        <a class="back-login-button" href="?" target="_self">Back to Sign In</a>
-        <div class="pricing-shell">
-            <div class="pricing-eyebrow">VEKDYN FOR PROGRAMS</div>
-            <div class="pricing-title">Build a stronger distance program with better data.</div>
-            <div class="pricing-copy">VEKDYN gives coaches one place to organize training,
-            monitor athlete development, review performance and recovery information,
-            and keep athletes connected to the plan.</div>
-            <div class="pricing-card"><h3>Program access</h3><p>Coach dashboard, athlete accounts,
-            training calendars, workout delivery, threshold tracking, performance tools,
-            recovery data, and supported athlete-data integrations.</p></div>
-            <div class="pricing-card"><h3>Pilot / pricing</h3><p>Program pricing is set up directly
-            with VEKDYN so the package can match the size and needs of the team. Contact
-            VEKDYN to discuss program access and pilot availability.</p></div>
+        <div class="pricing-page">
+            <div class="pricing-brand">VEK<span>DYN</span></div>
+            <div class="pricing-kicker">DATA DRIVES DEVELOPMENT</div>
+
+            <div class="pricing-heading">Simple team pricing.</div>
+            <div class="pricing-subheading">
+                One VEKDYN team license gives a program access to the coach platform
+                and athlete experience. Choose annual or monthly billing.
+            </div>
+
+            <div class="plan-grid">
+                <div class="plan-card featured">
+                    <div class="plan-label">Annual Team License</div>
+                    <div class="plan-price">$500 <small>/ year</small></div>
+                    <div class="save-pill">Save $100 annually</div>
+                    <div class="plan-copy">
+                        Best value for programs using VEKDYN throughout the full season
+                        and academic year.
+                    </div>
+                </div>
+
+                <div class="plan-card">
+                    <div class="plan-label">Monthly Team License</div>
+                    <div class="plan-price">$50 <small>/ month</small></div>
+                    <div class="plan-copy">
+                        Flexible month-to-month access for programs that want to start
+                        with a shorter commitment.
+                    </div>
+                </div>
+            </div>
+
+            <div class="included-box">
+                <div class="included-title">Included with either plan</div>
+                <div class="included-grid">
+                    <div>✓ Team dashboard & analytics</div>
+                    <div>✓ Athlete performance profiles</div>
+                    <div>✓ Training calendar & workout planning</div>
+                    <div>✓ Threshold & training analytics</div>
+                    <div>✓ Race predictions</div>
+                    <div>✓ Recovery tracking</div>
+                    <div>✓ Athlete data integrations</div>
+                    <div>✓ Secure team workspace</div>
+                </div>
+            </div>
+
+            <div class="purchase-box">
+                <div class="purchase-title">Purchasing Information</div>
+                <div class="purchase-row"><span>Vendor / Company</span><strong>VEKDYN</strong></div>
+                <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div>
+                <div class="purchase-row"><span>License</span><strong>Annual or Monthly Team License</strong></div>
+                <div class="purchase-row"><span>Published Pricing</span><strong>$500/year or $50/month</strong></div>
+                <div class="purchase-row"><span>Billing</span><strong>Annual invoice or monthly billing</strong></div>
+                <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div>
+            </div>
+
+            <div class="pricing-cta">
+                <div class="pricing-cta-title">Ready to bring VEKDYN to your program?</div>
+                <div class="pricing-cta-copy">
+                    Request program access or prepare the information needed for an invoice.
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+    st.markdown("### Request an Invoice")
+    st.caption(
+        "Coaches or university purchasing staff can prepare the information needed "
+        "for a VEKDYN invoice. No payment or banking information is collected here."
+    )
+
+    with st.form("invoice_request_form"):
+        invoice_school = st.text_input("School / Program")
+        invoice_contact = st.text_input("Coach or Purchasing Contact")
+        invoice_email = st.text_input("Contact Email")
+        invoice_plan = st.selectbox(
+            "License",
+            [
+                "Annual Team License — $500/year",
+                "Monthly Team License — $50/month",
+            ],
+        )
+        invoice_po = st.text_input("PO / Requisition Number (optional)")
+        invoice_notes = st.text_area("Purchasing Notes (optional)")
+        invoice_submit = st.form_submit_button(
+            "Prepare Invoice Request",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if invoice_submit:
+        if (
+            not invoice_school.strip()
+            or not invoice_contact.strip()
+            or not invoice_email.strip()
+        ):
+            st.error("Please enter the school/program, contact name, and contact email.")
+        else:
+            st.success("Invoice request prepared.")
+            st.markdown(
+                f"""**Vendor:** VEKDYN  
+**Product:** VEKDYN Team Platform  
+**School / Program:** {invoice_school}  
+**Contact:** {invoice_contact}  
+**Email:** {invoice_email}  
+**License:** {invoice_plan}  
+**PO / Requisition:** {invoice_po or "Not provided"}  
+**Notes:** {invoice_notes or "None"}"""
+            )
+
     st.stop()
 
-st.markdown(
-    """<a class="program-pricing-button" href="?pricing=1" target="_self">Programs / Pricing</a>""",
-    unsafe_allow_html=True,
-)
+# Native button on the login screen. This is intentionally not an HTML link:
+# Streamlit Cloud will render it reliably after every deployment.
+nav_spacer, nav_action = st.columns([3.1, 1.35])
+with nav_action:
+    if st.button(
+        "Programs / Pricing",
+        key="open_program_pricing",
+        use_container_width=True,
+    ):
+        st.query_params["pricing"] = "1"
+        st.rerun()
+
 
 st.markdown(
     '<div class="vekdyn-brand">VEK<span>DYN</span></div>',
