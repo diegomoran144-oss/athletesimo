@@ -2458,6 +2458,30 @@ def render_daily_feedback(feedback_date):
         return
 
     st.markdown("### How did you feel?")
+
+    # Keep the athlete's typed daily-feedback text black.
+    # This is intentionally injected here, after team-theme CSS, so later
+    # theme rules cannot turn this field's text white.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stTextArea"] textarea,
+        div[data-testid="stTextArea"] textarea:focus,
+        div[data-testid="stTextArea"] textarea:active {
+            color: #111111 !important;
+            -webkit-text-fill-color: #111111 !important;
+            caret-color: #111111 !important;
+        }
+        div[data-testid="stTextArea"] textarea::placeholder {
+            color: #9ca3af !important;
+            -webkit-text-fill-color: #9ca3af !important;
+            opacity: 1 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.caption(
         "Leave a short note for your coach about this day — for example "
         "how the workout felt, soreness, fatigue, or anything unusual."
