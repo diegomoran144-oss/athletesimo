@@ -859,19 +859,19 @@ if pricing_mode:
     with purchase_annual:
         st.link_button(
             "Purchase Annual — $500/year",
-            "https://buy.stripe.com/test_7sYbIT1Vw8pL3TB1MdeME00",
+            "https://buy.stripe.com/cNi3cn45g8da6Fp29PefC01",
             use_container_width=True,
             type="primary",
         )
     with purchase_monthly:
         st.link_button(
             "Start Monthly — $50/month",
-            "https://buy.stripe.com/test_3cI4gr6bMdK589R0I9eME01",
+            "https://buy.stripe.com/7sY3cn6dodxue7RdSxefC00",
             use_container_width=True,
         )
 
     st.caption(
-        "Secure checkout is handled by Stripe. These links are currently in Stripe sandbox/test mode."
+        "Secure checkout is handled by Stripe."
     )
 
     st.markdown("### Request an Invoice")
