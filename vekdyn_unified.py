@@ -3,6 +3,9 @@ import hashlib
 import base64
 import json
 import time
+import urllib.parse
+import urllib.request
+import urllib.error
 import bcrypt
 import psycopg2
 import streamlit as st
@@ -131,6 +134,110 @@ def handle_global_logout():
 
 def get_database_connection():
     return psycopg2.connect(st.secrets["DATABASE_URL"])
+
+
+# =========================================================
+# STRIPE LIVE INVOICING
+# Uses Stripe REST API directly so no extra Python package is required.
+# Add STRIPE_SECRET_KEY = "sk_live_..." to Streamlit secrets.
+# =========================================================
+
+def stripe_request(method, endpoint, data=None):
+    try:
+        secret_key = str(st.secrets["STRIPE_SECRET_KEY"]).strip()
+    except (KeyError, FileNotFoundError):
+        raise RuntimeError(
+            "STRIPE_SECRET_KEY is missing from Streamlit secrets. "
+            "Add your Stripe live secret key before creating invoices."
+        )
+
+    if not secret_key.startswith("sk_live_"):
+        raise RuntimeError(
+            "STRIPE_SECRET_KEY is not a Stripe live secret key. "
+            "Use the sk_live_... key for live invoices."
+        )
+
+    url = f"https://api.stripe.com/v1/{endpoint.lstrip('/')}"
+    encoded = urllib.parse.urlencode(data or {}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=encoded if method.upper() != "GET" else None,
+        method=method.upper(),
+        headers={
+            "Authorization": f"Bearer {secret_key}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        try:
+            message = json.loads(body).get("error", {}).get("message", body)
+        except json.JSONDecodeError:
+            message = body
+        raise RuntimeError(f"Stripe error: {message}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Could not reach Stripe: {error.reason}") from error
+
+
+def create_live_stripe_invoice(school, contact, email, plan, po_number="", notes=""):
+    annual = plan.startswith("Annual")
+    amount_cents = 50000 if annual else 5000
+    description = (
+        "VEKDYN Team Platform — Annual Team License"
+        if annual
+        else "VEKDYN Team Platform — Monthly Team License"
+    )
+
+    customer = stripe_request(
+        "POST",
+        "customers",
+        {
+            "name": school.strip(),
+            "email": email.strip(),
+            "description": f"VEKDYN purchasing contact: {contact.strip()}",
+            "metadata[school_program]": school.strip(),
+            "metadata[purchasing_contact]": contact.strip(),
+        },
+    )
+
+    customer_id = customer["id"]
+
+    invoice_data = {
+        "customer": customer_id,
+        "collection_method": "send_invoice",
+        "days_until_due": 30,
+        "description": description,
+        "metadata[school_program]": school.strip(),
+        "metadata[purchasing_contact]": contact.strip(),
+        "metadata[license]": plan,
+    }
+    if po_number.strip():
+        invoice_data["custom_fields[0][name]"] = "PO / Requisition"
+        invoice_data["custom_fields[0][value]"] = po_number.strip()[:140]
+    if notes.strip():
+        invoice_data["footer"] = notes.strip()[:500]
+
+    invoice = stripe_request("POST", "invoices", invoice_data)
+
+    stripe_request(
+        "POST",
+        "invoiceitems",
+        {
+            "customer": customer_id,
+            "invoice": invoice["id"],
+            "amount": amount_cents,
+            "currency": "usd",
+            "description": description,
+        },
+    )
+
+    finalized = stripe_request("POST", f"invoices/{invoice['id']}/finalize")
+    sent = stripe_request("POST", f"invoices/{finalized['id']}/send")
+    return sent
 
 
 # =========================================================
@@ -799,18 +906,42 @@ if pricing_mode:
             or not invoice_email.strip()
         ):
             st.error("Please enter the school/program, contact name, and contact email.")
+        elif "@" not in invoice_email or "." not in invoice_email.split("@")[-1]:
+            st.error("Please enter a valid contact email.")
         else:
-            st.success("Invoice request prepared.")
-            st.markdown(
-                f"""**Vendor:** VEKDYN  
+            try:
+                with st.spinner("Creating and sending the live Stripe invoice..."):
+                    stripe_invoice = create_live_stripe_invoice(
+                        invoice_school,
+                        invoice_contact,
+                        invoice_email,
+                        invoice_plan,
+                        invoice_po,
+                        invoice_notes,
+                    )
+
+                st.success(f"Live Stripe invoice sent to {invoice_email.strip()}.")
+                st.markdown(
+                    f"""**Vendor:** VEKDYN  
 **Product:** VEKDYN Team Platform  
 **School / Program:** {invoice_school}  
 **Contact:** {invoice_contact}  
 **Email:** {invoice_email}  
 **License:** {invoice_plan}  
 **PO / Requisition:** {invoice_po or "Not provided"}  
-**Notes:** {invoice_notes or "None"}"""
-            )
+**Stripe Invoice:** {stripe_invoice.get("number") or stripe_invoice.get("id")}  """
+                )
+
+                hosted_url = stripe_invoice.get("hosted_invoice_url")
+                if hosted_url:
+                    st.link_button(
+                        "Open Stripe Invoice",
+                        hosted_url,
+                        use_container_width=True,
+                        type="primary",
+                    )
+            except RuntimeError as error:
+                st.error(str(error))
 
     st.stop()
 
