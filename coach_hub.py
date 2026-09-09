@@ -5099,8 +5099,6 @@ def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
         "PM Session": [join_for(day, "PM", "title") for day in dates],
         "AM Description": [join_for(day, "AM", "description") for day in dates],
         "PM Description": [join_for(day, "PM", "description") for day in dates],
-        "AM Effort": [join_for(day, "AM", "effort") for day in dates],
-        "PM Effort": [join_for(day, "PM", "effort") for day in dates],
     }
 
     daily_miles = []
@@ -5390,7 +5388,17 @@ def render_team_workouts():
     if active_team == "dark_horse_endurance":
         _render_dark_horse_workout_calendar(matrix)
     else:
-        st.dataframe(matrix, use_container_width=True, height=500, row_height=62)
+        calendar_columns = {
+            column: st.column_config.TextColumn(width="large")
+            for column in matrix.columns
+        }
+        st.dataframe(
+            matrix,
+            use_container_width=True,
+            height=650,
+            row_height=90,
+            column_config=calendar_columns,
+        )
 
     if not workouts:
         st.info("No sessions are saved for this week yet.")
