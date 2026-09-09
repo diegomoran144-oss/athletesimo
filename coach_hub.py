@@ -5389,13 +5389,13 @@ def render_team_workouts():
         _render_dark_horse_workout_calendar(matrix)
     else:
         calendar_columns = {
-            column: st.column_config.TextColumn(width="large")
+            column: st.column_config.TextColumn(width="small")
             for column in matrix.columns
         }
         st.dataframe(
             matrix,
             use_container_width=True,
-            height=650,
+            height=635,
             row_height=90,
             column_config=calendar_columns,
         )
@@ -5440,11 +5440,15 @@ def initialize_threshold_database():
                     medium_pace TEXT,
                     long_lactate REAL,
                     long_pace TEXT,
+                    short_400_lactate REAL,
+                    short_400_time TEXT,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE(team_id, athlete_key)
                 )
                 """
             )
+            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_400_lactate REAL")
+            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_400_time TEXT")
         database.commit()
 
 
@@ -5457,6 +5461,8 @@ def save_threshold_profile(
         medium_pace,
         long_lactate,
         long_pace,
+        short_400_lactate,
+        short_400_time,
 ):
     """Save or update one athlete's threshold profile in Neon."""
     initialize_threshold_database()
@@ -5469,9 +5475,10 @@ def save_threshold_profile(
                     team_id, athlete_key,
                     short_lactate, short_pace,
                     medium_lactate, medium_pace,
-                    long_lactate, long_pace
+                    long_lactate, long_pace,
+                    short_400_lactate, short_400_time
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (team_id, athlete_key)
                 DO UPDATE SET
                     short_lactate = EXCLUDED.short_lactate,
@@ -5480,6 +5487,8 @@ def save_threshold_profile(
                     medium_pace = EXCLUDED.medium_pace,
                     long_lactate = EXCLUDED.long_lactate,
                     long_pace = EXCLUDED.long_pace,
+                    short_400_lactate = EXCLUDED.short_400_lactate,
+                    short_400_time = EXCLUDED.short_400_time,
                     updated_at = NOW()
                 """,
                 (
@@ -5487,6 +5496,7 @@ def save_threshold_profile(
                     short_lactate, short_pace,
                     medium_lactate, medium_pace,
                     long_lactate, long_pace,
+                    short_400_lactate, short_400_time,
                 ),
             )
         database.commit()
@@ -5506,7 +5516,8 @@ def load_threshold_profile(team_id, athlete_key):
                 SELECT
                     short_lactate, short_pace,
                     medium_lactate, medium_pace,
-                    long_lactate, long_pace
+                    long_lactate, long_pace,
+                    short_400_lactate, short_400_time
                 FROM athlete_threshold_profiles
                 WHERE team_id = %s AND athlete_key = %s
                 LIMIT 1
@@ -5522,6 +5533,7 @@ def load_threshold_profile(team_id, athlete_key):
         "short_reps": {"lactate": row[0], "pace": row[1] or "--"},
         "medium_reps": {"lactate": row[2], "pace": row[3] or "--"},
         "long_reps": {"lactate": row[4], "pace": row[5] or "--"},
+        "short_400": {"lactate": row[6], "time": row[7] or "--"},
     }
 
 
@@ -5545,6 +5557,7 @@ if dashboard_view in {"Dashboard", "Performance"}:
     short_data = threshold.get("short_reps", {}) or {}
     medium_data = threshold.get("medium_reps", {}) or {}
     long_data = threshold.get("long_reps", {}) or {}
+    short_400_data = threshold.get("short_400", {}) or {}
 
 
     def threshold_display_lactate(rep_data):
@@ -5567,6 +5580,11 @@ if dashboard_view in {"Dashboard", "Performance"}:
 
     def threshold_editor_pace(rep_data):
         value = rep_data.get("pace", "")
+        return "" if value in (None, "--") else str(value)
+
+
+    def threshold_editor_400_time(rep_data):
+        value = rep_data.get("time", "")
         return "" if value in (None, "--") else str(value)
 
 
@@ -5628,6 +5646,23 @@ if dashboard_view in {"Dashboard", "Performance"}:
                     placeholder="Example: 5:00/mi",
                     key=f"short_pace_{active_team}_{athlete_key}",
                 )
+                st.markdown("**400 m Check**")
+                short_400_lactate = st.number_input(
+                    "400 Lactate (mmol)",
+                    min_value=0.0,
+                    max_value=20.0,
+                    value=threshold_editor_lactate(short_400_data),
+                    step=0.1,
+                    format="%.1f",
+                    key=f"short_400_lactate_{active_team}_{athlete_key}",
+                )
+                short_400_time = st.text_input(
+                    "400 Time",
+                    value=threshold_editor_400_time(short_400_data),
+                    placeholder="Example: 69.5",
+                    key=f"short_400_time_{active_team}_{athlete_key}",
+                    help="Enter the athlete's 400 m rep time in seconds, e.g. 69.5.",
+                )
 
             with medium_col:
                 st.markdown("**Medium Reps (5–10 min)**")
@@ -5682,6 +5717,8 @@ if dashboard_view in {"Dashboard", "Performance"}:
                     medium_pace.strip(),
                     long_lactate,
                     long_pace.strip(),
+                    short_400_lactate,
+                    short_400_time.strip(),
                 )
                 st.success("Threshold profile saved.")
                 st.rerun()
