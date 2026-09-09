@@ -249,13 +249,13 @@ def handle_strava_callback():
 # This means the athlete owns the authorization, while the coach can see the
 # connected status and recovery data without ever receiving COROS credentials.
 
-COROS_MCP_URL = "https://mcpus.coros.com/mcp"
+# Universal COROS MCP endpoint; COROS routes the athlete to the correct region.
+COROS_MCP_URL = "https://mcp.coros.com/mcp"
 COROS_TIMEZONE = "America/Chicago"
 COROS_PROTOCOL_VERSION = "2025-06-18"
-COROS_REDIRECT_URI = st.secrets.get(
-    "ATHLETE_COROS_REDIRECT_URI",
-    st.secrets.get("ATHLETE_STRAVA_REDIRECT_URI", "http://localhost:8501"),
-)
+
+# COROS must use its own deployed callback. Never fall back to Strava/localhost.
+COROS_REDIRECT_URI = str(st.secrets.get("ATHLETE_COROS_REDIRECT_URI", "")).strip()
 
 
 def initialize_coros_database():
@@ -434,9 +434,16 @@ def _load_coros_oauth_client():
     initialize_coros_database()
     redirect_uri = str(COROS_REDIRECT_URI).strip()
 
-    if not redirect_uri.startswith(("https://", "http://localhost")):
+    if not redirect_uri:
         raise RuntimeError(
-            "ATHLETE_COROS_REDIRECT_URI must be an HTTPS URL (or localhost for testing)."
+            "ATHLETE_COROS_REDIRECT_URI is missing from Streamlit Secrets. "
+            "Set it to the public VEKDYN Athlete app URL."
+        )
+
+    if not redirect_uri.startswith("https://"):
+        raise RuntimeError(
+            "ATHLETE_COROS_REDIRECT_URI must be the public HTTPS URL of the "
+            "VEKDYN Athlete app; localhost is not valid for production."
         )
 
     with get_database_connection() as database:
