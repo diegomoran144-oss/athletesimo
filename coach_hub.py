@@ -2894,20 +2894,6 @@ st.markdown(
             line-height: 1.45;
         }
 
-        /* VEKDYN 2026 coach-workspace skin — compact dark/purple work hub */
-        .stApp { background: #07101f !important; color: #f7f8fc !important; }
-        [data-testid="stAppViewContainer"], [data-testid="stMain"] { background: #07101f !important; }
-        [data-testid="stSidebar"] { background: #081120 !important; border-right: 1px solid #26324a !important; }
-        [data-testid="stSidebar"] * { color: #eef2ff; }
-        div[data-testid="stVerticalBlockBorderWrapper"] { background: #0b1527 !important; border: 1px solid #25324a !important; border-radius: 12px !important; box-shadow: none !important; }
-        h1, h2, h3 { color: #f8f9ff !important; }
-        p, label, .stCaptionContainer { color: #c6ccdc; }
-        [data-testid="stMetricValue"] { color: #ffffff !important; }
-        [data-testid="stMetricLabel"] { color: #aeb7cb !important; }
-        div.stButton > button[kind="primary"], div.stButton > button[data-testid="baseButton-primary"] { background: linear-gradient(135deg,#6d28d9,#8b2cf5) !important; border-color: #9a4dff !important; color: white !important; }
-        div.stButton > button { border-radius: 9px !important; }
-        .team-workout-title, .athlete-name, .pb-time, .notes-title { color: #ffffff !important; }
-        .team-workout-subtitle, .pb-event, .notes-subtitle { color: #aeb7cb !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -3250,283 +3236,96 @@ if not athletes:
     st.stop()
 
 # =========================================================
-# SIDEBAR AND ATHLETE SELECTION
+# COMPACT COACH WORKSPACE HEADER + ATHLETE SELECTION
 # =========================================================
+
+# The refreshed Coach Hub uses one compact workspace instead of the old
+# left navigation rail. Team branding is still controlled by the existing
+# team-specific CSS; this block changes layout only.
+st.markdown(
+    """
+    <style>
+        [data-testid="stSidebar"] { display: none !important; }
+        .block-container { max-width: 1500px; padding-top: 1.15rem; padding-bottom: 5.5rem; }
+        .coach-kicker { font-size: 13px; opacity: .72; margin-bottom: 2px; }
+        .coach-greeting { font-size: 26px; font-weight: 760; line-height: 1.1; margin-bottom: 2px; }
+        .coach-team { font-size: 13px; opacity: .72; }
+        .compact-section-title { font-size: 20px; font-weight: 760; margin: 0 0 2px 0; }
+        .compact-section-subtitle { font-size: 12px; opacity: .72; margin-bottom: 8px; }
+        .bottom-nav-spacer { height: 8px; }
+        div[data-testid="stHorizontalBlock"]:has(.bottom-nav-anchor) {
+            position: sticky; bottom: 0; z-index: 999; padding: 8px 0 6px 0;
+            backdrop-filter: blur(10px);
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 if "dashboard_view" not in st.session_state:
     st.session_state["dashboard_view"] = "Dashboard"
 
-with st.sidebar:
-    # -----------------------------------------------------
-    # VEKDYN / TEAM IDENTITY
-    # -----------------------------------------------------
+# Normalize old view names from previous Coach Hub builds.
+_view_aliases = {
+    "Notes": "Dashboard",
+    "Recovery": "Dashboard",
+    "Performance": "Profile",
+}
+st.session_state["dashboard_view"] = _view_aliases.get(
+    st.session_state.get("dashboard_view", "Dashboard"),
+    st.session_state.get("dashboard_view", "Dashboard"),
+)
+dashboard_view = st.session_state.get("dashboard_view", "Dashboard")
 
+# Keep the selected athlete stable across reruns/OAuth returns.
+athlete_options = list(athletes.keys())
+saved_athlete = st.session_state.get("selected_athlete_key")
+if saved_athlete not in athlete_options:
+    saved_athlete = athlete_options[0]
+
+current_hour = datetime.now(ZoneInfo("America/Chicago")).hour
+if current_hour < 12:
+    greeting = "Good morning"
+elif current_hour < 17:
+    greeting = "Good afternoon"
+else:
+    greeting = "Good evening"
+
+header_left, header_mid, header_right = st.columns([4.5, 1.5, 2.2], vertical_alignment="center")
+with header_left:
     st.markdown(
-        "## VEK<span style='color:#2f9e44'>DYN</span>",
+        f'<div class="coach-greeting">{greeting}, Coach</div>'
+        f'<div class="coach-team">{html.escape(active_team_config["name"])}</div>',
         unsafe_allow_html=True,
     )
-
-    # Keep the coach and current school immediately under
-    # the VEKDYN identity so the active workspace is obvious.
-    st.caption("Coach")
-    st.caption(active_team_config["name"])
-
-    if st.button(
-            "▣ Dashboard",
-            key="nav_dashboard",
-            use_container_width=True,
-            type="primary" if st.session_state["dashboard_view"] == "Dashboard" else "secondary",
-    ):
-        st.session_state["dashboard_view"] = "Dashboard"
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # ATHLETE SELECTION
-    # -----------------------------------------------------
-
-    st.markdown("### Choose Athlete")
-
+with header_mid:
+    st.caption(datetime.now(ZoneInfo("America/Chicago")).strftime("%a %b %-d, %Y"))
+with header_right:
     athlete_key = st.selectbox(
-        "",
-        options=list(athletes.keys()),
+        "Viewing athlete",
+        options=athlete_options,
+        index=athlete_options.index(saved_athlete),
         format_func=lambda key: athletes[key]["profile"]["name"],
-        key="sidebar_athlete_selector",
+        key="compact_athlete_selector",
+        label_visibility="collapsed",
     )
+    st.session_state["selected_athlete_key"] = athlete_key
 
-    # We can read the selected athlete immediately so the
-    # Strava controls sit directly below the selector.
-    selected_sidebar_athlete = athletes[athlete_key]
-    selected_sidebar_profile = selected_sidebar_athlete["profile"]
-    athlete_name_for_button = selected_sidebar_profile.get("name", "Athlete")
-    athlete_first_name = athlete_name_for_button.split()[0]
+# Connection-status keys are preserved even though activity polling is disabled.
+selected_sidebar_athlete = athletes[athlete_key]
+selected_sidebar_profile = selected_sidebar_athlete["profile"]
+athlete_name_for_button = selected_sidebar_profile.get("name", "Athlete")
+athlete_first_name = athlete_name_for_button.split()[0]
+weekly_session_key = f"{athlete_key}_strava_weekly"
+heart_session_key = f"{athlete_key}_strava_heart_rate"
+message_session_key = f"strava_message_{athlete_key}"
+error_session_key = f"strava_error_{athlete_key}"
+coros_message_key = f"coros_message_{athlete_key}"
+coros_error_key = f"coros_error_{athlete_key}"
 
-    weekly_session_key = f"{athlete_key}_strava_weekly"
-    heart_session_key = f"{athlete_key}_strava_heart_rate"
-    message_session_key = f"strava_message_{athlete_key}"
-    error_session_key = f"strava_error_{athlete_key}"
-
-    # -----------------------------------------------------
-    # STRAVA — DIRECTLY UNDER ATHLETE SELECTOR
-    # -----------------------------------------------------
-
-    if strava_is_connected(athlete_key):
-        # Keep the athlete authorized, but do not poll Strava from the Coach Hub.
-        # Connections/tokens stay in Neon while activity ingestion is moved to webhooks.
-        connection = athlete_strava_connection(athlete_key)
-        connected_strava_name = connection.get("strava_name")
-
-        if connected_strava_name:
-            st.caption(f"Connected Strava account: {connected_strava_name}")
-        else:
-            st.caption("Strava connected")
-
-        st.caption("Activity polling paused · connection preserved")
-
-        reconnect_url = create_strava_login_url(athlete_key)
-        if reconnect_url:
-            st.link_button(
-                f"Reconnect {athlete_first_name}'s Strava",
-                reconnect_url,
-                use_container_width=True,
-            )
-
-    else:
-
-        login_url = create_strava_login_url(athlete_key)
-
-        if login_url:
-            st.link_button(
-                f"Connect {athlete_first_name}'s Strava",
-                login_url,
-                use_container_width=True,
-            )
-        else:
-            st.warning(
-                "Add the Strava Client ID to secrets.toml first."
-            )
-
-    # -----------------------------------------------------
-    # STRAVA STATUS
-    # -----------------------------------------------------
-
-    if st.session_state.get(message_session_key):
-        st.success(
-            st.session_state[message_session_key]
-        )
-
-    elif st.session_state.get(error_session_key):
-
-        if strava_is_connected(athlete_key):
-            st.warning(
-                "Strava sync failed. No live Strava mileage is "
-                "available right now. "
-                f"Details: {st.session_state[error_session_key]}"
-            )
-        else:
-            st.warning(
-                st.session_state[error_session_key]
-            )
-
-    elif not strava_is_connected(athlete_key):
-        st.caption(
-            "This athlete has not connected Strava yet."
-        )
-
-    # COROS connection lives on the coach side, directly under the selected athlete.
-    coros_message_key = f"coros_message_{athlete_key}"
-    coros_error_key = f"coros_error_{athlete_key}"
-    try:
-        coros_connected = coros_is_connected(athlete_key)
-        if coros_connected:
-            st.caption("COROS connected")
-            if st.button(f"Sync {athlete_first_name}'s COROS recovery", use_container_width=True, key=f"sync_coros_{active_team}_{athlete_key}"):
-                try:
-                    sync_coros_recovery(athlete_key)
-                    st.session_state[coros_message_key] = f"{athlete_name_for_button}'s recovery data synced from COROS."
-                    st.session_state.pop(coros_error_key, None)
-                    st.rerun()
-                except Exception as error:
-                    st.session_state[coros_error_key] = str(error)
-        else:
-            coros_login_url = create_coros_login_url(athlete_key)
-            st.link_button(f"Connect {athlete_first_name}'s COROS", coros_login_url, use_container_width=True)
-            st.caption(f"{athlete_first_name} must authorize their own COROS account.")
-    except Exception as error:
-        st.session_state[coros_error_key] = str(error)
-
-    if st.session_state.get(coros_message_key): st.success(st.session_state[coros_message_key])
-    if st.session_state.get(coros_error_key): st.warning(f"COROS: {st.session_state[coros_error_key]}")
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # ATHLETE OVERVIEW
-    # -----------------------------------------------------
-
-    st.markdown("### Athlete Overview")
-
-    nav_items = [
-        ("♙ Profile", "Profile"),
-        ("♨ Training", "Training"),
-        ("↗ Performance", "Performance"),
-        ("♡ Recovery", "Recovery"),
-    ]
-
-    for label, view_name in nav_items:
-        if st.button(
-                label,
-                key=f"nav_{view_name.lower()}",
-                use_container_width=True,
-                type="primary" if st.session_state.get("dashboard_view") == view_name else "secondary",
-        ):
-            st.session_state["dashboard_view"] = view_name
-
-    dashboard_view = st.session_state.get("dashboard_view", "Dashboard")
-
-    # Notes is no longer a standalone coach view. Normalize older sessions
-    # that may still have Notes selected from a previous version.
-    if dashboard_view == "Notes":
-        dashboard_view = "Dashboard"
-        st.session_state["dashboard_view"] = "Dashboard"
-
-    # Strava chart/polling is disabled during API review. Never display stale
-    # session-cached activity data as if it were current.
-    st.session_state.pop(weekly_session_key, None)
-    st.session_state.pop(heart_session_key, None)
-    st.session_state.pop(message_session_key, None)
-
-    # -----------------------------------------------------
-    # CONTACT / FEEDBACK
-    # -----------------------------------------------------
-
-    st.divider()
-
-    st.markdown("### VEKDYN")
-
-    if st.button(
-            "✉ Contact & Feedback",
-            key="contact_feedback_button",
-            use_container_width=True,
-    ):
-        st.session_state["show_contact_form"] = (
-            not st.session_state.get(
-                "show_contact_form",
-                False,
-            )
-        )
-
-    if st.session_state.get(
-            "show_contact_form",
-            False,
-    ):
-
-        st.caption(
-            "Questions, feedback, or interested in bringing "
-            "VEKDYN to your program?"
-        )
-
-        with st.form(
-                "vek_dyn_contact_form",
-                clear_on_submit=True,
-        ):
-
-            contact_name = st.text_input(
-                "Name",
-                placeholder="Your name",
-            )
-
-            contact_program = st.text_input(
-                "School / Program",
-                placeholder="School or running program",
-            )
-
-            contact_email = st.text_input(
-                "Email",
-                placeholder="name@email.com",
-            )
-
-            contact_message = st.text_area(
-                "Message",
-                placeholder=(
-                    "Tell us what you're interested in, "
-                    "share feedback, or report an issue."
-                ),
-                height=130,
-            )
-
-            contact_submit = st.form_submit_button(
-                "Send Message",
-                type="primary",
-                use_container_width=True,
-            )
-
-        if contact_submit:
-
-            if not contact_name.strip():
-                st.warning("Please enter your name.")
-
-            elif not contact_email.strip():
-                st.warning("Please enter your email.")
-
-            elif not contact_message.strip():
-                st.warning("Please enter a message.")
-
-            else:
-                st.success(
-                    "Thanks — your message is ready to send."
-                )
-
-    # -----------------------------------------------------
-    # LOG OUT — NOTHING BELOW THIS
-    # -----------------------------------------------------
-
-    if st.button(
-            "Log Out",
-            key="logout_button",
-            use_container_width=True,
-    ):
-        log_out()
+# Never display stale Strava activity cache while VEKDYN is in webhook transition.
+st.session_state.pop(weekly_session_key, None)
+st.session_state.pop(heart_session_key, None)
 
 # =========================================================
 # SELECTED ATHLETE DATA
@@ -3611,7 +3410,7 @@ def render_circular_athlete_photo(photo_path, alt_text="Athlete profile photo"):
     )
 
 
-if dashboard_view in {"Dashboard", "Profile"}:
+if dashboard_view == "Profile":
     # =========================================================
     # PROFILE DATA
     # =========================================================
@@ -3718,7 +3517,7 @@ if dashboard_view in {"Dashboard", "Profile"}:
                     unsafe_allow_html=True,
                 )
 
-if dashboard_view in {"Dashboard", "Profile", "Performance", "Recovery"}:
+if dashboard_view == "Profile":
     # =========================================================
     # PERFORMANCE BESTS AND DATA SOURCE
     # =========================================================
@@ -3811,7 +3610,7 @@ if dashboard_view in {"Dashboard", "Profile", "Performance", "Recovery"}:
             elif strava_is_connected(athlete_key):
                 st.caption("Sync an HR-enabled Strava run to update this benchmark.")
 
-if dashboard_view in {"Dashboard", "Training", "Recovery"}:
+if dashboard_view == "Training":
     # =========================================================
     # WEEKLY TRAINING VOLUME + HEART RATE & RECOVERY
     # =========================================================
@@ -5245,7 +5044,7 @@ def render_team_workouts():
     # athlete feedback on rest/unassigned days.
     return
 
-if dashboard_view in {"Dashboard", "Training"}:
+if dashboard_view == "Dashboard":
     render_team_workouts()
 
 
@@ -5371,7 +5170,7 @@ def load_threshold_profile(team_id, athlete_key):
 # THRESHOLD LACTATE PROFILE — DISPLAY + COACH EDITOR
 # =========================================================
 
-if dashboard_view in {"Dashboard", "Performance"}:
+if dashboard_view == "Dashboard":
     st.subheader("Threshold Lactate Profile")
 
     # Neon is the current source after a coach saves a profile.
@@ -5556,12 +5355,70 @@ if dashboard_view in {"Dashboard", "Performance"}:
                 st.error(f"VEKDYN could not save the threshold profile: {error}")
 
 # =========================================================
+# COMPACT DASHBOARD — HEART RATE & SLEEP
+# =========================================================
+
+if dashboard_view == "Dashboard":
+    st.markdown('<div class="compact-section-title">Heart Rate & Sleep</div>', unsafe_allow_html=True)
+    max_hr = "—"  # Activity polling is intentionally disabled during Strava review.
+    resting_hr = coros_recovery.get("sleep_hr_avg")
+    sleep_minutes = coros_recovery.get("sleep_minutes")
+    hrv_value = coros_recovery.get("hrv_avg")
+
+    if sleep_minutes is not None:
+        sleep_hours = int(sleep_minutes) // 60
+        sleep_remainder = int(sleep_minutes) % 60
+        sleep_display = f"{sleep_hours}h {sleep_remainder:02d}m"
+    else:
+        sleep_display = "—"
+
+    hr1, hr2, hr3, hr4 = st.columns(4)
+    with hr1:
+        with st.container(border=True):
+            st.caption("♥  MAX HR")
+            st.markdown(f"### {max_hr} bpm")
+    with hr2:
+        with st.container(border=True):
+            st.caption("●  RESTING HR")
+            st.markdown(f"### {resting_hr if resting_hr is not None else '—'} bpm")
+    with hr3:
+        with st.container(border=True):
+            st.caption("☾  SLEEP")
+            st.markdown(f"### {sleep_display}")
+    with hr4:
+        with st.container(border=True):
+            st.caption("▮▮  HRV")
+            st.markdown(f"### {hrv_value if hrv_value is not None else '—'} ms")
+
+# =========================================================
+# TRAINING VOLUME TAB — STRAVA CHART PAUSED FOR API REVIEW
+# =========================================================
+
+if dashboard_view == "Training":
+    st.subheader("Training Volume")
+    st.info(
+        "The Strava training-volume chart is temporarily disabled while VEKDYN "
+        "moves activity updates to webhooks. Existing Strava authorizations remain connected."
+    )
+    try:
+        planned_week_start = week_start_for(datetime.now(ZoneInfo("America/Chicago")).date())
+        planned_week_end = planned_week_start + timedelta(days=6)
+        planned_workouts = load_team_workouts_range(
+            active_team, planned_week_start, planned_week_end, athlete_key
+        )
+        _, planned_miles = _weekly_workout_matrix(planned_workouts, planned_week_start)
+        if planned_miles is not None:
+            st.metric("Planned Week", f"{planned_miles:g} mi")
+    except Exception:
+        pass
+
+# =========================================================
 # ATHLETE ACCESS & CONNECTIONS — COLLAPSED ADMIN CONTROLS
 # =========================================================
 
-if dashboard_view in {"Dashboard", "Performance"}:
+if dashboard_view == "Connections":
     st.divider()
-    with st.expander("Athlete Access & Connections", expanded=False):
+    with st.expander("Athlete Access & Connections", expanded=True):
         st.caption(
             "Manage this athlete's VEKDYN login and review the connected training account. "
             "These controls stay collapsed during normal coaching use."
@@ -5595,3 +5452,32 @@ if dashboard_view in {"Dashboard", "Performance"}:
             st.caption(
                 "The athlete can authorize Strava from VEKDYN Athlete. Coach-side connection is only needed as an administrative fallback."
             )
+
+# =========================================================
+# COMPACT BOTTOM NAVIGATION
+# =========================================================
+
+st.markdown('<div class="bottom-nav-anchor"></div>', unsafe_allow_html=True)
+nav1, nav2, nav3, nav4, nav5 = st.columns([1.1, 2, 2, 2, 2])
+with nav1:
+    st.markdown("**VEK<span style='color:#2f9e44'>DYN</span>**", unsafe_allow_html=True)
+for column, label, view in [
+    (nav2, "▣ Dashboard", "Dashboard"),
+    (nav3, "▥ Training Volume", "Training"),
+    (nav4, "↗ Connections", "Connections"),
+    (nav5, "♟ Athlete Profile", "Profile"),
+]:
+    with column:
+        if st.button(
+            label,
+            use_container_width=True,
+            type="primary" if dashboard_view == view else "secondary",
+            key=f"bottom_nav_{view.lower()}",
+        ):
+            st.session_state["dashboard_view"] = view
+            st.rerun()
+
+logout_col, _ = st.columns([1, 5])
+with logout_col:
+    if st.button("Log Out", key="compact_logout_button", use_container_width=True):
+        log_out()
