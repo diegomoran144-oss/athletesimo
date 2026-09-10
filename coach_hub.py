@@ -61,6 +61,7 @@ def make_athlete_id(name):
     return value
 
 
+@st.cache_data(show_spinner=False)
 def load_team_roster(roster_path, default_school="", default_team="Distance"):
     """
     Load either roster format currently used by VEKDYN.
@@ -563,7 +564,11 @@ def test_neon_connection():
 # =========================================================
 # ATHLETE LOGIN ACCOUNTS — COACH MANAGEMENT
 # =========================================================
+# Schema setup functions below are cached with st.cache_resource so normal
+# navigation does not repeatedly open Neon connections and execute CREATE/ALTER
+# statements on every Streamlit rerun. Data reads/writes remain live.
 
+@st.cache_resource(show_spinner=False)
 def initialize_athlete_login_database():
     """
     Create/upgrade the ONE shared athlete-login table used by both
@@ -965,6 +970,7 @@ COROS_TIMEZONE = "America/Chicago"
 COROS_PROTOCOL_VERSION = "2025-06-18"
 
 
+@st.cache_resource(show_spinner=False)
 def initialize_coros_database():
     with get_database_connection() as db:
         with db.cursor() as c:
@@ -1440,7 +1446,8 @@ def load_latest_coros_recovery(athlete_key):
 # =========================================================
 
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
-STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+# Direct activity polling is intentionally disabled for Strava review compliance.
+STRAVA_ACTIVITIES_URL = None
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 
 STRAVA_REDIRECT_URI = "https://vekdyn.streamlit.app"
@@ -1450,6 +1457,7 @@ STRAVA_REDIRECT_URI = "https://vekdyn.streamlit.app"
 # STRAVA DATABASE — NEON POSTGRESQL
 # =========================================================
 
+@st.cache_resource(show_spinner=False)
 def initialize_strava_database():
     """
     Create the Strava connection table in Neon if it does not
@@ -1597,6 +1605,7 @@ def persist_strava_connection(athlete_key, connection):
 TEAM_TIMEZONE = ZoneInfo("America/Chicago")
 
 
+@st.cache_resource(show_spinner=False)
 def initialize_notes_database():
     """Create a shared athlete/coach notes feed in Neon."""
     with get_database_connection() as database:
@@ -1744,30 +1753,6 @@ def athlete_strava_connection(athlete_key):
     if connection:
         strava_connections()[athlete_key] = connection
 
-    return connection
-
-
-def strava_secret(name, default=None):
-    """Read a Strava setting without crashing if it has not been added yet."""
-    try:
-        return st.secrets[name]
-    except (KeyError, FileNotFoundError):
-        return default
-
-
-def strava_connections():
-    """Return the in-session connection store keyed by VEKDYN athlete key."""
-    return st.session_state.setdefault("strava_connections", {})
-
-
-def athlete_strava_connection(athlete_key):
-    connection = strava_connections().get(athlete_key)
-    if connection:
-        return connection
-
-    connection = load_saved_strava_connection(athlete_key)
-    if connection:
-        strava_connections()[athlete_key] = connection
     return connection
 
 
@@ -1991,125 +1976,13 @@ def get_valid_strava_token(athlete_key):
 
 
 def get_strava_training_data(access_token, number_of_weeks=8):
-    start_date = datetime.now(timezone.utc) - timedelta(weeks=number_of_weeks)
+    """Strava activity polling is disabled.
 
-    response = requests.get(
-        STRAVA_ACTIVITIES_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={
-            "after": int(start_date.timestamp()),
-            "page": 1,
-            "per_page": 200,
-        },
-        timeout=15,
-    )
-    response.raise_for_status()
-
-    runs = [
-        activity
-        for activity in response.json()
-        if activity.get("sport_type") in {"Run", "TrailRun", "VirtualRun"}
-    ]
-
-    if not runs:
-        return pd.DataFrame(columns=["Week", "Mileage"]), {}
-
-    run_data = pd.DataFrame(
-        {
-            "Date": [run["start_date_local"] for run in runs],
-            "Mileage": [run["distance"] / 1609.344 for run in runs],
-            "MovingTime": [run.get("moving_time", 0) for run in runs],
-            "AverageHR": [run.get("average_heartrate") for run in runs],
-            "MaxHR": [run.get("max_heartrate") for run in runs],
-            "HasHR": [run.get("has_heartrate", False) for run in runs],
-        }
-    )
-    # Strava's local timestamps can include a timezone offset.  The chart's
-    # generated Monday dates are timezone-free, so reduce every activity to
-    # its local calendar date before grouping.  Otherwise reindex() sees no
-    # matching weeks and silently fills every value with zero.
-    run_data["Date"] = pd.to_datetime(
-        run_data["Date"].astype(str).str[:10],
-        format="%Y-%m-%d",
-    )
-    run_data["WeekStart"] = (
-            run_data["Date"]
-            - pd.to_timedelta(run_data["Date"].dt.weekday, unit="day")
-    ).dt.normalize()
-
-    current_monday = pd.Timestamp.now().normalize() - pd.to_timedelta(
-        pd.Timestamp.now().weekday(), unit="day"
-    )
-    all_weeks = pd.date_range(
-        end=current_monday,
-        periods=number_of_weeks,
-        freq="7D",
-    )
-
-    weekly = run_data.groupby("WeekStart")["Mileage"].sum().reindex(
-        all_weeks,
-        fill_value=0,
-    )
-
-    weekly_mileage = pd.DataFrame(
-        {
-            "Week": all_weeks.strftime("%b %d"),
-            "Mileage": weekly.round(1).to_numpy(),
-        }
-    )
-
-    # Use the seven most recent runs that actually contain HR. This prevents
-    # the card from falling back to dictionary data when the current week has
-    # mileage but no recorded heart rate yet. Weight average HR by moving time
-    # so a short warm-up does not count as much as a long run.
-    all_heart_runs = run_data[
-        run_data["HasHR"].fillna(False).astype(bool)
-        & run_data["AverageHR"].notna()
-        ].copy()
-
-    heart_runs = (
-        all_heart_runs
-        .sort_values("Date", ascending=False)
-        .head(7)
-        .copy()
-    )
-
-    heart_summary = {}
-    if not heart_runs.empty:
-        total_hr_time = heart_runs.loc[
-            heart_runs["MovingTime"] > 0,
-            "MovingTime",
-        ].sum()
-
-        if total_hr_time > 0:
-            weighted_hr = (
-                                  heart_runs["AverageHR"] * heart_runs["MovingTime"]
-                          ).sum() / heart_runs["MovingTime"].sum()
-        else:
-            weighted_hr = heart_runs["AverageHR"].mean()
-
-        recorded_max_hr = all_heart_runs["MaxHR"].dropna()
-        max_hr_date = "Not available"
-        if not recorded_max_hr.empty:
-            max_hr_index = recorded_max_hr.idxmax()
-            max_hr_date = all_heart_runs.loc[max_hr_index, "Date"].strftime(
-                "%b %d, %Y"
-            )
-
-        heart_summary = {
-            "average_heart_rate": round(float(weighted_hr)),
-            "max_heart_rate": (
-                round(float(recorded_max_hr.max()))
-                if not recorded_max_hr.empty
-                else "--"
-            ),
-            "max_heart_rate_date": max_hr_date,
-            "activities_with_hr": int(len(heart_runs)),
-            "last_updated": heart_runs["Date"].max().strftime("%b %d, %Y"),
-        }
-
-    return weekly_mileage, heart_summary
-
+    Existing OAuth connections/tokens remain intact in Neon. Activity updates
+    should enter VEKDYN through the Strava webhook/cache path before this
+    display is re-enabled. This function intentionally performs no Strava GET.
+    """
+    return pd.DataFrame(columns=["Week", "Mileage"]), {}
 
 def dictionary_weekly_mileage(training):
     return pd.DataFrame(
@@ -2200,7 +2073,7 @@ def open_team_workspace(team_id):
 
 
 def render_login_page():
-    """Show the login page for whichever VEKDYN team was selected."""
+    """Show a fast, form-based login for the selected VEKDYN team."""
     pending_team = (
             st.session_state.get("pending_team")
             or st.session_state.get("active_team")
@@ -2223,50 +2096,47 @@ def render_login_page():
     st.subheader(f"{config['name']} — Coach Login")
     st.caption("Sign in to access this private team workspace.")
 
-    username = st.text_input(
-        "Username",
-        key=f"coach_username_{pending_team}",
-    )
-    password = st.text_input(
-        "Password",
-        type="password",
-        key=f"coach_password_{pending_team}",
-    )
+    # A form prevents a full Streamlit rerun for every username/password
+    # keystroke. The app only processes authentication when Log In is pressed.
+    with st.form(f"coach_login_form_{pending_team}", clear_on_submit=False):
+        username = st.text_input(
+            "Username",
+            key=f"coach_username_{pending_team}",
+        )
+        password = st.text_input(
+            "Password",
+            type="password",
+            key=f"coach_password_{pending_team}",
+        )
+        submitted = st.form_submit_button(
+            "Log In",
+            type="primary",
+            use_container_width=True,
+        )
 
-    login_col, back_col = st.columns(2)
-
-    with login_col:
-        if st.button(
-                "Log In",
-                type="primary",
-                use_container_width=True,
-                key=f"login_{pending_team}",
-        ):
-            if check_login(pending_team, username, password):
-                st.session_state["logged_in"] = True
-                st.session_state["logged_in_user"] = username
-                st.session_state["active_team"] = pending_team
-                st.session_state["pending_team"] = None
-                st.session_state["page"] = "dashboard"
-                st.session_state.pop("just_logged_out", None)
-
-                st.query_params["session"] = create_login_token(
-                    username,
-                    pending_team,
-                )
-                st.rerun()
-            else:
-                st.error("Incorrect username or password for this team.")
-
-    with back_col:
-        if st.button(
-                "← Back",
-                use_container_width=True,
-                key=f"back_from_{pending_team}_login",
-        ):
-            st.session_state["page"] = "home"
-            st.session_state["pending_team"] = None
+    if submitted:
+        if check_login(pending_team, username, password):
+            st.session_state.update({
+                "logged_in": True,
+                "logged_in_user": username,
+                "active_team": pending_team,
+                "pending_team": None,
+                "page": "dashboard",
+            })
+            st.session_state.pop("just_logged_out", None)
+            st.query_params["session"] = create_login_token(username, pending_team)
             st.rerun()
+        else:
+            st.error("Incorrect username or password for this team.")
+
+    if st.button(
+            "← Back",
+            use_container_width=True,
+            key=f"back_from_{pending_team}_login",
+    ):
+        st.session_state["page"] = "home"
+        st.session_state["pending_team"] = None
+        st.rerun()
 
 
 def render_pricing_page():
@@ -3023,6 +2893,21 @@ st.markdown(
             font-size: 12px;
             line-height: 1.45;
         }
+
+        /* VEKDYN 2026 coach-workspace skin — compact dark/purple work hub */
+        .stApp { background: #07101f !important; color: #f7f8fc !important; }
+        [data-testid="stAppViewContainer"], [data-testid="stMain"] { background: #07101f !important; }
+        [data-testid="stSidebar"] { background: #081120 !important; border-right: 1px solid #26324a !important; }
+        [data-testid="stSidebar"] * { color: #eef2ff; }
+        div[data-testid="stVerticalBlockBorderWrapper"] { background: #0b1527 !important; border: 1px solid #25324a !important; border-radius: 12px !important; box-shadow: none !important; }
+        h1, h2, h3 { color: #f8f9ff !important; }
+        p, label, .stCaptionContainer { color: #c6ccdc; }
+        [data-testid="stMetricValue"] { color: #ffffff !important; }
+        [data-testid="stMetricLabel"] { color: #aeb7cb !important; }
+        div.stButton > button[kind="primary"], div.stButton > button[data-testid="baseButton-primary"] { background: linear-gradient(135deg,#6d28d9,#8b2cf5) !important; border-color: #9a4dff !important; color: white !important; }
+        div.stButton > button { border-radius: 9px !important; }
+        .team-workout-title, .athlete-name, .pb-time, .notes-title { color: #ffffff !important; }
+        .team-workout-subtitle, .pb-event, .notes-subtitle { color: #aeb7cb !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -3426,52 +3311,19 @@ with st.sidebar:
     # -----------------------------------------------------
 
     if strava_is_connected(athlete_key):
-
-        # Automatically sync only when the coach selects a different athlete.
-        # This avoids a redundant Sync button and prevents extra Strava API calls
-        # on every normal Streamlit rerun.
-        auto_sync_key = f"{active_team}:{athlete_key}"
-
-        if st.session_state.get("last_auto_synced_athlete") != auto_sync_key:
-            try:
-                token = get_valid_strava_token(athlete_key)
-
-                weekly, heart_rate = get_strava_training_data(
-                    token,
-                    number_of_weeks=8,
-                )
-
-                st.session_state[weekly_session_key] = weekly
-                st.session_state[heart_session_key] = heart_rate
-
-                st.session_state[message_session_key] = (
-                    f"{athlete_name_for_button}'s Strava synced automatically."
-                )
-                st.session_state.pop(error_session_key, None)
-
-                # Mark this athlete as synced only after a successful request.
-                st.session_state["last_auto_synced_athlete"] = auto_sync_key
-
-            except (
-                    requests.RequestException,
-                    sqlite3.DatabaseError,
-                    RuntimeError,
-                    KeyError,
-            ) as error:
-                st.session_state[error_session_key] = str(error)
-
+        # Keep the athlete authorized, but do not poll Strava from the Coach Hub.
+        # Connections/tokens stay in Neon while activity ingestion is moved to webhooks.
         connection = athlete_strava_connection(athlete_key)
         connected_strava_name = connection.get("strava_name")
 
         if connected_strava_name:
-            st.caption(
-                f"Connected Strava account: {connected_strava_name}"
-            )
+            st.caption(f"Connected Strava account: {connected_strava_name}")
         else:
             st.caption("Strava connected")
 
-        reconnect_url = create_strava_login_url(athlete_key)
+        st.caption("Activity polling paused · connection preserved")
 
+        reconnect_url = create_strava_login_url(athlete_key)
         if reconnect_url:
             st.link_button(
                 f"Reconnect {athlete_first_name}'s Strava",
@@ -3577,6 +3429,12 @@ with st.sidebar:
     if dashboard_view == "Notes":
         dashboard_view = "Dashboard"
         st.session_state["dashboard_view"] = "Dashboard"
+
+    # Strava chart/polling is disabled during API review. Never display stale
+    # session-cached activity data as if it were current.
+    st.session_state.pop(weekly_session_key, None)
+    st.session_state.pop(heart_session_key, None)
+    st.session_state.pop(message_session_key, None)
 
     # -----------------------------------------------------
     # CONTACT / FEEDBACK
@@ -3992,42 +3850,11 @@ if dashboard_view in {"Dashboard", "Training", "Recovery"}:
                         )
 
                 with graph_col:
-                    volume_chart = (
-                        alt.Chart(volume_data)
-                        .mark_area(
-                            line={"color": "#35a33b", "strokeWidth": 3},
-                            color=alt.Gradient(
-                                gradient="linear",
-                                stops=[
-                                    alt.GradientStop(color="#dff3e1", offset=0),
-                                    alt.GradientStop(color="#ffffff", offset=1),
-                                ],
-                                x1=1,
-                                x2=1,
-                                y1=1,
-                                y2=0,
-                            ),
-                            point={"filled": True, "fill": "#35a33b", "size": 80},
-                        )
-                        .encode(
-                            x=alt.X(
-                                "Week:N",
-                                sort=None,
-                                axis=alt.Axis(title=None, labelAngle=0),
-                            ),
-                            y=alt.Y(
-                                "Mileage:Q",
-                                title="Miles",
-                                scale=alt.Scale(zero=True),
-                            ),
-                            tooltip=[
-                                alt.Tooltip("Week:N"),
-                                alt.Tooltip("Mileage:Q", title="Miles", format=".1f"),
-                            ],
-                        )
-                        .properties(height=240)
+                    st.info(
+                        "Strava training-volume chart is temporarily disabled while "
+                        "VEKDYN transitions activity updates to webhooks. Existing "
+                        "athlete connections remain preserved."
                     )
-                    st.altair_chart(volume_chart, use_container_width=True)
 
     with recovery_card:
         with st.container(border=True):
@@ -4725,6 +4552,7 @@ WORKOUT_TYPES = [
 SESSION_SLOTS = ["AM", "PM"]
 
 
+@st.cache_resource(show_spinner=False)
 def initialize_workouts_database():
     """Create/upgrade persistent team/athlete workout storage in Neon."""
     with get_database_connection() as database:
@@ -4999,6 +4827,7 @@ def _session_description(workout):
     return " | ".join(pieces) if pieces else "—"
 
 
+@st.cache_resource(show_spinner=False)
 def initialize_daily_feedback_database():
     """
     Shared athlete day-feedback storage.
@@ -5424,6 +5253,7 @@ if dashboard_view in {"Dashboard", "Training"}:
 # THRESHOLD LACTATE PROFILE — NEON
 # =========================================================
 
+@st.cache_resource(show_spinner=False)
 def initialize_threshold_database():
     """Create persistent athlete threshold profile storage in Neon."""
     with get_database_connection() as database:
