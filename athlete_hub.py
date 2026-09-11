@@ -1904,6 +1904,51 @@ st.markdown(
         opacity: 1 !important;
     }
 
+
+    /* -----------------------------------------------------
+       2026 MOBILE ATHLETE APP SHELL
+    ----------------------------------------------------- */
+    .block-container { max-width: 760px !important; padding-bottom: 7.2rem !important; }
+    .mobile-topbar { display:flex; align-items:center; justify-content:space-between; margin:0 0 1.15rem; }
+    .mobile-brand { font-size:20px; font-weight:900; letter-spacing:2px; color:#10213c; }
+    .mobile-brand span { color:#25a95a; }
+    .profile-bubble { width:38px; height:38px; border:1px solid #d9e0e7; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; background:#fff; }
+    .mobile-greeting { margin:.1rem 0 1.5rem; }
+    .mobile-greeting .welcome { font-size:29px; }
+    .mobile-section-title { font-size:28px; font-weight:900; color:#10213c; margin:.4rem 0 .15rem; }
+    .mobile-week-range { color:#667085; font-size:15px; margin-bottom:.75rem; }
+
+    /* Turn Streamlit tabs into a phone-style bottom navigation bar. */
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"] {
+        position:fixed !important; left:50% !important; bottom:0 !important;
+        transform:translateX(-50%) !important; width:min(760px,100vw) !important;
+        z-index:9999 !important; background:rgba(255,255,255,.97) !important;
+        border-top:1px solid #e5e7eb !important; box-shadow:0 -6px 20px rgba(15,23,42,.06) !important;
+        display:grid !important; grid-template-columns:repeat(4,1fr) !important;
+        padding:.45rem .55rem calc(.45rem + env(safe-area-inset-bottom)) !important;
+        gap:.15rem !important;
+    }
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"] {
+        height:54px !important; border-radius:12px !important; justify-content:center !important;
+        font-size:13px !important; padding:.35rem .25rem !important;
+    }
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"] {
+        background:#eef9f1 !important; color:#24a75a !important;
+    }
+    div[data-baseweb="tab-highlight"] { display:none !important; }
+
+    /* Compact Strava-like week strip. */
+    div[data-testid="stHorizontalBlock"] div.stButton > button {
+        min-height:62px; padding:.35rem .15rem !important; font-size:12px !important;
+    }
+
+    @media (max-width:720px) {
+        .block-container { padding:1rem 1rem 7rem !important; }
+        .mobile-brand { font-size:19px; }
+        .mobile-section-title { font-size:27px; }
+        .mobile-greeting .welcome { font-size:26px; }
+        div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"] { font-size:12px !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2767,80 +2812,37 @@ def display_workout(
 
 
 # =========================================================
-# HEADER
+# HEADER — MOBILE ATHLETE APP
 # =========================================================
 
+first_name = athlete["name"].split()[0]
+school_logo = find_team_logo(athlete["team_id"])
+
 st.markdown(
-    '<div class="vekdyn">VEK<span>DYN</span></div>',
+    '<div class="mobile-topbar">'
+    '<div class="mobile-brand">VEK<span>DYN</span></div>'
+    '<div class="profile-bubble">♙</div>'
+    '</div>',
     unsafe_allow_html=True,
 )
 
-first_name = (
-    athlete["name"]
-    .split()[0]
-)
-
-school_logo = find_team_logo(
-    athlete["team_id"]
-)
-
-header_text_col, header_logo_col = st.columns(
-    [3.2, 1.2],
-    vertical_alignment="center",
-)
-
-with header_text_col:
-    st.markdown(
-        f'<div class="welcome">'
-        f'Good evening, {first_name}.'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        f'<div class="subtext">'
-        f'{athlete["team"]} • '
-        f'{athlete["event_group"]}'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-with header_logo_col:
+logo_col, greeting_col = st.columns([0.72, 3.5], vertical_alignment="center")
+with logo_col:
     if school_logo:
-        st.image(
-            str(school_logo),
-            use_container_width=True,
-        )
-
-        st.markdown(
-            f'<div class="school-logo-caption">'
-            f'{TEAM_LOGO_LABELS.get(athlete["team_id"], athlete["team"])}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        st.image(str(school_logo), use_container_width=True)
     else:
-        # Clean fallback if a logo file has not been added yet.
         st.markdown(
-            f"""
-            <div style="
-                min-height: 118px;
-                border: 1px solid #dfe5df;
-                border-radius: 14px;
-                background: #ffffff;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                text-align: center;
-                padding: 18px;
-                color: #6b7280;
-                font-weight: 700;
-            ">
-                {TEAM_LOGO_LABELS.get(athlete["team_id"], athlete["team"])}
-            </div>
-            """,
+            '<div class="profile-bubble" style="width:58px;height:58px;">🏃</div>',
             unsafe_allow_html=True,
         )
-
+with greeting_col:
+    st.markdown(
+        f'<div class="mobile-greeting">'
+        f'<div class="welcome">Good evening, {html.escape(first_name)}.</div>'
+        f'<div class="subtext">{html.escape(athlete["team"])} • {html.escape(athlete["event_group"])}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 # =========================================================
 # ATHLETE APP NAVIGATION + DAILY TRAINING UX
@@ -3211,11 +3213,12 @@ def render_connections_page():
 # NAVIGATION
 # =========================================================
 
-tab_home, tab_training, tab_connections = st.tabs(
+tab_home, tab_training, tab_performance, tab_connections = st.tabs(
     [
-        "Home",
-        "Training",
-        "Connections",
+        "⌂  Home",
+        "🏃  Training",
+        "▥  Performance",
+        "↗  Connections",
     ]
 )
 
@@ -3225,7 +3228,7 @@ tab_home, tab_training, tab_connections = st.tabs(
 # =========================================================
 
 with tab_home:
-    st.markdown("## My workouts")
+    st.markdown('<div class="mobile-section-title">My workouts</div>', unsafe_allow_html=True)
 
     today = date.today()
     current_sunday = (
@@ -3241,8 +3244,7 @@ with tab_home:
         st.session_state.home_selected_date = selected_day
 
     st.markdown(
-        f"<div style='text-align:center;font-weight:800;"
-        f"font-size:18px;margin:.25rem 0 .8rem;'>"
+        f"<div class='mobile-week-range'>"
         f"{current_sunday.strftime('%b %d')} – "
         f"{current_saturday.strftime('%b %d, %Y')}"
         f"</div>",
@@ -3282,8 +3284,6 @@ with tab_home:
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     render_daily_feedback(selected_day)
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    render_threshold_paces()
 
 
 # =========================================================
@@ -3481,6 +3481,49 @@ with tab_training:
         st.caption(
             f"Planned mileage shown this month: {planned_month_miles:g} mi"
         )
+
+
+# =========================================================
+# PERFORMANCE — THRESHOLD + PERFORMANCE TOOLS
+# =========================================================
+
+with tab_performance:
+    st.markdown('<div class="mobile-section-title">Performance</div>', unsafe_allow_html=True)
+    st.caption("Your coach-prescribed threshold profile and performance tools.")
+    render_threshold_paces()
+
+    st.markdown("### Performance calculator")
+    st.caption(
+        "Performance calculations stay separate from the daily workout feed so Home remains fast and simple."
+    )
+    with st.container(border=True):
+        st.markdown("**Race equivalency**")
+        distance_col, minutes_col, seconds_col = st.columns([1.5, 1, 1])
+        with distance_col:
+            source_distance = st.selectbox(
+                "Race distance",
+                ["1500m", "Mile", "3K", "5K", "8K", "10K"],
+                key="athlete_perf_distance",
+            )
+        with minutes_col:
+            source_minutes = st.number_input(
+                "Minutes", min_value=0, max_value=180, value=15, step=1,
+                key="athlete_perf_minutes",
+            )
+        with seconds_col:
+            source_seconds = st.number_input(
+                "Seconds", min_value=0.0, max_value=59.9, value=0.0, step=0.1,
+                key="athlete_perf_seconds",
+            )
+
+        distance_m = {"1500m":1500.0, "Mile":1609.344, "3K":3000.0, "5K":5000.0, "8K":8000.0, "10K":10000.0}
+        total_seconds = float(source_minutes) * 60.0 + float(source_seconds)
+        if total_seconds > 0:
+            target_seconds = total_seconds * (5000.0 / distance_m[source_distance]) ** 1.06
+            target_minutes = int(target_seconds // 60)
+            target_remainder = target_seconds - target_minutes * 60
+            st.metric("Equivalent 5K", f"{target_minutes}:{target_remainder:04.1f}")
+            st.caption("Training estimate only — not a guarantee of race performance.")
 
 
 # =========================================================
