@@ -750,15 +750,14 @@ def get_athlete_login_account(athlete_key):
 
 
 def generate_temporary_password():
-    """Generate a readable but strong one-time athlete password."""
+    """Generate a short, readable one-time athlete password for onboarding."""
 
+    # Six random alphanumeric characters keeps the temporary credential
+    # easy for a coach to share/type while remaining unpredictable.
+    # The athlete is still required to change it after first login.
     alphabet = string.ascii_letters + string.digits
-    groups = [
-        "".join(secrets.choice(alphabet) for _ in range(4)),
-        "".join(secrets.choice(alphabet) for _ in range(4)),
-        "".join(secrets.choice(alphabet) for _ in range(4)),
-    ]
-    return "Vkd-" + "-".join(groups)
+    random_part = "".join(secrets.choice(alphabet) for _ in range(6))
+    return f"Vkd-{random_part}"
 
 
 def create_or_reset_athlete_login(
@@ -5463,22 +5462,45 @@ if dashboard_view == "Dashboard":
     else:
         sleep_display = "—"
 
+    # Small color-coded metric accents make each recovery card easier to scan
+    # without changing the clean white-card layout or the value typography.
+    metric_label_style = (
+        "font-size:0.78rem;font-weight:700;letter-spacing:0.02em;"
+        "color:#667085;display:flex;align-items:center;gap:0.42rem;"
+        "margin-bottom:0.25rem;white-space:nowrap;"
+    )
+
     hr1, hr2, hr3, hr4 = st.columns(4)
     with hr1:
         with st.container(border=True):
-            st.caption("♥  MAX HR")
+            st.markdown(
+                f'<div style="{metric_label_style}"><span style="color:#ef4444;font-size:1.05rem;line-height:1;">♥</span><span>MAX HR</span></div>',
+                unsafe_allow_html=True,
+            )
             st.markdown(f"### {max_hr} bpm")
+
     with hr2:
         with st.container(border=True):
-            st.caption("●  RESTING HR")
+            st.markdown(
+                f'<div style="{metric_label_style}"><span style="color:#3b82f6;font-size:1.05rem;line-height:1;">●</span><span>RESTING HR</span></div>',
+                unsafe_allow_html=True,
+            )
             st.markdown(f"### {resting_hr if resting_hr is not None else '—'} bpm")
+
     with hr3:
         with st.container(border=True):
-            st.caption("☾  SLEEP")
+            st.markdown(
+                f'<div style="{metric_label_style}"><span style="color:#8b5cf6;font-size:1.08rem;line-height:1;">☾</span><span>SLEEP</span></div>',
+                unsafe_allow_html=True,
+            )
             st.markdown(f"### {sleep_display}")
+
     with hr4:
         with st.container(border=True):
-            st.caption("▮▮  HRV")
+            st.markdown(
+                f'<div style="{metric_label_style}"><span style="color:#22c55e;font-size:0.98rem;line-height:1;letter-spacing:-0.12rem;">▮▮</span><span>HRV</span></div>',
+                unsafe_allow_html=True,
+            )
             st.markdown(f"### {hrv_value if hrv_value is not None else '—'} ms")
 
 # =========================================================
