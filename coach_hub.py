@@ -288,6 +288,35 @@ except (FileNotFoundError, RuntimeError):
     dark_horse_roster = pd.DataFrame()
     dark_horse_athletes = {}
 
+# Public sales-demo workspace. This uses a static snapshot so a coach can
+# explore VEKDYN without touching a real team's roster, OAuth tokens or Neon data.
+DEMO_TEAM_ID = "oregon_ducks_demo"
+DEMO_ATHLETE_KEY = "demo_diego_moran"
+DEMO_ATHLETES = {
+    DEMO_ATHLETE_KEY: {
+        "profile": {
+            "name": "Diego Moran", "first_name": "Diego", "last_name": "Moran",
+            "school": "Oregon Ducks", "team": "Distance", "class": "SR", "sex": "M",
+        },
+        "pbs": {"800": "2:02", "1500": "4:02", "mile": "4:22", "3k": "8:52", "5k": "14:55"},
+        "xc_results": {
+            "8k": [{"time": "26:18", "meet": "XC Personal Best", "date": ""}],
+            "10k": [],
+        },
+        "threshold": {
+            "short_reps": {"pace": "5:18/mi", "lactate": 2.4},
+            "medium_reps": {"pace": "5:30/mi", "lactate": 2.6},
+            "long_reps": {"pace": "5:40/mi", "lactate": 2.8},
+        },
+        "training": {
+            "weekly_mileage": {"Week 1": 67, "Week 2": 71, "Week 3": 73, "Week 4": 69, "Week 5": 74, "Week 6": 72},
+        },
+        "recovery": {},
+        "strava_connected_csv": True,
+        "coros_connected_csv": True,
+    }
+}
+
 
 # =========================================================
 # TEAM ROUTING
@@ -304,6 +333,9 @@ def get_team_athletes(team_id):
     if team_id == "dark_horse_endurance":
         return dark_horse_athletes
 
+    if team_id == DEMO_TEAM_ID:
+        return DEMO_ATHLETES
+
     return {}
 
 
@@ -318,6 +350,7 @@ all_athletes = {
     **ollu_athletes,
     **sam_houston_athletes,
     **dark_horse_athletes,
+    **DEMO_ATHLETES,
 }
 
 # Map every athlete key back to the team that owns that profile.
@@ -325,6 +358,7 @@ athlete_team_lookup = {
     **{athlete_key: "ollu_distance" for athlete_key in ollu_athletes},
     **{athlete_key: "sam_houston" for athlete_key in sam_houston_athletes},
     **{athlete_key: "dark_horse_endurance" for athlete_key in dark_horse_athletes},
+    **{athlete_key: DEMO_TEAM_ID for athlete_key in DEMO_ATHLETES},
 }
 
 # Fail early if the same athlete_id exists in both schools. Athlete keys are
@@ -382,6 +416,10 @@ TEAM_CONFIG = {
     "dark_horse_endurance": {
         "name": "Dark Horse Endurance",
         "short_name": "Dark Horse",
+    },
+    DEMO_TEAM_ID: {
+        "name": "Oregon Ducks — VEKDYN Demo",
+        "short_name": "Oregon Ducks",
     },
 }
 
@@ -2088,6 +2126,21 @@ def open_team_workspace(team_id):
 
     remember_recent_team(team_id)
 
+    # The Oregon workspace is a read-only public sales demo: no coach password,
+    # no real athlete account, and no live integrations are exposed.
+    if team_id == DEMO_TEAM_ID:
+        st.session_state.update({
+            "logged_in": True,
+            "logged_in_user": "demo",
+            "active_team": DEMO_TEAM_ID,
+            "pending_team": None,
+            "page": "dashboard",
+            "dashboard_view": "Dashboard",
+        })
+        if "session" in st.query_params:
+            del st.query_params["session"]
+        st.rerun()
+
     # A session authenticated for one school must not silently open another.
     if (
             st.session_state.get("logged_in")
@@ -2486,7 +2539,7 @@ def render_starter_page():
         # The landing page shows at most three recent teams. Any other configured
         # school stays hidden until the coach searches for it.
         default_recent = [
-            team_id for team_id in ("ollu_distance", "sam_houston", "dark_horse_endurance")
+            team_id for team_id in (DEMO_TEAM_ID, "ollu_distance", "sam_houston", "dark_horse_endurance")
             if team_id in TEAM_CONFIG
         ][:3]
         recent_team_ids = [
@@ -3329,7 +3382,8 @@ header_left, header_mid, header_right = st.columns([4.5, 1.5, 2.2], vertical_ali
 with header_left:
     st.markdown(
         f'<div class="coach-greeting">{greeting}, Coach</div>'
-        f'<div class="coach-team">{html.escape(active_team_config["name"])}</div>',
+        f'<div class="coach-team">{html.escape(active_team_config["name"])}</div>'
+        + ('<div style="display:inline-block;margin-top:6px;padding:3px 8px;border-radius:999px;background:#e8f5e9;color:#187a35;font-size:11px;font-weight:800;">PUBLIC DEMO</div>' if active_team == DEMO_TEAM_ID else ''),
         unsafe_allow_html=True,
     )
 with header_mid:
@@ -3379,10 +3433,17 @@ recovery = athlete.get(
     training.get("recovery", {}),
 )
 
-try:
-    coros_recovery = load_latest_coros_recovery(athlete_key) if coros_is_connected(athlete_key) else {}
-except Exception:
-    coros_recovery = {}
+if active_team == DEMO_TEAM_ID:
+    # Polished sample recovery snapshot for the sales demo only.
+    coros_recovery = {
+        "sleep_hr_avg": 48, "sleep_minutes": 492, "sleep_score": 91,
+        "hrv_avg": 78, "hrv_baseline": 75, "recovery_score": 92,
+    }
+else:
+    try:
+        coros_recovery = load_latest_coros_recovery(athlete_key) if coros_is_connected(athlete_key) else {}
+    except Exception:
+        coros_recovery = {}
 threshold_lactate = athlete.get(
     "threshold_lactate",
     training.get("threshold_lactate", {}),
@@ -3406,6 +3467,9 @@ if weekly_session_key in st.session_state:
         volume_source = "Live Strava data"
 
 live_heart_rate = st.session_state.get(heart_session_key, {})
+if active_team == DEMO_TEAM_ID:
+    live_heart_rate = {"max_heart_rate": 194, "max_heart_rate_date": "Sep 2026"}
+    volume_source = "VEKDYN demo data"
 
 # =========================================================
 # ATHLETE PROFILE PHOTOS
@@ -4892,6 +4956,30 @@ def render_team_workout_card(workout, athlete_lookup):
 
 def render_team_workouts():
     """Sunday-Saturday coach planner with AM/PM sessions and weekly mileage."""
+    if active_team == DEMO_TEAM_ID:
+        st.markdown(
+            '<div class="team-workout-title">Weekly Training Plan</div>'
+            '<div class="team-workout-subtitle">Demo week — AM/PM sessions, effort and planned mileage.</div>',
+            unsafe_allow_html=True,
+        )
+        demo_rows = [
+            ("Mon", "Easy + strides", "8 mi easy · 6 × 10s hill sprints"),
+            ("Tue AM", "Threshold", "5 × 6 min @ LT1 · 60s jog"),
+            ("Tue PM", "Threshold", "2 × (5 × 600m) controlled · 60s jog"),
+            ("Wed", "Recovery", "7 mi easy + mobility"),
+            ("Thu", "Aerobic", "10 mi steady-easy"),
+            ("Fri", "Easy", "6 mi easy + 6 strides"),
+            ("Sat", "Hills", "8 × 200m hill · full controlled recovery"),
+            ("Sun", "Long run", "13 mi relaxed aerobic"),
+        ]
+        for day, kind, session in demo_rows:
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([1, 1.3, 4])
+                c1.markdown(f"**{day}**")
+                c2.caption(kind)
+                c3.write(session)
+        st.caption("Demo workspace · sample plan only · no live athlete account is modified.")
+        return
     st.markdown(
         '<div class="team-workout-title">Weekly Training Plan</div>'
         '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, effort and planned mileage.</div>',
@@ -5187,6 +5275,15 @@ def save_threshold_profile(
 
 def load_threshold_profile(team_id, athlete_key):
     """Load one athlete's saved threshold profile from Neon."""
+    if team_id == DEMO_TEAM_ID:
+        return {
+            "short_reps": {"lactate": 2.4, "pace": "5:18/mi"},
+            "medium_reps": {"lactate": 2.6, "pace": "5:30/mi"},
+            "long_reps": {"lactate": 2.8, "pace": "5:40/mi"},
+            "short_400": {"lactate": 2.5, "time": "70.0"},
+            "short_800": {"lactate": 2.6, "time": "2:22"},
+            "short_1k": {"lactate": 2.7, "time": "2:58"},
+        }
     initialize_threshold_database()
 
     if not athlete_key:
@@ -5450,7 +5547,7 @@ if dashboard_view == "Dashboard":
 
 if dashboard_view == "Dashboard":
     st.markdown('<div class="compact-section-title">Heart Rate & Sleep</div>', unsafe_allow_html=True)
-    max_hr = "—"  # Activity polling is intentionally disabled during Strava review.
+    max_hr = 194 if active_team == DEMO_TEAM_ID else "—"  # Demo snapshot; live polling remains disabled.
     resting_hr = coros_recovery.get("sleep_hr_avg")
     sleep_minutes = coros_recovery.get("sleep_minutes")
     hrv_value = coros_recovery.get("hrv_avg")
@@ -5514,6 +5611,9 @@ if dashboard_view == "Training":
         "moves activity updates to webhooks. Existing Strava authorizations remain connected."
     )
     try:
+        if active_team == DEMO_TEAM_ID:
+            st.metric("Planned Week", "72 mi")
+            raise StopIteration
         planned_week_start = week_start_for(datetime.now(ZoneInfo("America/Chicago")).date())
         planned_week_end = planned_week_start + timedelta(days=6)
         planned_workouts = load_team_workouts_range(
@@ -5522,6 +5622,8 @@ if dashboard_view == "Training":
         _, planned_miles = _weekly_workout_matrix(planned_workouts, planned_week_start)
         if planned_miles is not None:
             st.metric("Planned Week", f"{planned_miles:g} mi")
+    except StopIteration:
+        pass
     except Exception:
         pass
 
@@ -5529,7 +5631,19 @@ if dashboard_view == "Training":
 # ATHLETE ACCESS & CONNECTIONS — COLLAPSED ADMIN CONTROLS
 # =========================================================
 
-if dashboard_view == "Connections":
+if dashboard_view == "Connections" and active_team == DEMO_TEAM_ID:
+    st.divider()
+    st.subheader("Athlete Access & Connections")
+    st.success("Demo athlete connected")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Strava**  ·  Connected")
+        st.caption("Demo connection — no real OAuth token is exposed.")
+    with c2:
+        st.markdown("**COROS**  ·  Connected")
+        st.caption("Demo recovery feed — sample data only.")
+
+elif dashboard_view == "Connections":
     st.divider()
     with st.expander("Athlete Access & Connections", expanded=True):
         st.caption(
