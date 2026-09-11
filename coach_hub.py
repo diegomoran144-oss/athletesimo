@@ -4957,27 +4957,91 @@ def render_team_workout_card(workout, athlete_lookup):
 def render_team_workouts():
     """Sunday-Saturday coach planner with AM/PM sessions and weekly mileage."""
     if active_team == DEMO_TEAM_ID:
+        # Keep the sales demo visually identical to the real school workspaces.
+        # The only difference is that its workouts are an in-memory sample and
+        # never write to Neon or modify a live athlete account.
         st.markdown(
             '<div class="team-workout-title">Weekly Training Plan</div>'
-            '<div class="team-workout-subtitle">Demo week — AM/PM sessions, effort and planned mileage.</div>',
+            '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, effort and planned mileage.</div>',
             unsafe_allow_html=True,
         )
-        demo_rows = [
-            ("Mon", "Easy + strides", "8 mi easy · 6 × 10s hill sprints"),
-            ("Tue AM", "Threshold", "5 × 6 min @ LT1 · 60s jog"),
-            ("Tue PM", "Threshold", "2 × (5 × 600m) controlled · 60s jog"),
-            ("Wed", "Recovery", "7 mi easy + mobility"),
-            ("Thu", "Aerobic", "10 mi steady-easy"),
-            ("Fri", "Easy", "6 mi easy + 6 strides"),
-            ("Sat", "Hills", "8 × 200m hill · full controlled recovery"),
-            ("Sun", "Long run", "13 mi relaxed aerobic"),
+
+        today = datetime.now(TEAM_TIMEZONE).date()
+        current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+        week_state_key = f"coach_workout_week_offset_{active_team}_{athlete_key}"
+        if week_state_key not in st.session_state:
+            st.session_state[week_state_key] = 0
+
+        nav_left, nav_mid, nav_right = st.columns([1, 1, 1])
+        with nav_left:
+            if st.button("← Previous week", key=f"prev_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+                st.session_state[week_state_key] -= 1
+                st.rerun()
+        with nav_mid:
+            if st.button("This week", key=f"this_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+                st.session_state[week_state_key] = 0
+                st.rerun()
+        with nav_right:
+            if st.button("Next week →", key=f"next_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+                st.session_state[week_state_key] += 1
+                st.rerun()
+
+        week_start = current_sunday + timedelta(weeks=int(st.session_state[week_state_key]))
+        week_end = week_start + timedelta(days=6)
+
+        title_left, title_right = st.columns([3, 1])
+        with title_left:
+            st.markdown(f"### {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}")
+            st.caption("Showing team-wide sessions plus individual sessions for Diego Moran.")
+
+        # Sample data uses the exact workout structure consumed by the normal
+        # school calendar, so the Oregon demo renders through the same matrix.
+        def demo_workout(day_offset, session, workout_type, description, miles, effort=""):
+            return {
+                "Date": week_start + timedelta(days=day_offset),
+                "Session": session,
+                "Type": workout_type,
+                "Warm Up": "",
+                "Workout": description,
+                "Cool Down": "",
+                "Notes": "",
+                "Effort": effort,
+                "Planned Miles": miles,
+            }
+
+        demo_workouts = [
+            demo_workout(0, "AM", "Long Run", "13 mi relaxed aerobic", 13, "6"),
+            demo_workout(1, "AM", "Easy + Strides", "8 mi easy · 6 × 10s hill sprints", 8, "4"),
+            demo_workout(2, "AM", "Threshold", "5 × 6 min @ LT1 · 60s jog", 8, "7"),
+            demo_workout(2, "PM", "Threshold", "2 × (5 × 600m) controlled · 60s jog", 6, "7"),
+            demo_workout(3, "AM", "Recovery", "7 mi easy + mobility", 7, "3"),
+            demo_workout(4, "AM", "Aerobic", "10 mi steady-easy", 10, "5"),
+            demo_workout(5, "AM", "Easy", "6 mi easy + 6 strides", 6, "3"),
+            demo_workout(6, "AM", "Hills", "8 × 200m hill · full controlled recovery", 8, "8"),
         ]
-        for day, kind, session in demo_rows:
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([1, 1.3, 4])
-                c1.markdown(f"**{day}**")
-                c2.caption(kind)
-                c3.write(session)
+        demo_feedback = {
+            week_start + timedelta(days=1): "Felt smooth and relaxed.",
+            week_start + timedelta(days=2): "Strong on both threshold sessions.",
+            week_start + timedelta(days=4): "Good aerobic rhythm.",
+        }
+        matrix, weekly_miles = _weekly_workout_matrix(
+            demo_workouts, week_start, athlete_feedback=demo_feedback
+        )
+
+        with title_right:
+            st.metric("Planned Week", f"{weekly_miles:g} mi" if weekly_miles is not None else "— mi")
+
+        calendar_columns = {
+            column: st.column_config.TextColumn(width="small")
+            for column in matrix.columns
+        }
+        st.dataframe(
+            matrix,
+            use_container_width=True,
+            height=635,
+            row_height=90,
+            column_config=calendar_columns,
+        )
         st.caption("Demo workspace · sample plan only · no live athlete account is modified.")
         return
     st.markdown(
