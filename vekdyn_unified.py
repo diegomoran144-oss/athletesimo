@@ -31,6 +31,7 @@ TEAM_CONFIG = {
     "ollu_distance": "OLLU Distance",
     "sam_houston": "Sam Houston Distance",
     "dark_horse_endurance": "Dark Horse Endurance",
+    "oregon_ducks_demo": "Oregon Ducks — VEKDYN Demo",
 }
 
 
@@ -113,6 +114,7 @@ def clear_unified_login():
         "page",
         "athlete_id",
         "password_change_required",
+        "vekdyn_demo_mode",
     ]
 
     for key in keys_to_clear:
@@ -368,6 +370,23 @@ def authenticate_user(username, password):
         return athlete
 
     return None
+
+
+# =========================================================
+# PUBLIC COACH DEMO
+# =========================================================
+
+def open_public_coach_demo():
+    """Open the Oregon Ducks sales demo without requiring credentials."""
+    demo_user = {"role": "coach", "username": "VEKDYN Demo", "team_id": "oregon_ducks_demo", "demo_mode": True}
+    st.session_state["vekdyn_authenticated_user"] = demo_user
+    st.session_state["vekdyn_demo_mode"] = True
+    st.session_state["logged_in"] = True
+    st.session_state["logged_in_user"] = demo_user["username"]
+    st.session_state["active_team"] = demo_user["team_id"]
+    st.session_state["pending_team"] = None
+    st.session_state["page"] = "dashboard"
+    st.session_state["vekdyn_role"] = "coach"
 
 
 # =========================================================
@@ -988,6 +1007,15 @@ with st.form("vekdyn_unified_login"):
         type="primary",
         use_container_width=True,
     )
+
+
+st.markdown(
+    '<div style="text-align:center;color:#6b7280;font-size:13px;font-weight:700;margin:14px 0 8px 0;">OR EXPLORE VEKDYN</div>',
+    unsafe_allow_html=True,
+)
+if st.button("Try Coach Demo", key="open_public_coach_demo", use_container_width=True):
+    open_public_coach_demo()
+    st.rerun()
 
 if submitted:
     clean_username = username.strip()
