@@ -1949,6 +1949,32 @@ st.markdown(
         .mobile-greeting .welcome { font-size:26px; }
         div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"] { font-size:12px !important; }
     }
+
+    /* V2: true bottom navigation made from the four nav button columns, not st.tabs. */
+    div[data-testid="stHorizontalBlock"]:has(button[kind][data-testid="stBaseButton-primary"]),
+    div[data-testid="stHorizontalBlock"]:has(button[kind][data-testid="stBaseButton-secondary"]) { }
+
+    /* The navigation row is tagged by its unique Streamlit keys through the button text layout.
+       JS-free fallback: style the first horizontal block immediately before the active view. */
+    .vekdyn-bottom-nav-marker + div[data-testid="stHorizontalBlock"] {
+        position:fixed !important; left:50% !important; bottom:0 !important;
+        transform:translateX(-50%) !important; width:min(760px,100vw) !important;
+        z-index:9999 !important; background:rgba(255,255,255,.98) !important;
+        border-top:1px solid #e5e7eb !important; box-shadow:0 -6px 20px rgba(15,23,42,.06) !important;
+        padding:.42rem .55rem calc(.42rem + env(safe-area-inset-bottom)) !important; gap:.2rem !important;
+    }
+    .vekdyn-bottom-nav-marker + div[data-testid="stHorizontalBlock"] div.stButton > button {
+        min-height:54px !important; border:0 !important; box-shadow:none !important;
+        font-size:12px !important; padding:.25rem .1rem !important;
+    }
+
+    /* V2 workout week strip: never stack the seven days vertically on mobile. */
+    div[data-testid="stSegmentedControl"] { overflow-x:auto !important; overflow-y:hidden !important; padding-bottom:2px; }
+    div[data-testid="stSegmentedControl"] > div { display:flex !important; flex-wrap:nowrap !important; min-width:max-content !important; gap:5px !important; }
+    div[data-testid="stSegmentedControl"] button { min-width:70px !important; height:58px !important; white-space:nowrap !important; border-radius:10px !important; font-size:12px !important; }
+    @media (max-width:720px) {
+      div[data-testid="stSegmentedControl"] button { min-width:52px !important; height:58px !important; padding:4px 5px !important; font-size:11px !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2888,30 +2914,26 @@ def workout_day_value(workout):
 
 
 def render_day_picker(week_start, workouts, selected_day, key_prefix):
-    """Final-Surge-style compact Sunday-Saturday selector."""
-
+    """Compact horizontal Sunday-Saturday selector that stays on one row on phones."""
     workout_dates = {workout_day_value(item) for item in workouts}
+    days = [week_start + timedelta(days=i) for i in range(7)]
+    labels = []
+    label_to_day = {}
+    for day_value in days:
+        dot = " •" if day_value in workout_dates else ""
+        label = f"{day_value.strftime('%a')} {day_value.day}{dot}"
+        labels.append(label)
+        label_to_day[label] = day_value
 
-    day_columns = st.columns(7)
-    for day_index, day_column in enumerate(day_columns):
-        day_value = week_start + timedelta(days=day_index)
-        has_workout = day_value in workout_dates
-
-        # Keep the button compact. The dot tells the athlete a workout exists.
-        label = f"{day_value.strftime('%a')}\n{day_value.day}"
-        if has_workout:
-            label += " •"
-
-        with day_column:
-            if st.button(
-                label,
-                key=f"{key_prefix}_{day_value.isoformat()}",
-                use_container_width=True,
-                type="primary" if day_value == selected_day else "secondary",
-            ):
-                return day_value
-
-    return selected_day
+    current_label = next((label for label, d in label_to_day.items() if d == selected_day), labels[0])
+    choice = st.segmented_control(
+        "Workout day",
+        options=labels,
+        default=current_label,
+        key=f"{key_prefix}_segmented",
+        label_visibility="collapsed",
+    )
+    return label_to_day.get(choice, selected_day)
 
 
 def render_selected_day_workouts(workouts, selected_day):
@@ -3213,21 +3235,34 @@ def render_connections_page():
 # NAVIGATION
 # =========================================================
 
-tab_home, tab_training, tab_performance, tab_connections = st.tabs(
-    [
-        "⌂  Home",
-        "🏃  Training",
-        "▥  Performance",
-        "↗  Connections",
-    ]
-)
+if "athlete_nav" not in st.session_state:
+    st.session_state.athlete_nav = "Home"
+
+nav_labels = ["Home", "Training", "Performance", "Connections"]
+nav_icons = {"Home": "⌂", "Training": "🏃", "Performance": "▥", "Connections": "↗"}
+
+# Real bottom navigation: ordinary Streamlit buttons are fixed to the bottom with CSS.
+st.markdown('<div class="vekdyn-bottom-nav-marker"></div>', unsafe_allow_html=True)
+nav_cols = st.columns(4, gap="small")
+for _i, _label in enumerate(nav_labels):
+    with nav_cols[_i]:
+        if st.button(
+            f"{nav_icons[_label]}\n{_label}",
+            key=f"athlete_bottom_nav_{_label.lower()}",
+            use_container_width=True,
+            type="primary" if st.session_state.athlete_nav == _label else "secondary",
+        ):
+            st.session_state.athlete_nav = _label
+            st.rerun()
+
+active_nav = st.session_state.athlete_nav
 
 
 # =========================================================
 # HOME — CURRENT WEEK / SELECTED DAY
 # =========================================================
 
-with tab_home:
+if active_nav == "Home":
     st.markdown('<div class="mobile-section-title">My workouts</div>', unsafe_allow_html=True)
 
     today = date.today()
@@ -3402,7 +3437,7 @@ def render_month_training_calendar(month_first, workouts):
     st.markdown(calendar_html, unsafe_allow_html=True)
 
 
-with tab_training:
+if active_nav == "Training":
     st.header("Training")
     st.caption(
         "See the whole training block. Your Home tab keeps the day-to-day view."
@@ -3487,7 +3522,7 @@ with tab_training:
 # PERFORMANCE — THRESHOLD + PERFORMANCE TOOLS
 # =========================================================
 
-with tab_performance:
+if active_nav == "Performance":
     st.markdown('<div class="mobile-section-title">Performance</div>', unsafe_allow_html=True)
     st.caption("Your coach-prescribed threshold profile and performance tools.")
     render_threshold_paces()
@@ -3530,5 +3565,5 @@ with tab_performance:
 # CONNECTIONS
 # =========================================================
 
-with tab_connections:
+if active_nav == "Connections":
     render_connections_page()
