@@ -1522,6 +1522,24 @@ def load_saved_strava_connection(athlete_key):
     }
 
 
+
+def delete_saved_strava_connection(athlete_key):
+    """Remove a stale/revoked Strava authorization from Neon and this session."""
+    initialize_strava_database()
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM strava_connections WHERE athlete_key = %s",
+                (athlete_key,),
+            )
+        database.commit()
+
+    strava_connections().pop(athlete_key, None)
+    st.session_state.pop(f"{athlete_key}_strava_weekly", None)
+    st.session_state.pop(f"{athlete_key}_strava_heart_rate", None)
+
+
 def saved_owner_of_strava_account(strava_athlete_id):
     """
     Check whether this Strava account is already connected
@@ -1937,8 +1955,9 @@ def refresh_strava_token(athlete_key):
     )
 
     if not refresh_token:
+        delete_saved_strava_connection(athlete_key)
         raise RuntimeError(
-            f"No Strava refresh token is available for {athlete_key}."
+            f"Strava authorization is no longer valid for {athlete_key}. Reconnect Strava."
         )
 
     response = requests.post(
@@ -1951,8 +1970,24 @@ def refresh_strava_token(athlete_key):
         },
         timeout=15,
     )
+
+    # Strava rejected this stored authorization. Remove it instead of
+    # continuing to count the athlete as connected.
+    if response.status_code in (400, 401, 403):
+        delete_saved_strava_connection(athlete_key)
+        raise RuntimeError(
+            "Strava authorization expired or was revoked. Reconnect Strava."
+        )
+
     response.raise_for_status()
     token_data = response.json()
+
+    if not token_data.get("access_token") or not token_data.get("refresh_token"):
+        delete_saved_strava_connection(athlete_key)
+        raise RuntimeError(
+            "Strava returned an invalid authorization. Reconnect Strava."
+        )
+
     # Refresh responses do not include the athlete profile, so preserve the
     # identity returned during the original authorization.
     token_data["athlete"] = {
