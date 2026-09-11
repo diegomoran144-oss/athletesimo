@@ -2024,6 +2024,24 @@ st.markdown(
         white-space:normal !important;
         overflow:hidden !important;
     }
+    /* V6: compact school identity exactly like the mobile render. */
+    .athlete-identity-row { display:flex; align-items:center; gap:14px; margin:.2rem 0 1.65rem; }
+    .athlete-school-logo { width:58px; height:58px; flex:0 0 58px; border-radius:13px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#fff; border:1px solid #e2e7ec; box-shadow:0 4px 12px rgba(15,23,42,.05); }
+    .athlete-school-logo img { display:block; width:100% !important; height:100% !important; object-fit:contain !important; padding:5px; box-sizing:border-box; }
+    .athlete-school-logo-fallback { font-size:25px; }
+    .athlete-identity-row .mobile-greeting { margin:0 !important; min-width:0; }
+    .athlete-identity-row .welcome { margin:0 0 4px !important; line-height:1.08 !important; }
+    .athlete-identity-row .subtext { margin:0 !important; }
+
+    /* V6: real seven-column week grid; anchors do not inherit Streamlit's responsive wrapping. */
+    .week-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:6px; width:100%; margin:.3rem 0 1.15rem; }
+    .week-day { min-width:0; height:66px; box-sizing:border-box; border:1px solid #d7dde3; border-radius:10px; background:#fff; text-decoration:none !important; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#566273 !important; line-height:1; }
+    .week-dow { font-size:11px; margin-bottom:7px; }
+    .week-num { font-size:16px; font-weight:800; color:#243248; white-space:nowrap; }
+    .week-dot { display:inline-block; width:4px; height:4px; border-radius:50%; background:currentColor; margin-left:3px; vertical-align:middle; }
+    .week-day.active { background:#2f9e44; border-color:#2f9e44; color:#fff !important; }
+    .week-day.active .week-num { color:#fff; }
+
     @media (max-width:480px) {
         .st-key-athlete_bottom_nav { padding-left:6px !important; padding-right:6px !important; }
         .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] { gap:2px !important; }
@@ -2309,6 +2327,11 @@ if athlete.get("team_id") == "dark_horse_endurance":
         .dh-feedback-title { color:#fff;font-size:16px;font-weight:850; }
         .dh-feedback-sub { color:#9891aa;font-size:12px;margin-top:2px; }
         .dh-feedback-chevron { color:#9e96b3;font-size:22px; }
+        .athlete-school-logo { width:58px !important; height:58px !important; flex-basis:58px !important; background:#11121d !important; border-color:#302c43 !important; box-shadow:0 5px 18px rgba(0,0,0,.22) !important; }
+        .week-day { background:#10111b !important; border-color:#2c2a40 !important; color:#aaa5bc !important; }
+        .week-day .week-num { color:#f1eef9 !important; }
+        .week-day.active { background:linear-gradient(180deg,#8e4cff,#6830ef) !important; border-color:#9c60ff !important; color:#fff !important; box-shadow:0 5px 18px rgba(124,60,255,.24) !important; }
+        .week-day.active .week-num { color:#fff !important; }
         @media (max-width:420px) { .block-container { padding-left:.7rem !important; padding-right:.7rem !important; } .mobile-greeting .welcome { font-size:27px !important; } div[data-testid="stSegmentedControl"] > div { gap:4px !important; } div[data-testid="stSegmentedControl"] button { height:66px !important; font-size:10px !important; } .dh-session { grid-template-columns:66px 1fr; gap:12px; } .dh-session-badge { height:62px; } }
         </style>
         """,
@@ -2945,26 +2968,30 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-logo_col, greeting_col = st.columns([0.72, 3.5], vertical_alignment="center")
-with logo_col:
-    if school_logo:
-        if athlete.get("team_id") == "dark_horse_endurance":
-            st.image(str(school_logo), width=66)
-        else:
-            st.image(str(school_logo), use_container_width=True)
-    else:
-        st.markdown(
-            '<div class="profile-bubble" style="width:58px;height:58px;">🏃</div>',
-            unsafe_allow_html=True,
-        )
-with greeting_col:
-    st.markdown(
-        f'<div class="mobile-greeting">'
-        f'<div class="welcome">Good evening, {html.escape(first_name)}.</div>'
-        f'<div class="subtext">{html.escape(athlete["team"])} • {html.escape(athlete["event_group"])}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+def _logo_data_uri(path):
+    if not path:
+        return None
+    suffix = Path(path).suffix.lower()
+    mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix, "image/png")
+    encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+logo_uri = _logo_data_uri(school_logo) if school_logo else None
+logo_html = (
+    f'<div class="athlete-school-logo"><img src="{logo_uri}" alt="{html.escape(athlete["team"])} logo"></div>'
+    if logo_uri else
+    '<div class="athlete-school-logo athlete-school-logo-fallback">🏃</div>'
+)
+
+st.markdown(
+    f'<div class="athlete-identity-row">'
+    f'{logo_html}'
+    f'<div class="mobile-greeting">'
+    f'<div class="welcome">Good evening, {html.escape(first_name)}.</div>'
+    f'<div class="subtext">{html.escape(athlete["team"])} • {html.escape(athlete["event_group"])}</div>'
+    f'</div></div>',
+    unsafe_allow_html=True,
+)
 
 # =========================================================
 # ATHLETE APP NAVIGATION + DAILY TRAINING UX
@@ -3010,26 +3037,38 @@ def workout_day_value(workout):
 
 
 def render_day_picker(week_start, workouts, selected_day, key_prefix):
-    """Compact horizontal Sunday-Saturday selector that stays on one row on phones."""
+    """Render a true seven-cell HTML grid so mobile browsers can never wrap the week."""
     workout_dates = {workout_day_value(item) for item in workouts}
     days = [week_start + timedelta(days=i) for i in range(7)]
-    labels = []
-    label_to_day = {}
-    for day_value in days:
-        dot = " •" if day_value in workout_dates else ""
-        label = f"{day_value.strftime('%a')}\n{day_value.day}{dot}"
-        labels.append(label)
-        label_to_day[label] = day_value
 
-    current_label = next((label for label, d in label_to_day.items() if d == selected_day), labels[0])
-    choice = st.segmented_control(
-        "Workout day",
-        options=labels,
-        default=current_label,
-        key=f"{key_prefix}_segmented",
-        label_visibility="collapsed",
-    )
-    return label_to_day.get(choice, selected_day)
+    requested = st.query_params.get("day")
+    if isinstance(requested, list):
+        requested = requested[0] if requested else None
+    if requested:
+        try:
+            requested_day = date.fromisoformat(str(requested))
+            if requested_day in days:
+                selected_day = requested_day
+        except ValueError:
+            pass
+
+    session_token = browser_session_token()
+    cells = []
+    for day_value in days:
+        params = {"day": day_value.isoformat()}
+        if session_token:
+            params["session"] = session_token
+        href = "?" + urlencode(params)
+        active = " active" if day_value == selected_day else ""
+        dot = '<span class="week-dot"></span>' if day_value in workout_dates else ""
+        cells.append(
+            f'<a class="week-day{active}" href="{href}">'
+            f'<span class="week-dow">{day_value.strftime("%a")}</span>'
+            f'<span class="week-num">{day_value.day}{dot}</span></a>'
+        )
+
+    st.markdown('<div class="week-grid">' + "".join(cells) + '</div>', unsafe_allow_html=True)
+    return selected_day
 
 
 def render_selected_day_workouts(workouts, selected_day):
