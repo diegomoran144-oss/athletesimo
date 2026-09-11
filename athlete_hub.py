@@ -1977,6 +1977,62 @@ st.markdown(
       div[data-testid="stSegmentedControl"] > div { gap:2px !important; }
       div[data-testid="stSegmentedControl"] button { font-size:10px !important; padding:2px 0 !important; }
     }
+
+    /* V5 PHONE LAYOUT: Streamlit normally stacks columns/segments on narrow screens. */
+    .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] {
+        display:grid !important;
+        grid-template-columns:repeat(4,minmax(0,1fr)) !important;
+        flex-wrap:nowrap !important;
+        gap:4px !important;
+        width:100% !important;
+    }
+    .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+        width:100% !important;
+        min-width:0 !important;
+        flex:none !important;
+    }
+    .st-key-athlete_bottom_nav div.stButton,
+    .st-key-athlete_bottom_nav div.stButton > button { width:100% !important; }
+    .st-key-athlete_bottom_nav div.stButton > button {
+        min-height:58px !important;
+        padding:4px 1px !important;
+        font-size:11px !important;
+        line-height:1.15 !important;
+        white-space:normal !important;
+    }
+
+    /* Seven-day selector: hard seven-column grid, never wrap to a second row. */
+    div[data-testid="stSegmentedControl"] > div,
+    div[data-testid="stSegmentedControl"] [role="radiogroup"] {
+        display:grid !important;
+        grid-template-columns:repeat(7,minmax(0,1fr)) !important;
+        grid-auto-flow:column !important;
+        width:100% !important;
+        min-width:0 !important;
+        gap:3px !important;
+        overflow:visible !important;
+    }
+    div[data-testid="stSegmentedControl"] button,
+    div[data-testid="stSegmentedControl"] [role="radio"] {
+        width:100% !important;
+        min-width:0 !important;
+        max-width:none !important;
+        margin:0 !important;
+        padding:4px 0 !important;
+        font-size:10px !important;
+        line-height:1.1 !important;
+        white-space:normal !important;
+        overflow:hidden !important;
+    }
+    @media (max-width:480px) {
+        .st-key-athlete_bottom_nav { padding-left:6px !important; padding-right:6px !important; }
+        .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] { gap:2px !important; }
+        .st-key-athlete_bottom_nav div.stButton > button { font-size:10px !important; }
+        div[data-testid="stSegmentedControl"] > div,
+        div[data-testid="stSegmentedControl"] [role="radiogroup"] { gap:2px !important; }
+        div[data-testid="stSegmentedControl"] button,
+        div[data-testid="stSegmentedControl"] [role="radio"] { font-size:9px !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2961,7 +3017,7 @@ def render_day_picker(week_start, workouts, selected_day, key_prefix):
     label_to_day = {}
     for day_value in days:
         dot = " •" if day_value in workout_dates else ""
-        label = f"{day_value.strftime('%a')} {day_value.day}{dot}"
+        label = f"{day_value.strftime('%a')}\n{day_value.day}{dot}"
         labels.append(label)
         label_to_day[label] = day_value
 
