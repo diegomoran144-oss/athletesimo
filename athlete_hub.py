@@ -1950,30 +1950,32 @@ st.markdown(
         div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"] { font-size:12px !important; }
     }
 
-    /* V2: true bottom navigation made from the four nav button columns, not st.tabs. */
-    div[data-testid="stHorizontalBlock"]:has(button[kind][data-testid="stBaseButton-primary"]),
-    div[data-testid="stHorizontalBlock"]:has(button[kind][data-testid="stBaseButton-secondary"]) { }
-
-    /* The navigation row is tagged by its unique Streamlit keys through the button text layout.
-       JS-free fallback: style the first horizontal block immediately before the active view. */
-    .vekdyn-bottom-nav-marker + div[data-testid="stHorizontalBlock"] {
+    /* V3: pin the keyed navigation container itself to the phone bottom. */
+    .st-key-athlete_bottom_nav {
         position:fixed !important; left:50% !important; bottom:0 !important;
         transform:translateX(-50%) !important; width:min(760px,100vw) !important;
         z-index:9999 !important; background:rgba(255,255,255,.98) !important;
         border-top:1px solid #e5e7eb !important; box-shadow:0 -6px 20px rgba(15,23,42,.06) !important;
-        padding:.42rem .55rem calc(.42rem + env(safe-area-inset-bottom)) !important; gap:.2rem !important;
+        padding:.38rem .55rem calc(.38rem + env(safe-area-inset-bottom)) !important;
     }
-    .vekdyn-bottom-nav-marker + div[data-testid="stHorizontalBlock"] div.stButton > button {
-        min-height:54px !important; border:0 !important; box-shadow:none !important;
-        font-size:12px !important; padding:.25rem .1rem !important;
+    .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] { gap:.15rem !important; }
+    .st-key-athlete_bottom_nav div.stButton > button {
+        min-height:52px !important; border:0 !important; box-shadow:none !important;
+        font-size:12px !important; padding:.2rem .05rem !important; border-radius:10px !important;
     }
 
-    /* V2 workout week strip: never stack the seven days vertically on mobile. */
-    div[data-testid="stSegmentedControl"] { overflow-x:auto !important; overflow-y:hidden !important; padding-bottom:2px; }
-    div[data-testid="stSegmentedControl"] > div { display:flex !important; flex-wrap:nowrap !important; min-width:max-content !important; gap:5px !important; }
-    div[data-testid="stSegmentedControl"] button { min-width:70px !important; height:58px !important; white-space:nowrap !important; border-radius:10px !important; font-size:12px !important; }
-    @media (max-width:720px) {
-      div[data-testid="stSegmentedControl"] button { min-width:52px !important; height:58px !important; padding:4px 5px !important; font-size:11px !important; }
+    /* V3: all seven days share the available width — no wrap and no horizontal overflow. */
+    div[data-testid="stSegmentedControl"] { width:100% !important; overflow:visible !important; padding-bottom:2px; }
+    div[data-testid="stSegmentedControl"] > div {
+        display:flex !important; flex-wrap:nowrap !important; width:100% !important; min-width:0 !important; gap:4px !important;
+    }
+    div[data-testid="stSegmentedControl"] button {
+        flex:1 1 0 !important; min-width:0 !important; width:auto !important; height:58px !important;
+        white-space:normal !important; border-radius:10px !important; font-size:11px !important; padding:3px 2px !important;
+    }
+    @media (max-width:420px) {
+      div[data-testid="stSegmentedControl"] > div { gap:2px !important; }
+      div[data-testid="stSegmentedControl"] button { font-size:10px !important; padding:2px 0 !important; }
     }
     </style>
     """,
@@ -2200,23 +2202,58 @@ if athlete.get("team_id") == "dark_horse_endurance":
     st.markdown(
         """
         <style>
-        :root { --dh-purple:#9b3cff; --dh-purple-soft:#b46cff; --dh-border:#4c246d; --dh-text:#f7f4fb; --dh-muted:#b9afc4; }
-        .stApp { background:radial-gradient(circle at 70% 0%,#130a1d 0%,#07070a 32%,#030305 78%) !important; color:var(--dh-text) !important; }
-        .block-container { max-width:1180px !important; padding-top:2rem !important; }
-        .vekdyn,.welcome,.pace-value,h1,h2,h3,h4 { color:var(--dh-text) !important; }
-        .vekdyn span { color:#38d477 !important; }
-        .subtext,.school-logo-caption,.pace-label,div[data-testid="stCaptionContainer"],div[data-testid="stMarkdownContainer"] p { color:var(--dh-muted) !important; }
-        button[data-baseweb="tab"] { color:#cfc5d8 !important; font-weight:700 !important; }
-        button[data-baseweb="tab"][aria-selected="true"] { color:var(--dh-purple-soft) !important; }
-        div[data-baseweb="tab-highlight"] { background-color:var(--dh-purple) !important; }
-        [data-testid="stVerticalBlockBorderWrapper"] { background:linear-gradient(135deg,rgba(30,18,42,.96),rgba(12,10,17,.98)) !important; border:1px solid var(--dh-border) !important; border-radius:14px !important; box-shadow:inset 0 1px 0 rgba(180,108,255,.05); }
-        hr { border-color:#3b214d !important; }
-        div.stButton > button,div.stLinkButton > a { background:#110d18 !important; border:1px solid #563078 !important; color:#f7f4fb !important; border-radius:10px !important; }
-        div.stButton > button:hover,div.stLinkButton > a:hover { border-color:var(--dh-purple) !important; color:white !important; }
-        div.stButton > button[kind="primary"],div.stLinkButton > a[kind="primary"] { background:linear-gradient(135deg,#6d20bd,#a23cff) !important; border-color:#a64cff !important; color:white !important; box-shadow:0 0 18px rgba(155,60,255,.18); }
-        [data-testid="stAlert"] { background:#160f20 !important; border:1px solid #542c76 !important; color:#eee8f5 !important; }
-        [data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea { background:#0c0910 !important; color:white !important; border-color:#4b2867 !important; }
-        .school-logo-caption { color:#a96aff !important; letter-spacing:.08em; text-transform:uppercase; }
+        :root { --dh-purple:#7c3cff; --dh-purple-bright:#9a5cff; --dh-purple-soft:#b596ff; --dh-bg:#080911; --dh-card:#11111d; --dh-border:#29263d; --dh-text:#f7f5ff; --dh-muted:#9c96b5; }
+        html, body, [data-testid="stAppViewContainer"], .stApp {
+          background:radial-gradient(circle at 78% 4%, rgba(80,38,126,.20) 0%, rgba(8,9,17,0) 28%),linear-gradient(180deg,#090a12 0%,#080911 100%) !important;
+          color:var(--dh-text) !important;
+        }
+        .block-container { max-width:620px !important; padding:1.25rem .95rem 7.5rem !important; }
+        .mobile-topbar { margin-bottom:1.15rem !important; }
+        .mobile-brand { color:#fff !important; font-size:21px !important; letter-spacing:2.5px !important; }
+        .mobile-brand span { color:#36d274 !important; }
+        .profile-bubble { width:42px !important; height:42px !important; background:#0f1019 !important; border:1px solid #3a3451 !important; color:#f8f6ff !important; }
+        .mobile-greeting { margin:.1rem 0 1.5rem !important; }
+        .mobile-greeting .welcome { color:#fff !important; font-size:30px !important; font-weight:900 !important; }
+        .subtext,.mobile-week-range,div[data-testid="stCaptionContainer"] { color:var(--dh-muted) !important; }
+        .mobile-section-title { color:#fff !important; font-size:29px !important; font-weight:900 !important; }
+        h1,h2,h3,h4,.vekdyn,.pace-value { color:#fff !important; }
+        div[data-testid="stMarkdownContainer"] p { color:#d7d2e5; }
+        hr { border-color:#29263d !important; }
+        [data-testid="stVerticalBlockBorderWrapper"] { background:linear-gradient(145deg,rgba(20,19,34,.98),rgba(13,13,23,.99)) !important; border:1px solid var(--dh-border) !important; border-radius:13px !important; }
+        [data-testid="stAlert"] { background:#12111e !important; border:1px solid #30284b !important; color:#eee9ff !important; }
+        div[data-testid="stSegmentedControl"] { width:100% !important; overflow:visible !important; }
+        div[data-testid="stSegmentedControl"] > div { display:grid !important; grid-template-columns:repeat(7,minmax(0,1fr)) !important; gap:6px !important; width:100% !important; }
+        div[data-testid="stSegmentedControl"] button { min-width:0 !important; width:100% !important; height:70px !important; padding:4px 1px !important; white-space:normal !important; background:#10111b !important; border:1px solid #2c2a40 !important; border-radius:9px !important; color:#aba6bd !important; font-size:11px !important; line-height:1.25 !important; box-shadow:none !important; }
+        div[data-testid="stSegmentedControl"] button[aria-pressed="true"], div[data-testid="stSegmentedControl"] button[data-selected="true"] { background:linear-gradient(180deg,#8e4cff,#6830ef) !important; border-color:#9c60ff !important; color:white !important; box-shadow:0 5px 18px rgba(124,60,255,.24) !important; }
+        div.stButton > button, div.stLinkButton > a { background:#11111c !important; border:1px solid #302b46 !important; color:#eeeaff !important; border-radius:10px !important; }
+        div.stButton > button[kind="primary"], div.stLinkButton > a[kind="primary"] { background:linear-gradient(180deg,#8647ff,#6a31ee) !important; border-color:#955cff !important; color:white !important; }
+        [data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea { background:#0f1018 !important; color:#f8f6ff !important; -webkit-text-fill-color:#f8f6ff !important; border-color:#332d4a !important; }
+        .st-key-athlete_bottom_nav { background:rgba(9,10,17,.98) !important; border-top:1px solid #252335 !important; box-shadow:0 -10px 30px rgba(0,0,0,.24) !important; backdrop-filter:blur(18px) !important; }
+        .st-key-athlete_bottom_nav div.stButton > button { background:transparent !important; border:0 !important; color:#aaa3be !important; font-size:12px !important; min-height:58px !important; }
+        .st-key-athlete_bottom_nav div.stButton > button[kind="primary"] { background:transparent !important; color:#8d52ff !important; box-shadow:none !important; }
+        .dh-workout-card { margin-top:.75rem; background:linear-gradient(145deg,#151422,#10101a); border:1px solid #2d2940; border-radius:13px; padding:17px 17px 13px; }
+        .dh-workout-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:10px; }
+        .dh-workout-head-title { color:#fff; font-size:22px; line-height:1.1; font-weight:900; }
+        .dh-workout-date { color:#9790ad; font-size:13px; white-space:nowrap; }
+        .dh-session { display:grid; grid-template-columns:74px 1fr; gap:14px; align-items:center; padding:13px 0; }
+        .dh-session + .dh-session { border-top:1px solid #292638; }
+        .dh-session-badge { height:66px; border-radius:11px; display:flex; flex-direction:column; align-items:center; justify-content:center; font-weight:900; font-size:16px; }
+        .dh-session-badge.am { background:linear-gradient(145deg,#3a211b,#22171a); color:#ff9a52; }
+        .dh-session-badge.pm { background:linear-gradient(145deg,#232047,#19172f); color:#9c72ff; }
+        .dh-session-icon { font-size:22px; line-height:1; margin-bottom:3px; }
+        .dh-session-title { color:#fff; font-size:17px; font-weight:850; line-height:1.2; }
+        .dh-session-detail { color:#9d96b3; font-size:14px; margin-top:5px; line-height:1.35; }
+        .dh-note { border-top:1px solid #292638; margin-top:3px; padding:14px 0 5px; display:grid; grid-template-columns:44px 1fr; gap:10px; }
+        .dh-note-icon { color:#b1a8c8; font-size:22px; }
+        .dh-note-label { color:#938ca8; font-size:12px; margin-bottom:2px; }
+        .dh-note-text { color:#eeeaff; font-size:14px; }
+        .dh-feedback-shell { margin-top:14px; background:linear-gradient(145deg,#151422,#10101a); border:1px solid #2d2940; border-radius:13px; padding:15px 16px; }
+        .dh-feedback-row { display:grid; grid-template-columns:54px 1fr 18px; gap:12px; align-items:center; }
+        .dh-feedback-icon { width:50px;height:50px;border-radius:10px;background:#201a37;color:#925cff;display:flex;align-items:center;justify-content:center;font-size:23px; }
+        .dh-feedback-title { color:#fff;font-size:16px;font-weight:850; }
+        .dh-feedback-sub { color:#9891aa;font-size:12px;margin-top:2px; }
+        .dh-feedback-chevron { color:#9e96b3;font-size:22px; }
+        @media (max-width:420px) { .block-container { padding-left:.7rem !important; padding-right:.7rem !important; } .mobile-greeting .welcome { font-size:27px !important; } div[data-testid="stSegmentedControl"] > div { gap:4px !important; } div[data-testid="stSegmentedControl"] button { height:66px !important; font-size:10px !important; } .dh-session { grid-template-columns:66px 1fr; gap:12px; } .dh-session-badge { height:62px; } }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2855,7 +2892,10 @@ st.markdown(
 logo_col, greeting_col = st.columns([0.72, 3.5], vertical_alignment="center")
 with logo_col:
     if school_logo:
-        st.image(str(school_logo), use_container_width=True)
+        if athlete.get("team_id") == "dark_horse_endurance":
+            st.image(str(school_logo), width=66)
+        else:
+            st.image(str(school_logo), use_container_width=True)
     else:
         st.markdown(
             '<div class="profile-bubble" style="width:58px;height:58px;">🏃</div>',
@@ -2954,6 +2994,67 @@ def render_selected_day_workouts(workouts, selected_day):
 
         if workout_index < len(selected_workouts) - 1:
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+
+def render_dark_horse_day_card(workouts, selected_day, today):
+    """Render the Dark Horse home workout card as one compact mobile panel."""
+    selected = [item for item in workouts if workout_day_value(item) == selected_day]
+    heading = "Today's workout" if selected_day == today else selected_day.strftime("%A's workout")
+    date_text = selected_day.strftime("%a, %b %d, %Y")
+    if not selected:
+        block = (
+            '<div class="dh-workout-card"><div class="dh-workout-head">'
+            f'<div class="dh-workout-head-title">{html.escape(heading)}</div>'
+            f'<div class="dh-workout-date">{html.escape(date_text)}</div></div>'
+            '<div class="dh-session-detail">No workout has been assigned for this day.</div></div>'
+        )
+        st.markdown(block, unsafe_allow_html=True)
+        return
+    sessions_html=[]
+    notes=[]
+    for item in selected:
+        session=str(item.get("session") or "AM").upper()
+        is_pm=session=="PM"
+        icon="☾" if is_pm else "☀"
+        cls="pm" if is_pm else "am"
+        title=html.escape(str(item.get("title") or "Training"))
+        parts=[]
+        main=str(item.get("main") or "").strip()
+        if main: parts.append(main)
+        if item.get("effort"): parts.append(f"Effort: {item['effort']}")
+        if item.get("planned_miles") is not None: parts.append(f"{item['planned_miles']:g} mi planned")
+        if item.get("warmup"): parts.append(f"Warm-up: {item['warmup']}")
+        if item.get("cooldown"): parts.append(f"Cool-down: {item['cooldown']}")
+        detail=html.escape(" · ".join(parts)) if parts else "Workout details from your coach"
+        sessions_html.append(
+            f'<div class="dh-session"><div class="dh-session-badge {cls}"><div class="dh-session-icon">{icon}</div>{html.escape(session)}</div>'
+            f'<div><div class="dh-session-title">{title}</div><div class="dh-session-detail">{detail}</div></div></div>'
+        )
+        note=str(item.get("coach_notes") or "").strip()
+        if note and note not in notes: notes.append(note)
+    notes_html=""
+    if notes:
+        notes_html=(
+            '<div class="dh-note"><div class="dh-note-icon">▣</div><div><div class="dh-note-label">Coach note</div>'
+            f'<div class="dh-note-text">{html.escape(" · ".join(notes))}</div></div></div>'
+        )
+    block=(
+        '<div class="dh-workout-card"><div class="dh-workout-head">'
+        f'<div class="dh-workout-head-title">{html.escape(heading)}</div>'
+        f'<div class="dh-workout-date">{html.escape(date_text)}</div></div>'
+        + ''.join(sessions_html) + notes_html + '</div>'
+    )
+    st.markdown(block, unsafe_allow_html=True)
+
+
+def render_dark_horse_feedback_intro():
+    st.markdown(
+        '<div class="dh-feedback-shell"><div class="dh-feedback-row">'
+        '<div class="dh-feedback-icon">▥</div><div><div class="dh-feedback-title">How did you feel?</div>'
+        '<div class="dh-feedback-sub">Log your readiness, energy, and notes.</div></div>'
+        '<div class="dh-feedback-chevron">›</div></div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_threshold_paces():
@@ -3241,19 +3342,19 @@ if "athlete_nav" not in st.session_state:
 nav_labels = ["Home", "Training", "Performance", "Connections"]
 nav_icons = {"Home": "⌂", "Training": "🏃", "Performance": "▥", "Connections": "↗"}
 
-# Real bottom navigation: ordinary Streamlit buttons are fixed to the bottom with CSS.
-st.markdown('<div class="vekdyn-bottom-nav-marker"></div>', unsafe_allow_html=True)
-nav_cols = st.columns(4, gap="small")
-for _i, _label in enumerate(nav_labels):
-    with nav_cols[_i]:
-        if st.button(
-            f"{nav_icons[_label]}\n{_label}",
-            key=f"athlete_bottom_nav_{_label.lower()}",
-            use_container_width=True,
-            type="primary" if st.session_state.athlete_nav == _label else "secondary",
-        ):
-            st.session_state.athlete_nav = _label
-            st.rerun()
+# Real bottom navigation: key the container so CSS can reliably pin the whole row.
+with st.container(key="athlete_bottom_nav"):
+    nav_cols = st.columns(4, gap="small")
+    for _i, _label in enumerate(nav_labels):
+        with nav_cols[_i]:
+            if st.button(
+                f"{nav_icons[_label]}\n{_label}",
+                key=f"athlete_bottom_nav_{_label.lower()}",
+                use_container_width=True,
+                type="primary" if st.session_state.athlete_nav == _label else "secondary",
+            ):
+                st.session_state.athlete_nav = _label
+                st.rerun()
 
 active_nav = st.session_state.athlete_nav
 
@@ -3304,20 +3405,21 @@ if active_nav == "Home":
 
     selected_day = st.session_state.home_selected_date
 
-    if selected_day == today:
-        st.markdown("### Today's workout")
+    if athlete.get("team_id") == "dark_horse_endurance":
+        render_dark_horse_day_card(current_week_workouts, selected_day, today)
+        render_dark_horse_feedback_intro()
+        with st.expander("Add / edit today's note", expanded=False):
+            render_daily_feedback(selected_day)
     else:
-        st.markdown(
-            f"### {selected_day.strftime('%A, %B %d')}"
-        )
-
-    render_selected_day_workouts(
-        current_week_workouts,
-        selected_day,
-    )
-
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    render_daily_feedback(selected_day)
+        if selected_day == today:
+            st.markdown("### Today's workout")
+        else:
+            st.markdown(
+                f"### {selected_day.strftime('%A, %B %d')}"
+            )
+        render_selected_day_workouts(current_week_workouts, selected_day)
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        render_daily_feedback(selected_day)
 
 
 
