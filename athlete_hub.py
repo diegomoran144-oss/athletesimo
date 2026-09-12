@@ -3724,38 +3724,6 @@ if active_nav == "Performance":
     st.caption("Your coach-prescribed threshold profile and performance tools.")
     render_threshold_paces()
 
-    st.markdown("### Performance calculator")
-    st.caption(
-        "Performance calculations stay separate from the daily workout feed so Home remains fast and simple."
-    )
-    with st.container(border=True):
-        st.markdown("**Race equivalency**")
-        distance_col, minutes_col, seconds_col = st.columns([1.5, 1, 1])
-        with distance_col:
-            source_distance = st.selectbox(
-                "Race distance",
-                ["1500m", "Mile", "3K", "5K", "8K", "10K"],
-                key="athlete_perf_distance",
-            )
-        with minutes_col:
-            source_minutes = st.number_input(
-                "Minutes", min_value=0, max_value=180, value=15, step=1,
-                key="athlete_perf_minutes",
-            )
-        with seconds_col:
-            source_seconds = st.number_input(
-                "Seconds", min_value=0.0, max_value=59.9, value=0.0, step=0.1,
-                key="athlete_perf_seconds",
-            )
-
-        distance_m = {"1500m":1500.0, "Mile":1609.344, "3K":3000.0, "5K":5000.0, "8K":8000.0, "10K":10000.0}
-        total_seconds = float(source_minutes) * 60.0 + float(source_seconds)
-        if total_seconds > 0:
-            target_seconds = total_seconds * (5000.0 / distance_m[source_distance]) ** 1.06
-            target_minutes = int(target_seconds // 60)
-            target_remainder = target_seconds - target_minutes * 60
-            st.metric("Equivalent 5K", f"{target_minutes}:{target_remainder:04.1f}")
-            st.caption("Training estimate only — not a guarantee of race performance.")
 
 
 # =========================================================
