@@ -1123,6 +1123,7 @@ def load_latest_coros_recovery(athlete_key):
 # ATHLETE LOGIN TABLE
 # =========================================================
 
+@st.cache_resource(show_spinner=False)
 def create_login_table():
     """
     Create/upgrade the ONE shared athlete-login table used by
@@ -1237,6 +1238,7 @@ except Exception as error:
 ATHLETE_SESSION_DAYS = 30
 
 
+@st.cache_resource(show_spinner=False)
 def create_athlete_session_table():
     """
     Persistent login tokens live in Neon so a browser refresh does not
@@ -1479,6 +1481,7 @@ handle_coros_callback_before_login()
 # ATHLETE ACCOUNT PROFILE — SHARED WITH COACH HUB
 # =========================================================
 
+@st.cache_data(ttl=300, show_spinner=False)
 def load_logged_in_athlete_profile(athlete_id):
     """
     Resolve the authenticated login to the exact athlete/team record created
@@ -2718,11 +2721,9 @@ def render_daily_feedback(feedback_date):
 # THRESHOLD TRAINING PACES - NEON
 # =========================================================
 
-def get_threshold_profile():
-    """
-    Load the logged-in athlete's individual threshold profile
-    written by the coach in VEKDYN Coach.
-    """
+@st.cache_data(ttl=60, show_spinner=False)
+def get_threshold_profile(team_id, athlete_key):
+    """Load threshold data only when the Performance tab actually needs it."""
 
     conn = get_database_connection()
 
@@ -2742,10 +2743,7 @@ def get_threshold_profile():
                   AND athlete_key = %s
                 LIMIT 1;
                 """,
-                (
-                    athlete["team_id"],
-                    athlete["athlete_key"],
-                ),
+                (team_id, athlete_key),
             )
 
             row = cursor.fetchone()
@@ -2783,8 +2781,6 @@ def get_threshold_profile():
         },
     }
 
-
-threshold_profile = get_threshold_profile()
 
 
 # =========================================================
@@ -3159,6 +3155,10 @@ def render_threshold_paces():
     VEKDYN does not prescribe an easy-run pace here. Easy running remains
     athlete-controlled unless a coach explicitly writes something in the workout.
     """
+    # Do not make this Neon query during login -> Home. It is only needed here.
+    threshold_profile = get_threshold_profile(
+        athlete["team_id"], athlete["athlete_key"]
+    )
 
     st.markdown("### Threshold paces")
     st.caption("Prescribed threshold pace by repetition length.")
@@ -3677,3 +3677,12 @@ if active_nav == "Performance":
     st.markdown('<div class="mobile-section-title">Performance</div>', unsafe_allow_html=True)
     st.caption("Your coach-prescribed threshold profile and performance tools.")
     render_threshold_paces()
+
+
+
+# =========================================================
+# CONNECTIONS
+# =========================================================
+
+if active_nav == "Connections":
+    render_connections_page()
