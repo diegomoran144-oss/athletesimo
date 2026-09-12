@@ -3529,190 +3529,144 @@ def shifted_month(base_date, offset):
     return date(year, zero_based_month + 1, 1)
 
 
-def render_month_training_calendar(month_first, workouts):
-    """Responsive month calendar: 7-column grid on desktop, agenda cards on phones."""
-    cal = calendar.Calendar(firstweekday=6)
-    weeks = cal.monthdatescalendar(month_first.year, month_first.month)
-
+def render_expanded_training_calendar(start_month, workouts, month_count=3):
+    """Final-Surge-style expanded calendar: full month grids stacked vertically."""
     workouts_by_day = {}
     for item in workouts:
         workout_date = workout_day_value(item)
         workouts_by_day.setdefault(workout_date, []).append(item)
 
     today = date.today()
-    weekday_labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    selected_raw = st.query_params.get("calday")
+    if isinstance(selected_raw, list):
+        selected_raw = selected_raw[0] if selected_raw else None
+    try:
+        selected_day = date.fromisoformat(str(selected_raw)) if selected_raw else None
+    except ValueError:
+        selected_day = None
 
-    def workout_lines(day_value):
-        lines = []
-        for item in workouts_by_day.get(day_value, []):
-            title = html.escape(str(item.get("title") or "Training"))
-            session = html.escape(str(item.get("session") or "AM").upper())
-            effort = html.escape(str(item.get("effort") or "").strip())
-            lines.append(f'<div class="cal-workout"><b>{session}</b> · {title}</div>')
-            if effort and effort.lower() != title.lower():
-                lines.append(f'<div class="cal-effort">{effort}</div>')
-        return "".join(lines) or '<div class="cal-empty">—</div>'
+    session_token = browser_session_token()
+    weekday_labels = ["S", "M", "T", "W", "T", "F", "S"]
+    blocks = []
 
-    desktop_headers = "".join(
-        f'<div class="cal-head">{label}</div>' for label in weekday_labels
-    )
-    desktop_days = []
-    for week in weeks:
-        for day_value in week:
-            in_month = day_value.month == month_first.month
-            classes = "cal-day"
-            if not in_month:
-                classes += " outside"
-            if day_value == today:
-                classes += " today"
-            dot = '<span class="today-dot">●</span>' if day_value == today else ""
-            content = workout_lines(day_value) if in_month else ""
-            desktop_days.append(
-                f'<div class="{classes}">'
-                f'<div class="cal-date">{dot}{day_value.day}</div>{content}</div>'
-            )
+    for month_offset in range(month_count):
+        month_first = shifted_month(start_month, month_offset)
+        cal = calendar.Calendar(firstweekday=6)
+        weeks = cal.monthdatescalendar(month_first.year, month_first.month)
 
-    mobile_days = []
-    for day_number in range(1, calendar.monthrange(month_first.year, month_first.month)[1] + 1):
-        day_value = date(month_first.year, month_first.month, day_number)
-        day_workouts = workouts_by_day.get(day_value, [])
-        if not day_workouts and day_value != today:
-            continue
-        today_class = " mobile-today" if day_value == today else ""
-        mobile_days.append(
-            f'<div class="mobile-day{today_class}">'
-            f'<div class="mobile-date"><b>{day_value.strftime("%a")}</b>'
-            f'<span>{day_value.strftime("%b %d")}</span></div>'
-            f'<div class="mobile-workouts">{workout_lines(day_value)}</div></div>'
+        header = ''.join(f'<div class="fs-weekday">{label}</div>' for label in weekday_labels)
+        day_cells = []
+        for week in weeks:
+            for day_value in week:
+                if day_value.month != month_first.month:
+                    day_cells.append('<div class="fs-day fs-outside"></div>')
+                    continue
+
+                params = {"calday": day_value.isoformat()}
+                if session_token:
+                    params["session"] = session_token
+                href = "?" + urlencode(params)
+
+                day_workouts = workouts_by_day.get(day_value, [])
+                classes = ["fs-day"]
+                if day_value == today:
+                    classes.append("fs-today")
+                if day_value == selected_day:
+                    classes.append("fs-selected")
+
+                dots = ''
+                if day_workouts:
+                    # One compact marker per AM/PM assignment, capped at three.
+                    dots = '<div class="fs-dots">' + ''.join(
+                        '<span class="fs-dot"></span>' for _ in day_workouts[:3]
+                    ) + '</div>'
+
+                day_cells.append(
+                    f'<a class="{" ".join(classes)}" href="{href}">'
+                    f'<span class="fs-number">{day_value.day}</span>{dots}</a>'
+                )
+
+        blocks.append(
+            f'<section class="fs-month">'
+            f'<div class="fs-month-title">{month_first.strftime("%B %Y")}</div>'
+            f'<div class="fs-weekdays">{header}</div>'
+            f'<div class="fs-grid">{"".join(day_cells)}</div>'
+            f'</section>'
         )
 
-    if not mobile_days:
-        mobile_days.append('<div class="mobile-no-workouts">No workouts scheduled this month.</div>')
-
-    calendar_html = f"""
-    <style>
-      .training-calendar-desktop {{
-        display:grid; grid-template-columns:repeat(7,minmax(0,1fr));
-        border:1px solid #dfe5df; border-radius:14px; overflow:hidden;
-        background:#fff;
-      }}
-      .cal-head {{padding:10px 5px;text-align:center;font-weight:800;font-size:13px;
-        border-bottom:1px solid #dfe5df;background:#f8faf8;color:#111827;}}
-      .cal-day {{min-height:112px;padding:8px;border-right:1px solid #e5e7eb;
-        border-bottom:1px solid #e5e7eb;min-width:0;}}
-      .cal-day:nth-child(7n) {{border-right:none;}}
-      .cal-day.outside {{background:#fafafa;color:#a3a3a3;}}
-      .cal-day.today {{background:#f0faf2;}}
-      .cal-date {{text-align:right;font-weight:800;font-size:13px;color:#111827;margin-bottom:7px;}}
-      .outside .cal-date {{color:#a3a3a3;}}
-      .today-dot {{color:#2f9e44;margin-right:4px;}}
-      .cal-workout {{font-size:11px;line-height:1.35;color:#374151;overflow-wrap:anywhere;margin-top:4px;}}
-      .cal-effort {{font-size:10px;line-height:1.3;color:#6b7280;overflow-wrap:anywhere;margin-top:2px;}}
-      .cal-empty {{font-size:12px;color:#9ca3af;}}
-      .training-calendar-mobile {{display:none;}}
-
-      @media (max-width:720px) {{
-        .training-calendar-desktop {{display:none;}}
-        .training-calendar-mobile {{display:block;}}
-        .mobile-day {{display:grid;grid-template-columns:82px minmax(0,1fr);gap:12px;
-          padding:14px 4px;border-bottom:1px solid #e5e7eb;}}
-        .mobile-day.mobile-today {{background:#f0faf2;border-radius:12px;padding-left:10px;padding-right:10px;}}
-        .mobile-date {{display:flex;flex-direction:column;font-size:14px;color:#111827;}}
-        .mobile-date span {{font-size:12px;color:#6b7280;margin-top:2px;}}
-        .mobile-workouts .cal-workout {{font-size:14px;line-height:1.4;margin-top:0;margin-bottom:3px;}}
-        .mobile-workouts .cal-effort {{font-size:12px;margin-bottom:4px;}}
-        .mobile-no-workouts {{padding:18px 0;color:#6b7280;text-align:center;}}
-      }}
-    </style>
-    <div class="training-calendar-desktop">
-      {desktop_headers}{''.join(desktop_days)}
-    </div>
-    <div class="training-calendar-mobile">
-      {''.join(mobile_days)}
-    </div>
-    """
-    st.markdown(calendar_html, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <style>
+          .fs-calendar {{max-width:760px;margin:0 auto 1rem;}}
+          .fs-month {{margin:0 0 30px;}}
+          .fs-month-title {{font-size:24px;font-weight:850;color:#111827;margin:10px 0 12px;}}
+          .fs-weekdays,.fs-grid {{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));}}
+          .fs-weekdays {{border-bottom:1px solid #e5e7eb;}}
+          .fs-weekday {{text-align:center;padding:6px 0 10px;font-size:13px;font-weight:700;color:#6b7280;}}
+          .fs-grid {{border-bottom:1px solid #eef0ee;}}
+          .fs-day {{height:76px;display:flex;flex-direction:column;align-items:center;justify-content:center;
+            text-decoration:none!important;color:#111827!important;border-bottom:1px solid #eef0ee;position:relative;}}
+          .fs-outside {{pointer-events:none;}}
+          .fs-number {{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+            font-size:20px;font-weight:650;}}
+          .fs-today .fs-number {{background:#2f9e44;color:#fff;font-weight:850;}}
+          .fs-selected:not(.fs-today) .fs-number {{outline:2px solid #2f9e44;outline-offset:1px;}}
+          .fs-dots {{height:10px;margin-top:2px;display:flex;gap:3px;align-items:center;justify-content:center;}}
+          .fs-dot {{width:6px;height:6px;border-radius:50%;background:#91a6b5;display:block;}}
+          .fs-selected .fs-dot,.fs-today .fs-dot {{background:#2f9e44;}}
+          .fs-day:hover {{background:#f7faf7;}}
+          @media(max-width:720px) {{
+            .fs-calendar {{margin-left:-2px;margin-right:-2px;}}
+            .fs-month {{margin-bottom:26px;}}
+            .fs-month-title {{font-size:21px;margin:8px 0 10px;}}
+            .fs-day {{height:64px;}}
+            .fs-number {{width:34px;height:34px;font-size:18px;}}
+            .fs-weekday {{font-size:12px;padding-bottom:8px;}}
+          }}
+        </style>
+        <div class="fs-calendar">{"".join(blocks)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    return selected_day
 
 
 if active_nav == "Training":
     st.header("Training")
-    st.caption(
-        "See the whole training block. Your Home tab keeps the day-to-day view."
-    )
+    st.caption("Your full training block. Tap any workout day to open its sessions.")
 
     today = date.today()
-    month_first = shifted_month(
-        date(today.year, today.month, 1),
-        st.session_state.training_month_offset,
+    first_month = date(today.year, today.month, 1)
+    last_month = shifted_month(first_month, 2)
+    last_day = date(
+        last_month.year,
+        last_month.month,
+        calendar.monthrange(last_month.year, last_month.month)[1],
     )
 
-    previous_col, current_col, next_col = st.columns([1, 1, 1])
-
-    with previous_col:
-        if st.button(
-            "← Previous month",
-            use_container_width=True,
-            key="athlete_prev_month",
-        ):
-            st.session_state.training_month_offset -= 1
-            st.rerun()
-
-    with current_col:
-        if st.button(
-            "This month",
-            use_container_width=True,
-            key="athlete_this_month",
-        ):
-            st.session_state.training_month_offset = 0
-            st.rerun()
-
-    with next_col:
-        if st.button(
-            "Next month →",
-            use_container_width=True,
-            key="athlete_next_month",
-        ):
-            st.session_state.training_month_offset += 1
-            st.rerun()
-
-    st.markdown(
-        f"<div style='text-align:center;font-weight:850;"
-        f"font-size:22px;margin:.35rem 0 1rem;'>"
-        f"{month_first.strftime('%B %Y')}"
-        f"</div>",
-        unsafe_allow_html=True,
+    # One database read supplies all three expanded months.
+    training_workouts = get_workouts(first_month, last_day)
+    selected_training_day = render_expanded_training_calendar(
+        first_month,
+        training_workouts,
+        month_count=3,
     )
 
-    # Load the complete visible calendar grid, including spillover days
-    # from the previous/next month.
-    cal = calendar.Calendar(firstweekday=6)
-    visible_weeks = cal.monthdatescalendar(
-        month_first.year,
-        month_first.month,
-    )
-    grid_start = visible_weeks[0][0]
-    grid_end = visible_weeks[-1][-1]
-
-    month_workouts = get_workouts(grid_start, grid_end)
-    render_month_training_calendar(month_first, month_workouts)
-
-    month_only_workouts = [
-        item for item in month_workouts
-        if workout_day_value(item).month == month_first.month
-        and workout_day_value(item).year == month_first.year
-    ]
+    if selected_training_day:
+        st.markdown(
+            f"<div style='font-size:20px;font-weight:850;margin:.5rem 0 .7rem;'>"
+            f"{selected_training_day.strftime('%A, %B %d')}</div>",
+            unsafe_allow_html=True,
+        )
+        render_selected_day_workouts(training_workouts, selected_training_day)
 
     planned_values = [
         item.get("planned_miles")
-        for item in month_only_workouts
+        for item in training_workouts
         if item.get("planned_miles") is not None
     ]
-
     if planned_values:
-        planned_month_miles = round(sum(planned_values), 1)
-        st.caption(
-            f"Planned mileage shown this month: {planned_month_miles:g} mi"
-        )
+        st.caption(f"Planned mileage shown: {round(sum(planned_values), 1):g} mi")
 
 
 # =========================================================
@@ -3723,12 +3677,3 @@ if active_nav == "Performance":
     st.markdown('<div class="mobile-section-title">Performance</div>', unsafe_allow_html=True)
     st.caption("Your coach-prescribed threshold profile and performance tools.")
     render_threshold_paces()
-
-
-
-# =========================================================
-# CONNECTIONS
-# =========================================================
-
-if active_nav == "Connections":
-    render_connections_page()
