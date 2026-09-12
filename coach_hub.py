@@ -3416,6 +3416,22 @@ st.session_state.pop(weekly_session_key, None)
 st.session_state.pop(heart_session_key, None)
 
 # =========================================================
+# FAST DASHBOARD READ CACHE
+# =========================================================
+# Streamlit reruns the script when a navigation button is clicked. Cache the
+# small COROS reads briefly so switching Dashboard / Training / Predictor /
+# Profile does not reopen Neon multiple times for unchanged data.
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_coros_is_connected(athlete_key):
+    return coros_is_connected(athlete_key)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_latest_coros_recovery(athlete_key):
+    return load_latest_coros_recovery(athlete_key)
+
+
+# =========================================================
 # SELECTED ATHLETE DATA
 # =========================================================
 
@@ -3441,7 +3457,13 @@ if active_team == DEMO_TEAM_ID:
     }
 else:
     try:
-        coros_recovery = load_latest_coros_recovery(athlete_key) if coros_is_connected(athlete_key) else {}
+        # Only the main Dashboard needs recovery cards. Other views should not
+        # pay for COROS/Neon reads just because Streamlit reran during navigation.
+        coros_recovery = (
+            cached_latest_coros_recovery(athlete_key)
+            if dashboard_view == "Dashboard" and cached_coros_is_connected(athlete_key)
+            else {}
+        )
     except Exception:
         coros_recovery = {}
 threshold_lactate = athlete.get(
