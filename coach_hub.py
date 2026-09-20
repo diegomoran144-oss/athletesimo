@@ -28,41 +28,6 @@ OLLU_ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
 SAM_HOUSTON_ROSTER_PATH = Path(__file__).with_name("sam_houston_csv")
 DARK_HORSE_ROSTER_PATH = Path(__file__).with_name("dark_horse_endurance_csv")
 
-
-def resolve_roster_path(preferred_path, aliases=()):
-    """Find a deployed roster even if Git/Streamlit preserved a .csv or copy suffix."""
-    preferred_path = Path(preferred_path)
-    folder = preferred_path.parent
-
-    exact_candidates = [preferred_path]
-    for alias in aliases:
-        exact_candidates.extend([folder / alias, folder / f"{alias}.csv"])
-
-    for candidate in exact_candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate
-
-    # Handle downloaded/copied names such as dark_horse_endurance_csv(2) or
-    # dark_horse_endurance_csv (2).csv without tying VEKDYN to that suffix.
-    stems = {preferred_path.name.lower(), *(str(alias).lower() for alias in aliases)}
-    matches = []
-    if folder.exists():
-        for candidate in folder.iterdir():
-            if not candidate.is_file():
-                continue
-            name = candidate.name.lower()
-            normalized = re.sub(r"\.csv$", "", name)
-            normalized = re.sub(r"\s*\(\d+\)$", "", normalized).strip()
-            if normalized in stems:
-                matches.append(candidate)
-
-    if matches:
-        # Prefer the newest matching copy, which is normally the roster most
-        # recently uploaded/deployed by the coach.
-        return max(matches, key=lambda item: item.stat().st_mtime)
-
-    return preferred_path
-
 TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
 TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
 
@@ -116,34 +81,10 @@ def load_team_roster(roster_path, default_school="", default_team="Distance"):
         roster_path,
         dtype=str,
         keep_default_na=False,
-        encoding="utf-8-sig",
     ).fillna("")
 
-    # Normalize headers so exports such as "Name", "PB 5K", or headers with
-    # accidental spaces/BOM characters still map to VEKDYN's canonical fields.
-    def normalize_roster_column(column):
-        value = str(column).replace("\ufeff", "").strip().lower()
-        value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
-        aliases = {
-            "athlete": "name", "athlete_name": "name",
-            "first": "first_name", "firstname": "first_name",
-            "last": "last_name", "lastname": "last_name",
-            "gender": "sex", "class": "class_year", "year": "class_year",
-            "800": "pb_800", "800m": "pb_800",
-            "1500": "pb_1500", "1500m": "pb_1500",
-            "mile": "pb_mile", "3k": "pb_3k", "3000": "pb_3k",
-            "5k": "pb_5k", "5000": "pb_5k",
-            "6k": "pb_6k", "8k": "pb_8k",
-        }
-        return aliases.get(value, value)
-
-    roster.columns = [normalize_roster_column(column) for column in roster.columns]
-    if roster.columns.duplicated().any():
-        duplicates = sorted(set(roster.columns[roster.columns.duplicated()].tolist()))
-        raise RuntimeError(
-            f"{roster_path.name} has duplicate columns after normalization: "
-            + ", ".join(duplicates)
-        )
+    # Normalize column names in case whitespace was accidentally added.
+    roster.columns = [str(column).strip() for column in roster.columns]
 
     # -------------------------------------------------
     # NORMALIZE NAME / ID FIELDS
@@ -337,23 +278,14 @@ sam_houston_roster, sam_houston_athletes = load_team_roster(
 # Dark Horse can be deployed before the roster is populated. Replace the
 # header-only template with the real CSV when the coach is ready.
 try:
-    DARK_HORSE_ROSTER_PATH = resolve_roster_path(
-        DARK_HORSE_ROSTER_PATH,
-        aliases=("dark_horse_endurance_csv", "dark_horse_endurance"),
-    )
     dark_horse_roster, dark_horse_athletes = load_team_roster(
         DARK_HORSE_ROSTER_PATH,
         default_school="Dark Horse Endurance",
         default_team="Endurance",
     )
-except (FileNotFoundError, RuntimeError, pd.errors.ParserError) as error:
-    # Keep the rest of Coach Hub usable, but preserve the roster error so the
-    # Dark Horse workspace can explain why a CSV was not loaded.
+except (FileNotFoundError, RuntimeError):
     dark_horse_roster = pd.DataFrame()
     dark_horse_athletes = {}
-    DARK_HORSE_ROSTER_ERROR = str(error)
-else:
-    DARK_HORSE_ROSTER_ERROR = None
 
 # Public sales-demo workspace. This uses a static snapshot so a coach can
 # explore VEKDYN without touching a real team's roster, OAuth tokens or Neon data.
@@ -4637,6 +4569,16 @@ def save_team_workout(
             raise ValueError("Planned mileage cannot be negative.")
 
     initialize_workouts_database()
+
+    # Dark Horse uses the current roster ID as the permanent workout assignment key.
+    if team_id == "dark_horse_endurance" and athlete_key:
+        normalized_assignment = make_athlete_id(athlete_key)
+        for current_key, athlete in dark_horse_athletes.items():
+            profile_name = athlete.get("profile", {}).get("name", "")
+            if normalized_assignment in {make_athlete_id(current_key), make_athlete_id(profile_name)}:
+                athlete_key = current_key
+                break
+
     with get_database_connection() as database:
         with database.cursor() as cursor:
             cursor.execute(
@@ -4733,9 +4675,56 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
     return _workout_rows_to_dicts(rows)
 
 
+def reconcile_dark_horse_workout_keys():
+    """Reconnect legacy Dark Horse workout assignments to current roster IDs.
+
+    Older rows may contain an athlete name or a differently formatted key.
+    Current roster IDs are canonical; team-wide rows (NULL athlete_key) are untouched.
+    """
+    if not dark_horse_athletes:
+        return
+
+    canonical_by_normalized = {}
+    for current_key, athlete in dark_horse_athletes.items():
+        profile = athlete.get("profile", {})
+        for candidate in (current_key, profile.get("name", "")):
+            normalized = make_athlete_id(candidate)
+            if normalized:
+                canonical_by_normalized[normalized] = current_key
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT athlete_key
+                FROM team_workouts
+                WHERE team_id = 'dark_horse_endurance'
+                  AND athlete_key IS NOT NULL
+                  AND BTRIM(athlete_key) <> ''
+                """
+            )
+            stored_keys = [row[0] for row in cursor.fetchall()]
+
+            for stored_key in stored_keys:
+                canonical_key = canonical_by_normalized.get(make_athlete_id(stored_key))
+                if canonical_key and canonical_key != stored_key:
+                    cursor.execute(
+                        """
+                        UPDATE team_workouts
+                        SET athlete_key = %s
+                        WHERE team_id = 'dark_horse_endurance'
+                          AND athlete_key = %s
+                        """,
+                        (canonical_key, stored_key),
+                    )
+        database.commit()
+
+
 def load_team_workouts_range(team_id, start_date, end_date, selected_athlete_key=None):
     """Load a complete Sunday-Saturday planning window for the selected athlete."""
     initialize_workouts_database()
+    if team_id == "dark_horse_endurance":
+        reconcile_dark_horse_workout_keys()
 
     with get_database_connection() as database:
         with database.cursor() as cursor:
@@ -4998,11 +4987,11 @@ def _render_dark_horse_workout_calendar(matrix):
     markup = """
 <style>
 .dh-wrap{width:100%;overflow-x:auto;border:1px solid #8f45c2;border-radius:10px;background:#0e0912}
-.dh-cal{width:100%;min-width:760px;border-collapse:collapse;table-layout:fixed}
+.dh-cal{width:100%;min-width:900px;border-collapse:collapse;table-layout:fixed}
 .dh-cal th,.dh-cal td{padding:16px 12px;border-right:1px solid #613878;border-bottom:1px solid #513062;font-size:14px;line-height:1.35}
 .dh-cal thead th{background:#7d3caf;color:#fff;font-weight:800;text-align:center}
-.dh-cal thead th:first-child{background:#321a40;width:120px}
-.dh-cal tbody th{background:#2b1836;color:#f8efff;font-weight:750;text-align:left;width:120px}
+.dh-cal thead th:first-child{background:#321a40;width:150px}
+.dh-cal tbody th{background:#2b1836;color:#f8efff;font-weight:750;text-align:left;width:150px}
 .dh-cal td{background:#18111f;color:#fff;font-weight:550}
 .dh-cal tr.dh-alt td{background:#23152c}.dh-cal tr.dh-alt th{background:#372044}
 .dh-cal tr.dh-total td{background:#422154;font-weight:800}.dh-cal tr.dh-total th{background:#632b7d;color:#fff}
@@ -5120,8 +5109,11 @@ def render_team_workouts():
         with title_right:
             st.metric("Planned Week", f"{weekly_miles:g} mi" if weekly_miles is not None else "— mi")
 
+        # Keep all seven day columns (Sun-Sat) visible on normal desktop widths.
+        # An explicit pixel width is narrower than Streamlit's "small" preset,
+        # while Streamlit still provides horizontal scrolling on smaller screens.
         calendar_columns = {
-            column: st.column_config.TextColumn(width="small")
+            column: st.column_config.TextColumn(width=92)
             for column in matrix.columns
         }
         st.dataframe(
@@ -5291,8 +5283,11 @@ def render_team_workouts():
     if active_team == "dark_horse_endurance":
         _render_dark_horse_workout_calendar(matrix)
     else:
+        # Keep all seven day columns (Sun-Sat) visible on normal desktop widths.
+        # An explicit pixel width is narrower than Streamlit's "small" preset,
+        # while Streamlit still provides horizontal scrolling on smaller screens.
         calendar_columns = {
-            column: st.column_config.TextColumn(width="small")
+            column: st.column_config.TextColumn(width=92)
             for column in matrix.columns
         }
         st.dataframe(
