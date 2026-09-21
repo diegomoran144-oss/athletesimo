@@ -4826,8 +4826,20 @@ def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
         if (day, slot) in by_day_slot:
             by_day_slot[(day, slot)].append(workout)
 
-    def join_for(day, slot, field):
+    def effective_sessions(day, slot):
+        """Use an athlete-specific session as an override of the team default."""
         sessions = by_day_slot[(day, slot)]
+        if not sessions:
+            return []
+
+        # load_team_workouts_range() returns both the team workout (athlete_key=None)
+        # and the selected athlete's workout. If an individual workout exists for
+        # this day/session, show only that workout; otherwise inherit the team one.
+        individual_sessions = [item for item in sessions if item.get("athlete_key")]
+        return individual_sessions if individual_sessions else sessions
+
+    def join_for(day, slot, field):
+        sessions = effective_sessions(day, slot)
         if not sessions:
             return "—"
         if field == "title":
@@ -4853,7 +4865,7 @@ def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
         miles = [
             float(item["Planned Miles"])
             for slot in SESSION_SLOTS
-            for item in by_day_slot[(day, slot)]
+            for item in effective_sessions(day, slot)
             if item.get("Planned Miles") is not None
         ]
         daily_miles.append(round(sum(miles), 1) if miles else None)
@@ -4983,7 +4995,7 @@ def render_team_workouts():
         # never write to Neon or modify a live athlete account.
         st.markdown(
             '<div class="team-workout-title">Weekly Training Plan</div>'
-            '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions and workout details.</div>',
+            '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, effort and planned mileage.</div>',
             unsafe_allow_html=True,
         )
 
@@ -5127,6 +5139,23 @@ def render_team_workouts():
             with top_slot:
                 session_slot = st.selectbox("Session", SESSION_SLOTS)
 
+            effort_col, miles_col = st.columns(2)
+            with effort_col:
+                effort_level = st.selectbox(
+                    "Effort (1–10)",
+                    ["—"] + [str(value) for value in range(1, 11)],
+                    help="Optional coach target. Use 1 for very easy and 10 for maximal.",
+                )
+            with miles_col:
+                planned_miles = st.number_input(
+                    "Planned mileage",
+                    min_value=0.0,
+                    max_value=50.0,
+                    value=0.0,
+                    step=0.5,
+                    help="Use 0 if you do not want mileage included for this session.",
+                )
+
             warm_up = st.text_area("Warm Up", placeholder="Example: 2 miles easy + drills")
             main_workout = st.text_area(
                 "Main Workout",
@@ -5162,8 +5191,8 @@ def render_team_workouts():
                     notes,
                     video_url,
                     session_slot=session_slot,
-                    effort_level="",
-                    planned_miles=None,
+                    effort_level="" if effort_level == "—" else effort_level,
+                    planned_miles=None if planned_miles == 0 else planned_miles,
                 )
                 st.success("Workout saved to VEKDYN.")
                 st.rerun()
