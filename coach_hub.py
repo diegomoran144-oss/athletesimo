@@ -4569,16 +4569,6 @@ def save_team_workout(
             raise ValueError("Planned mileage cannot be negative.")
 
     initialize_workouts_database()
-
-    # Dark Horse uses the current roster ID as the permanent workout assignment key.
-    if team_id == "dark_horse_endurance" and athlete_key:
-        normalized_assignment = make_athlete_id(athlete_key)
-        for current_key, athlete in dark_horse_athletes.items():
-            profile_name = athlete.get("profile", {}).get("name", "")
-            if normalized_assignment in {make_athlete_id(current_key), make_athlete_id(profile_name)}:
-                athlete_key = current_key
-                break
-
     with get_database_connection() as database:
         with database.cursor() as cursor:
             cursor.execute(
@@ -4675,56 +4665,9 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
     return _workout_rows_to_dicts(rows)
 
 
-def reconcile_dark_horse_workout_keys():
-    """Reconnect legacy Dark Horse workout assignments to current roster IDs.
-
-    Older rows may contain an athlete name or a differently formatted key.
-    Current roster IDs are canonical; team-wide rows (NULL athlete_key) are untouched.
-    """
-    if not dark_horse_athletes:
-        return
-
-    canonical_by_normalized = {}
-    for current_key, athlete in dark_horse_athletes.items():
-        profile = athlete.get("profile", {})
-        for candidate in (current_key, profile.get("name", "")):
-            normalized = make_athlete_id(candidate)
-            if normalized:
-                canonical_by_normalized[normalized] = current_key
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT DISTINCT athlete_key
-                FROM team_workouts
-                WHERE team_id = 'dark_horse_endurance'
-                  AND athlete_key IS NOT NULL
-                  AND BTRIM(athlete_key) <> ''
-                """
-            )
-            stored_keys = [row[0] for row in cursor.fetchall()]
-
-            for stored_key in stored_keys:
-                canonical_key = canonical_by_normalized.get(make_athlete_id(stored_key))
-                if canonical_key and canonical_key != stored_key:
-                    cursor.execute(
-                        """
-                        UPDATE team_workouts
-                        SET athlete_key = %s
-                        WHERE team_id = 'dark_horse_endurance'
-                          AND athlete_key = %s
-                        """,
-                        (canonical_key, stored_key),
-                    )
-        database.commit()
-
-
 def load_team_workouts_range(team_id, start_date, end_date, selected_athlete_key=None):
     """Load a complete Sunday-Saturday planning window for the selected athlete."""
     initialize_workouts_database()
-    if team_id == "dark_horse_endurance":
-        reconcile_dark_horse_workout_keys()
 
     with get_database_connection() as database:
         with database.cursor() as cursor:
@@ -4763,62 +4706,6 @@ def load_team_workouts_range(team_id, start_date, end_date, selected_athlete_key
             rows = cursor.fetchall()
 
     return _workout_rows_to_dicts(rows)
-
-
-def update_team_workout(
-        workout_id,
-        team_id,
-        workout_type,
-        warm_up,
-        workout,
-        cool_down,
-        notes,
-        video_url="",
-        session_slot="AM",
-        planned_miles=None,
-):
-    """Update an existing coach-written session without changing its assignment/date."""
-    main_workout = str(workout or "").strip()
-    if not main_workout:
-        raise ValueError("Add the main workout before saving.")
-
-    clean_slot = str(session_slot or "AM").strip().upper()
-    if clean_slot not in SESSION_SLOTS:
-        clean_slot = "AM"
-
-    clean_video = str(video_url or "").strip() if team_id == "dark_horse_endurance" else ""
-    clean_miles = None if planned_miles in (None, "", 0, 0.0) else float(planned_miles)
-
-    initialize_workouts_database()
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE team_workouts
-                SET workout_type = %s,
-                    warm_up = %s,
-                    workout = %s,
-                    cool_down = %s,
-                    notes = %s,
-                    video_url = %s,
-                    session_slot = %s,
-                    planned_miles = %s
-                WHERE id = %s AND team_id = %s
-                """,
-                (
-                    str(workout_type).strip(),
-                    str(warm_up or "").strip(),
-                    main_workout,
-                    str(cool_down or "").strip(),
-                    str(notes or "").strip(),
-                    clean_video,
-                    clean_slot,
-                    clean_miles,
-                    int(workout_id),
-                    team_id,
-                ),
-            )
-        database.commit()
 
 
 def delete_team_workout(workout_id, team_id):
@@ -5057,159 +4944,6 @@ def _render_dark_horse_workout_calendar(matrix):
 """.replace("__HEADERS__", headers).replace("__BODY__", "".join(body))
     st.markdown(markup, unsafe_allow_html=True)
 
-def render_dark_horse_calendar_actions(workouts):
-    """Put edit/delete controls directly beneath the Dark Horse calendar.
-
-    Streamlit's custom HTML table cannot send hover events back to Python, so these
-    compact controls are the reliable desktop + mobile equivalent: one button per
-    saved calendar session, with editing and a confirmed delete in a popover.
-    """
-    if not workouts:
-        return
-
-    st.markdown(
-        """
-        <style>
-        .dh-manage-hint{color:#aaa6b0;font-size:12px;margin:8px 0 6px 2px}
-        </style>
-        <div class="dh-manage-hint">Select a saved session to edit or delete it.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Keep the controls in calendar order and compact enough to scan quickly.
-    ordered = sorted(
-        workouts,
-        key=lambda w: (
-            pd.Timestamp(w.get("Date")).date(),
-            0 if str(w.get("Session") or "AM").upper() == "AM" else 1,
-            int(w.get("id") or 0),
-        ),
-    )
-
-    for start_index in range(0, len(ordered), 4):
-        columns = st.columns(4, gap="small")
-        for column, workout in zip(columns, ordered[start_index:start_index + 4]):
-            workout_id = int(workout["id"])
-            day_label = pd.Timestamp(workout["Date"]).strftime("%a")
-            slot = str(workout.get("Session") or "AM").upper()
-            workout_type = workout_value(workout.get("Type"), "Workout")
-            trigger = f"{day_label} {slot} · {workout_type}"
-
-            with column:
-                with st.popover(trigger, use_container_width=True):
-                    st.caption("Edit this calendar session")
-
-                    current_type = workout_value(workout.get("Type"), "Other")
-                    type_options = list(WORKOUT_TYPES)
-                    if current_type not in type_options:
-                        type_options.append(current_type)
-
-                    current_slot = slot if slot in SESSION_SLOTS else "AM"
-                    edit_type = st.selectbox(
-                        "Workout type",
-                        type_options,
-                        index=type_options.index(current_type),
-                        key=f"dh_edit_type_{workout_id}",
-                    )
-                    edit_slot = st.selectbox(
-                        "Session",
-                        SESSION_SLOTS,
-                        index=SESSION_SLOTS.index(current_slot),
-                        key=f"dh_edit_slot_{workout_id}",
-                    )
-                    edit_miles = st.number_input(
-                        "Planned mileage",
-                        min_value=0.0,
-                        max_value=50.0,
-                        value=float(workout.get("Planned Miles") or 0.0),
-                        step=0.5,
-                        key=f"dh_edit_miles_{workout_id}",
-                    )
-                    edit_warmup = st.text_area(
-                        "Warm Up",
-                        value=str(workout.get("Warm Up") or ""),
-                        key=f"dh_edit_wu_{workout_id}",
-                    )
-                    edit_main = st.text_area(
-                        "Main Workout",
-                        value=str(workout.get("Workout") or ""),
-                        key=f"dh_edit_main_{workout_id}",
-                    )
-                    edit_cooldown = st.text_area(
-                        "Cool Down",
-                        value=str(workout.get("Cool Down") or ""),
-                        key=f"dh_edit_cd_{workout_id}",
-                    )
-                    edit_notes = st.text_area(
-                        "Coach Notes",
-                        value=str(workout.get("Notes") or ""),
-                        key=f"dh_edit_notes_{workout_id}",
-                    )
-                    edit_video = st.text_input(
-                        "Coach Video URL",
-                        value=str(workout.get("Video URL") or ""),
-                        key=f"dh_edit_video_{workout_id}",
-                    )
-
-                    save_col, delete_col = st.columns(2)
-                    with save_col:
-                        if st.button(
-                            "Save changes",
-                            type="primary",
-                            use_container_width=True,
-                            key=f"dh_save_edit_{workout_id}",
-                        ):
-                            if not str(edit_main).strip():
-                                st.warning("Add the main workout before saving.")
-                            else:
-                                update_team_workout(
-                                    workout_id=workout_id,
-                                    team_id=active_team,
-                                    workout_type=edit_type,
-                                    warm_up=edit_warmup,
-                                    workout=edit_main,
-                                    cool_down=edit_cooldown,
-                                    notes=edit_notes,
-                                    video_url=edit_video,
-                                    session_slot=edit_slot,
-                                    planned_miles=None if edit_miles == 0 else edit_miles,
-                                )
-                                st.rerun()
-
-                    with delete_col:
-                        confirm_key = f"dh_confirm_delete_{workout_id}"
-                        if not st.session_state.get(confirm_key):
-                            if st.button(
-                                "Delete",
-                                use_container_width=True,
-                                key=f"dh_delete_ask_{workout_id}",
-                            ):
-                                st.session_state[confirm_key] = True
-                                st.rerun()
-                        else:
-                            st.warning("Delete this workout?")
-                            yes_col, no_col = st.columns(2)
-                            with yes_col:
-                                if st.button(
-                                    "Yes, delete",
-                                    type="primary",
-                                    use_container_width=True,
-                                    key=f"dh_delete_yes_{workout_id}",
-                                ):
-                                    delete_team_workout(workout_id, active_team)
-                                    st.session_state.pop(confirm_key, None)
-                                    st.rerun()
-                            with no_col:
-                                if st.button(
-                                    "Cancel",
-                                    use_container_width=True,
-                                    key=f"dh_delete_no_{workout_id}",
-                                ):
-                                    st.session_state.pop(confirm_key, None)
-                                    st.rerun()
-
-
 def render_team_workout_card(workout, athlete_lookup):
     """Detailed saved-session card used inside the management expander."""
     workout_date = pd.Timestamp(workout["Date"])
@@ -5249,7 +4983,7 @@ def render_team_workouts():
         # never write to Neon or modify a live athlete account.
         st.markdown(
             '<div class="team-workout-title">Weekly Training Plan</div>'
-            '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, effort and planned mileage.</div>',
+            '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions and workout details.</div>',
             unsafe_allow_html=True,
         )
 
@@ -5393,23 +5127,6 @@ def render_team_workouts():
             with top_slot:
                 session_slot = st.selectbox("Session", SESSION_SLOTS)
 
-            effort_col, miles_col = st.columns(2)
-            with effort_col:
-                effort_level = st.selectbox(
-                    "Effort (1–10)",
-                    ["—"] + [str(value) for value in range(1, 11)],
-                    help="Optional coach target. Use 1 for very easy and 10 for maximal.",
-                )
-            with miles_col:
-                planned_miles = st.number_input(
-                    "Planned mileage",
-                    min_value=0.0,
-                    max_value=50.0,
-                    value=0.0,
-                    step=0.5,
-                    help="Use 0 if you do not want mileage included for this session.",
-                )
-
             warm_up = st.text_area("Warm Up", placeholder="Example: 2 miles easy + drills")
             main_workout = st.text_area(
                 "Main Workout",
@@ -5445,8 +5162,8 @@ def render_team_workouts():
                     notes,
                     video_url,
                     session_slot=session_slot,
-                    effort_level="" if effort_level == "—" else effort_level,
-                    planned_miles=None if planned_miles == 0 else planned_miles,
+                    effort_level="",
+                    planned_miles=None,
                 )
                 st.success("Workout saved to VEKDYN.")
                 st.rerun()
@@ -5491,7 +5208,6 @@ def render_team_workouts():
     # of forcing the coach to open seven separate cards.
     if active_team == "dark_horse_endurance":
         _render_dark_horse_workout_calendar(matrix)
-        render_dark_horse_calendar_actions(workouts)
     else:
         # Keep all seven day columns (Sun-Sat) visible on normal desktop widths.
         # An explicit pixel width is narrower than Streamlit's "small" preset,
@@ -5510,7 +5226,7 @@ def render_team_workouts():
 
     if not workouts:
         st.info("No sessions are saved for this week yet.")
-    elif active_team != "dark_horse_endurance":
+    else:
         with st.expander("Manage saved sessions", expanded=False):
             for start_index in range(0, len(workouts), 3):
                 row = workouts[start_index:start_index + 3]
@@ -5518,9 +5234,6 @@ def render_team_workouts():
                 for column, workout in zip(columns, row):
                     with column:
                         render_team_workout_card(workout, team_athletes)
-        return
-    else:
-        # Dark Horse manages sessions directly from the calendar controls above.
         return
 
     # No saved sessions to manage. The weekly calendar above can still show
