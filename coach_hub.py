@@ -4811,6 +4811,111 @@ def load_daily_feedback_range(team_id, selected_athlete_key, start_date, end_dat
     }
 
 
+def _infer_distance_miles(text):
+    """Infer distance in miles from common coach workout notation.
+
+    Examples:
+      3 WP -> 3.0
+      2 CD -> 2.0
+      5 x 1 mile -> 5.0
+      8 x 400m -> about 1.99
+      5k -> about 3.11
+
+    Time-only reps such as "5 x 6 min" intentionally add no mileage.
+    """
+    if text is None:
+        return 0.0
+
+    value = str(text).strip().lower()
+    if not value or value == "nan":
+        return 0.0
+
+    # Normalize multiplication symbols and punctuation used in workout notation.
+    value = value.replace("×", "x")
+    total = 0.0
+
+    def to_miles(distance, unit):
+        distance = float(distance)
+        unit = unit.lower()
+        if unit in {"mi", "mile", "miles"}:
+            return distance
+        if unit in {"k", "km", "kilometer", "kilometers", "kilometre", "kilometres"}:
+            return distance * 0.621371
+        if unit in {"m", "meter", "meters", "metre", "metres"}:
+            return distance / 1609.344
+        return 0.0
+
+    # Nested reps, e.g. 2 x (5 x 600m).
+    nested = re.compile(
+        r"(\d+(?:\.\d+)?)\s*x\s*\(\s*(\d+(?:\.\d+)?)\s*x\s*"
+        r"(\d+(?:\.\d+)?)\s*(mi|miles?|km|kilometers?|kilometres?|k|meters?|metres?|m)\s*\)",
+        re.I,
+    )
+    for match in list(nested.finditer(value)):
+        total += float(match.group(1)) * float(match.group(2)) * to_miles(match.group(3), match.group(4))
+    value = nested.sub(" ", value)
+
+    # Standard reps, e.g. 5 x 1 mile or 8 x 400m.
+    reps = re.compile(
+        r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*"
+        r"(mi|miles?|km|kilometers?|kilometres?|k|meters?|metres?|m)\b",
+        re.I,
+    )
+    for match in list(reps.finditer(value)):
+        total += float(match.group(1)) * to_miles(match.group(2), match.group(3))
+    value = reps.sub(" ", value)
+
+    # Standalone explicit distances, e.g. 3 miles easy or 5k tempo.
+    distance = re.compile(
+        r"(?<![\d.])(\d+(?:\.\d+)?)\s*"
+        r"(mi|miles?|km|kilometers?|kilometres?|k|meters?|metres?|m)\b",
+        re.I,
+    )
+    for match in distance.finditer(value):
+        total += to_miles(match.group(1), match.group(2))
+
+    # VEKDYN shorthand currently used by the coach: "3 WP", "2 WU", "2 CD".
+    shorthand = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(wp|wu|cd)\s*", value, re.I)
+    if shorthand:
+        total += float(shorthand.group(1))
+
+    return total
+
+
+def _session_inferred_miles(workout):
+    """Use explicit legacy mileage when present; otherwise infer from workout text."""
+    if workout.get("Planned Miles") is not None:
+        try:
+            return max(0.0, float(workout["Planned Miles"]))
+        except (TypeError, ValueError):
+            pass
+
+    return sum(
+        _infer_distance_miles(workout.get(field))
+        for field in ("Warm Up", "Workout", "Cool Down")
+    )
+
+
+def _effective_workouts_for_calendar(workouts, selected_athlete_key):
+    """Individual session overrides the team session for the same date/AM-PM slot."""
+    grouped = {}
+    for workout in workouts:
+        day = workout.get("Date")
+        if hasattr(day, "date"):
+            day = day.date()
+        slot = str(workout.get("Session") or "AM").upper()
+        key = (day, slot)
+        grouped.setdefault(key, []).append(workout)
+
+    effective = []
+    for items in grouped.values():
+        individual = [item for item in items if item.get("athlete_key") == selected_athlete_key]
+        team = [item for item in items if not item.get("athlete_key")]
+        # If an athlete-specific workout exists, it replaces the team default.
+        effective.extend(individual if individual else team)
+    return effective
+
+
 def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
     """Build the Sunday-Saturday matrix shown to the coach."""
     dates = [week_start + timedelta(days=i) for i in range(7)]
@@ -4826,20 +4931,8 @@ def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
         if (day, slot) in by_day_slot:
             by_day_slot[(day, slot)].append(workout)
 
-    def effective_sessions(day, slot):
-        """Use an athlete-specific session as an override of the team default."""
-        sessions = by_day_slot[(day, slot)]
-        if not sessions:
-            return []
-
-        # load_team_workouts_range() returns both the team workout (athlete_key=None)
-        # and the selected athlete's workout. If an individual workout exists for
-        # this day/session, show only that workout; otherwise inherit the team one.
-        individual_sessions = [item for item in sessions if item.get("athlete_key")]
-        return individual_sessions if individual_sessions else sessions
-
     def join_for(day, slot, field):
-        sessions = effective_sessions(day, slot)
+        sessions = by_day_slot[(day, slot)]
         if not sessions:
             return "—"
         if field == "title":
@@ -4863,12 +4956,12 @@ def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
     daily_miles = []
     for day in dates:
         miles = [
-            float(item["Planned Miles"])
+            _session_inferred_miles(item)
             for slot in SESSION_SLOTS
-            for item in effective_sessions(day, slot)
-            if item.get("Planned Miles") is not None
+            for item in by_day_slot[(day, slot)]
         ]
-        daily_miles.append(round(sum(miles), 1) if miles else None)
+        inferred_total = sum(miles)
+        daily_miles.append(round(inferred_total, 1) if inferred_total > 0 else None)
 
     rows["Total Day Mileage"] = [
         f"{value:g}" if value is not None else "—"
@@ -4995,7 +5088,7 @@ def render_team_workouts():
         # never write to Neon or modify a live athlete account.
         st.markdown(
             '<div class="team-workout-title">Weekly Training Plan</div>'
-            '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, effort and planned mileage.</div>',
+            '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions and automatically calculated mileage.</div>',
             unsafe_allow_html=True,
         )
 
@@ -5082,7 +5175,7 @@ def render_team_workouts():
         return
     st.markdown(
         '<div class="team-workout-title">Weekly Training Plan</div>'
-        '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, effort and planned mileage.</div>',
+        '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions and automatically calculated mileage.</div>',
         unsafe_allow_html=True,
     )
 
@@ -5139,23 +5232,6 @@ def render_team_workouts():
             with top_slot:
                 session_slot = st.selectbox("Session", SESSION_SLOTS)
 
-            effort_col, miles_col = st.columns(2)
-            with effort_col:
-                effort_level = st.selectbox(
-                    "Effort (1–10)",
-                    ["—"] + [str(value) for value in range(1, 11)],
-                    help="Optional coach target. Use 1 for very easy and 10 for maximal.",
-                )
-            with miles_col:
-                planned_miles = st.number_input(
-                    "Planned mileage",
-                    min_value=0.0,
-                    max_value=50.0,
-                    value=0.0,
-                    step=0.5,
-                    help="Use 0 if you do not want mileage included for this session.",
-                )
-
             warm_up = st.text_area("Warm Up", placeholder="Example: 2 miles easy + drills")
             main_workout = st.text_area(
                 "Main Workout",
@@ -5191,8 +5267,8 @@ def render_team_workouts():
                     notes,
                     video_url,
                     session_slot=session_slot,
-                    effort_level="" if effort_level == "—" else effort_level,
-                    planned_miles=None if planned_miles == 0 else planned_miles,
+                    effort_level="",
+                    planned_miles=None,
                 )
                 st.success("Workout saved to VEKDYN.")
                 st.rerun()
@@ -5221,8 +5297,9 @@ def render_team_workouts():
         athlete_feedback = {}
         st.warning(f"VEKDYN could not load athlete day feedback: {error}")
 
+    calendar_workouts = _effective_workouts_for_calendar(workouts, athlete_key)
     matrix, weekly_miles = _weekly_workout_matrix(
-        workouts,
+        calendar_workouts,
         week_start,
         athlete_feedback=athlete_feedback,
     )
