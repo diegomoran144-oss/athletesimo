@@ -3097,39 +3097,43 @@ def workout_day_value(workout):
 
 
 def render_day_picker(week_start, workouts, selected_day, key_prefix):
-    """Render a true seven-cell HTML grid so mobile browsers can never wrap the week."""
+    """Switch days without browser navigation, preserving the logged-in Streamlit session.
+
+    The old version used raw <a href="?..."> links. Safari treats those as a page
+    navigation, which can create a fresh Streamlit session and send the athlete
+    through authentication again. Native Streamlit buttons only rerun the current
+    session, so changing days can no longer log the athlete out.
+    """
     workout_dates = {workout_day_value(item) for item in workouts}
     days = [week_start + timedelta(days=i) for i in range(7)]
 
-    requested = st.query_params.get("day")
-    if isinstance(requested, list):
-        requested = requested[0] if requested else None
-    if requested:
-        try:
-            requested_day = date.fromisoformat(str(requested))
-            if requested_day in days:
-                selected_day = requested_day
-        except ValueError:
-            pass
+    # Keep selection entirely in session_state. Query parameters are not needed
+    # for ordinary week-day switching and therefore cannot disturb auth state.
+    state_key = f"{key_prefix}_selected_date"
+    if state_key not in st.session_state or st.session_state[state_key] not in days:
+        st.session_state[state_key] = selected_day if selected_day in days else days[0]
 
-    session_token = browser_session_token()
-    cells = []
-    for day_value in days:
-        params = {"day": day_value.isoformat()}
-        if session_token:
-            params["session"] = session_token
-        href = "?" + urlencode(params)
-        active = " active" if day_value == selected_day else ""
-        dot = '<span class="week-dot"></span>' if day_value in workout_dates else ""
-        cells.append(
-            f'<a class="week-day{active}" href="{href}">'
-            f'<span class="week-dow">{day_value.strftime("%a")}</span>'
-            f'<span class="week-num">{day_value.day}{dot}</span></a>'
-        )
+    selected_day = st.session_state[state_key]
+    columns = st.columns(7, gap="small")
 
-    st.markdown('<div class="week-grid">' + "".join(cells) + '</div>', unsafe_allow_html=True)
+    for column, day_value in zip(columns, days):
+        has_workout = day_value in workout_dates
+        marker = " •" if has_workout else ""
+        label = f"{day_value.strftime('%a')}\n{day_value.day}{marker}"
+        button_type = "primary" if day_value == selected_day else "secondary"
+
+        with column:
+            if st.button(
+                label,
+                key=f"{key_prefix}_{day_value.isoformat()}",
+                type=button_type,
+                use_container_width=True,
+            ):
+                st.session_state[state_key] = day_value
+                st.session_state.home_selected_date = day_value
+                selected_day = day_value
+
     return selected_day
-
 
 def render_selected_day_workouts(workouts, selected_day):
     """Show only the workout(s) for the day the athlete selected."""
