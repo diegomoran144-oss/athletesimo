@@ -1483,7 +1483,7 @@ def load_latest_coros_recovery(athlete_key):
 
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 # Direct activity polling is intentionally disabled for Strava review compliance.
-STRAVA_ACTIVITIES_URL = None
+STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 
 STRAVA_REDIRECT_URI = "https://vekdyn.streamlit.app"
@@ -2046,14 +2046,59 @@ def get_valid_strava_token(athlete_key):
     return refresh_strava_token(athlete_key)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def get_strava_training_data(access_token, number_of_weeks=8):
-    """Strava activity polling is disabled.
+    """Fetch recent runs for one authenticated Strava athlete and aggregate weekly mileage.
 
-    Existing OAuth connections/tokens remain intact in Neon. Activity updates
-    should enter VEKDYN through the Strava webhook/cache path before this
-    display is re-enabled. This function intentionally performs no Strava GET.
+    Cached for 15 minutes so normal Streamlit reruns do not repeatedly consume
+    Strava read requests. The access token itself determines which athlete is read.
     """
-    return pd.DataFrame(columns=["Week", "Mileage"]), {}
+    now = datetime.now(timezone.utc)
+    after_dt = now - timedelta(weeks=number_of_weeks, days=7)
+    response = requests.get(
+        STRAVA_ACTIVITIES_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"after": int(after_dt.timestamp()), "per_page": 100, "page": 1},
+        timeout=20,
+    )
+    response.raise_for_status()
+    activities = response.json()
+
+    week_totals = {}
+    max_hr = None
+    max_hr_date = None
+    for activity in activities:
+        sport = str(activity.get("sport_type") or activity.get("type") or "")
+        if sport not in {"Run", "TrailRun", "VirtualRun"}:
+            continue
+        started = activity.get("start_date_local") or activity.get("start_date")
+        if not started:
+            continue
+        try:
+            activity_day = datetime.fromisoformat(str(started).replace("Z", "+00:00")).date()
+        except ValueError:
+            continue
+        week_start = activity_day - timedelta(days=activity_day.weekday())
+        miles = float(activity.get("distance") or 0) / 1609.344
+        week_totals[week_start] = week_totals.get(week_start, 0.0) + miles
+
+        activity_hr = activity.get("max_heartrate")
+        if activity_hr is not None and (max_hr is None or float(activity_hr) > max_hr):
+            max_hr = float(activity_hr)
+            max_hr_date = activity_day.strftime("%b %d, %Y")
+
+    current_week = now.date() - timedelta(days=now.date().weekday())
+    weeks = [current_week - timedelta(weeks=i) for i in reversed(range(number_of_weeks))]
+    volume = pd.DataFrame({
+        "Week": [week.strftime("%b %d") for week in weeks],
+        "Mileage": [round(week_totals.get(week, 0.0), 2) for week in weeks],
+    })
+    heart = {
+        "max_heart_rate": round(max_hr) if max_hr is not None else None,
+        "max_heart_rate_date": max_hr_date,
+        "last_updated": now.strftime("%b %d, %Y %I:%M %p UTC"),
+    }
+    return volume, heart
 
 def dictionary_weekly_mileage(training):
     return pd.DataFrame(
@@ -3410,9 +3455,16 @@ error_session_key = f"strava_error_{athlete_key}"
 coros_message_key = f"coros_message_{athlete_key}"
 coros_error_key = f"coros_error_{athlete_key}"
 
-# Never display stale Strava activity cache while VEKDYN is in webhook transition.
-st.session_state.pop(weekly_session_key, None)
-st.session_state.pop(heart_session_key, None)
+# Strava reads are cached for 15 minutes. Keep each athlete's data isolated by key.
+if active_team != DEMO_TEAM_ID and strava_is_connected(athlete_key):
+    try:
+        _token = get_valid_strava_token(athlete_key)
+        _weekly, _heart = get_strava_training_data(_token, number_of_weeks=8)
+        st.session_state[weekly_session_key] = _weekly
+        st.session_state[heart_session_key] = _heart
+        st.session_state.pop(error_session_key, None)
+    except Exception as _strava_error:
+        st.session_state[error_session_key] = str(_strava_error)
 
 # =========================================================
 # FAST DASHBOARD READ CACHE
@@ -3768,11 +3820,21 @@ if dashboard_view == "Training":
                         )
 
                 with graph_col:
-                    st.info(
-                        "Strava training-volume chart is temporarily disabled while "
-                        "VEKDYN transitions activity updates to webhooks. Existing "
-                        "athlete connections remain preserved."
+                    chart_data = volume_data.copy()
+                    chart_data["Mileage"] = pd.to_numeric(chart_data["Mileage"], errors="coerce").fillna(0.0)
+                    chart = (
+                        alt.Chart(chart_data)
+                        .mark_line(point=True)
+                        .encode(
+                            x=alt.X("Week:N", sort=None, title="Week"),
+                            y=alt.Y("Mileage:Q", title="Miles", scale=alt.Scale(zero=True)),
+                            tooltip=[alt.Tooltip("Week:N"), alt.Tooltip("Mileage:Q", format=".1f")],
+                        )
+                        .properties(height=250)
                     )
+                    st.altair_chart(chart, use_container_width=True)
+                    if st.session_state.get(error_session_key):
+                        st.caption("Strava sync issue: " + st.session_state[error_session_key])
 
     with recovery_card:
         with st.container(border=True):
