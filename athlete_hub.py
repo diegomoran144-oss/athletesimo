@@ -3460,6 +3460,52 @@ def render_connections_page():
     if st.session_state.pop("coros_sync_success", False):
         st.success("COROS recovery data synced to VEKDYN ✓")
 
+    # Temporary COROS diagnostic: show exactly what VEKDYN has stored in Neon.
+    # This does not expose OAuth/access tokens or modify Strava/calendar behavior.
+    if coros_connection:
+        with st.expander("COROS diagnostic", expanded=False):
+            try:
+                with get_database_connection() as diagnostic_db:
+                    with diagnostic_db.cursor() as diagnostic_cursor:
+                        diagnostic_cursor.execute(
+                            """
+                            SELECT recovery_date, sleep_minutes, sleep_score, hrv_avg,
+                                   hrv_baseline, resting_hr, vekdyn_recovery_score, updated_at
+                            FROM coros_recovery_daily
+                            WHERE athlete_key = %s
+                            ORDER BY recovery_date DESC
+                            LIMIT 7
+                            """,
+                            (athlete_key,),
+                        )
+                        diagnostic_rows = diagnostic_cursor.fetchall()
+
+                st.caption(f"Athlete key: {athlete_key}")
+                if diagnostic_rows:
+                    diagnostic_df = pd.DataFrame(
+                        diagnostic_rows,
+                        columns=[
+                            "Date", "Sleep min", "Sleep score", "HRV avg",
+                            "HRV baseline", "Resting HR", "VEKDYN recovery", "Updated at"
+                        ],
+                    )
+                    st.dataframe(diagnostic_df, use_container_width=True, hide_index=True)
+                    populated = {
+                        "sleep": sum(row[1] is not None for row in diagnostic_rows),
+                        "hrv": sum(row[3] is not None for row in diagnostic_rows),
+                        "resting_hr": sum(row[5] is not None for row in diagnostic_rows),
+                    }
+                    st.caption(
+                        f"Stored rows: {len(diagnostic_rows)} · "
+                        f"sleep values: {populated['sleep']} · "
+                        f"HRV values: {populated['hrv']} · "
+                        f"resting-HR values: {populated['resting_hr']}"
+                    )
+                else:
+                    st.warning("COROS is connected, but no recovery rows are stored for this athlete key.")
+            except Exception as diagnostic_error:
+                st.warning(f"COROS diagnostic could not read Neon: {diagnostic_error}")
+
     if st.session_state.get("coros_sync_error"):
         st.warning(
             "COROS sync: "
