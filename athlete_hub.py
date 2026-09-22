@@ -1438,24 +1438,30 @@ def revoke_persistent_athlete_session(raw_token):
 
 
 def browser_session_token():
-    """
-    Read the persistent token from the URL.
+    """Return the persistent athlete token without losing it on calendar clicks.
 
-    Streamlit session_state disappears on a hard browser refresh, while
-    query parameters remain. The token itself is random and its hash is
-    the only value stored in Neon.
+    Prefer the URL token because it survives a brand-new Streamlit session, but
+    keep a session_state copy as a fallback for internal reruns/navigation.
     """
     token = st.query_params.get("session")
 
     if isinstance(token, list):
         token = token[0] if token else None
 
-    return str(token).strip() if token else None
+    if token:
+        clean_token = str(token).strip()
+        st.session_state["persistent_athlete_session"] = clean_token
+        return clean_token
+
+    cached_token = st.session_state.get("persistent_athlete_session")
+    return str(cached_token).strip() if cached_token else None
 
 
 def set_browser_session_token(raw_token):
     if raw_token:
-        st.query_params["session"] = raw_token
+        clean_token = str(raw_token).strip()
+        st.session_state["persistent_athlete_session"] = clean_token
+        st.query_params["session"] = clean_token
 
 
 def clear_oauth_params_keep_session():
@@ -3076,6 +3082,7 @@ def athlete_logout():
 
     st.session_state["logged_in"] = False
     st.session_state["just_logged_out"] = True
+    st.session_state.pop("persistent_athlete_session", None)
 
     # Remove athlete/coach/unified persistence tokens and explicitly tell
     # vekdyn_unified.py this rerun is an intentional logout.
