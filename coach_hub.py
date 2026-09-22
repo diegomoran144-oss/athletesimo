@@ -1032,6 +1032,10 @@ def initialize_coros_database():
                 ADD COLUMN IF NOT EXISTS sleep_hr_avg INTEGER""")
             c.execute("""ALTER TABLE coros_recovery_daily
                 ADD COLUMN IF NOT EXISTS sleep_hr_baseline INTEGER""")
+            c.execute("""ALTER TABLE coros_recovery_daily
+                ADD COLUMN IF NOT EXISTS resting_hr INTEGER""")
+            c.execute("""ALTER TABLE coros_recovery_daily
+                ADD COLUMN IF NOT EXISTS vekdyn_recovery_score INTEGER""")
         db.commit()
 
 
@@ -1454,26 +1458,40 @@ def sync_coros_recovery(athlete_key):
 
 
 def load_latest_coros_recovery(athlete_key):
+    """Load the newest recorded COROS value for each recovery metric.
+
+    Athlete Hub can write sleep, HRV and resting HR on different dates, so the
+    Coach Hub must not require every metric to exist on the single newest row.
+    """
     initialize_coros_database()
     with get_database_connection() as db:
         with db.cursor() as c:
             c.execute(
-                """SELECT recovery_date,sleep_minutes,sleep_score,hrv_avg,hrv_baseline,
-                          hrv_normal_low,hrv_normal_high,hrv_status,recovery_score,
-                          sleep_hr_avg,sleep_hr_baseline
-                   FROM coros_recovery_daily
-                   WHERE athlete_key=%s
-                   ORDER BY recovery_date DESC LIMIT 1""",
-                (athlete_key,),
+                """
+                SELECT
+                    (SELECT recovery_date FROM coros_recovery_daily WHERE athlete_key=%s AND (sleep_minutes IS NOT NULL OR hrv_avg IS NOT NULL OR resting_hr IS NOT NULL OR sleep_hr_avg IS NOT NULL) ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT sleep_minutes FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_minutes IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT sleep_score FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_score IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_avg FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_normal_low FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_low IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_normal_high FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_high IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_status FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_status IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT COALESCE(vekdyn_recovery_score,recovery_score) FROM coros_recovery_daily WHERE athlete_key=%s AND COALESCE(vekdyn_recovery_score,recovery_score) IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT sleep_hr_avg FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_hr_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT sleep_hr_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_hr_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT resting_hr FROM coros_recovery_daily WHERE athlete_key=%s AND resting_hr IS NOT NULL ORDER BY recovery_date DESC LIMIT 1)
+                """,
+                (athlete_key,) * 12,
             )
             r = c.fetchone()
-    if not r:
+    if not r or not any(value is not None for value in r):
         return {}
     return {
-        "date": r[0], "sleep_minutes": r[1], "sleep_score": r[2], "hrv_avg": r[3],
-        "hrv_baseline": r[4], "hrv_normal_low": r[5], "hrv_normal_high": r[6],
-        "hrv_status": r[7], "recovery_score": r[8], "sleep_hr_avg": r[9],
-        "sleep_hr_baseline": r[10],
+        "date": r[0], "sleep_minutes": r[1], "sleep_score": r[2],
+        "hrv_avg": r[3], "hrv_baseline": r[4], "hrv_normal_low": r[5],
+        "hrv_normal_high": r[6], "hrv_status": r[7], "recovery_score": r[8],
+        "sleep_hr_avg": r[9], "sleep_hr_baseline": r[10], "resting_hr": r[11],
     }
 
 
@@ -3873,6 +3891,8 @@ if dashboard_view == "Training":
 
             with sleep_left:
                 sleep_hr_value = coros_recovery.get("sleep_hr_avg")
+                if sleep_hr_value is None:
+                    sleep_hr_value = coros_recovery.get("resting_hr")
                 st.metric(
                     "Average Sleeping HR",
                     f"{sleep_hr_value} bpm" if sleep_hr_value is not None else "—",
@@ -5741,8 +5761,10 @@ if dashboard_view == "Dashboard":
         194
         if active_team == DEMO_TEAM_ID
         else live_heart_rate.get("max_heart_rate", "—")
-    )  # Live athlete max HR comes from the existing Strava activity data.
+    )
     resting_hr = coros_recovery.get("sleep_hr_avg")
+    if resting_hr is None:
+        resting_hr = coros_recovery.get("resting_hr")
     sleep_minutes = coros_recovery.get("sleep_minutes")
     hrv_value = coros_recovery.get("hrv_avg")
 
