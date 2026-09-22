@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import bcrypt
 import psycopg2
 import requests
+import pandas as pd
 import streamlit as st
 from pathlib import Path
 
@@ -211,6 +212,62 @@ def get_valid_strava_token(athlete_key):
     if connection.get("access_token") and connection.get("expires_at", 0) > time.time() + 60:
         return connection["access_token"]
     return refresh_strava_token(athlete_key)
+
+STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_athlete_strava_weekly(access_token, number_of_weeks=8):
+    """Return weekly running mileage for the athlete represented by this token."""
+    today = date.today()
+    after_day = today - timedelta(weeks=number_of_weeks, days=7)
+    response = requests.get(
+        STRAVA_ACTIVITIES_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"after": int(time.mktime(after_day.timetuple())), "per_page": 100, "page": 1},
+        timeout=20,
+    )
+    response.raise_for_status()
+    totals = {}
+    for activity in response.json():
+        sport = str(activity.get("sport_type") or activity.get("type") or "")
+        if sport not in {"Run", "TrailRun", "VirtualRun"}:
+            continue
+        started = activity.get("start_date_local") or activity.get("start_date")
+        if not started:
+            continue
+        try:
+            activity_day = date.fromisoformat(str(started)[:10])
+        except ValueError:
+            continue
+        week_start = activity_day - timedelta(days=activity_day.weekday())
+        totals[week_start] = totals.get(week_start, 0.0) + float(activity.get("distance") or 0) / 1609.344
+
+    current_week = today - timedelta(days=today.weekday())
+    weeks = [current_week - timedelta(weeks=i) for i in reversed(range(number_of_weeks))]
+    return pd.DataFrame({
+        "Week": [week.strftime("%b %d") for week in weeks],
+        "Mileage": [round(totals.get(week, 0.0), 2) for week in weeks],
+    })
+
+def render_strava_volume_chart(athlete_key):
+    """Athlete-facing 8-week mileage chart, isolated to the logged-in athlete."""
+    connection = load_saved_strava_connection(athlete_key)
+    if not connection:
+        st.info("Connect Strava in Connections to see your training-volume chart.")
+        return
+    try:
+        token = get_valid_strava_token(athlete_key)
+        weekly = get_athlete_strava_weekly(token, 8)
+    except Exception as error:
+        st.warning(f"Strava training data could not be loaded: {error}")
+        return
+    if weekly.empty:
+        st.info("No recent Strava running data is available yet.")
+        return
+    current = float(weekly["Mileage"].iloc[-1])
+    st.metric("This week", f"{current:.1f} mi")
+    st.line_chart(weekly.set_index("Week")[["Mileage"]], height=260)
+    st.caption("Last 8 weeks · Strava")
 
 def handle_strava_callback():
     code = st.query_params.get("code")
@@ -3634,6 +3691,10 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
 if active_nav == "Training":
     st.header("Training")
     st.caption("Your full training block. Tap any workout day to open its sessions.")
+
+    with st.container(border=True):
+        st.subheader("Weekly Training Volume")
+        render_strava_volume_chart(athlete["athlete_key"])
 
     today = date.today()
     first_month = date(today.year, today.month, 1)
