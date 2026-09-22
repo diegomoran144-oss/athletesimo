@@ -3097,41 +3097,35 @@ def workout_day_value(workout):
 
 
 def render_day_picker(week_start, workouts, selected_day, key_prefix):
-    """Switch days without browser navigation, preserving the logged-in Streamlit session.
-
-    The old version used raw <a href="?..."> links. Safari treats those as a page
-    navigation, which can create a fresh Streamlit session and send the athlete
-    through authentication again. Native Streamlit buttons only rerun the current
-    session, so changing days can no longer log the athlete out.
-    """
+    """Final-Surge-style seven-day strip without browser navigation/logout."""
     workout_dates = {workout_day_value(item) for item in workouts}
     days = [week_start + timedelta(days=i) for i in range(7)]
 
-    # Keep selection entirely in session_state. Query parameters are not needed
-    # for ordinary week-day switching and therefore cannot disturb auth state.
     state_key = f"{key_prefix}_selected_date"
     if state_key not in st.session_state or st.session_state[state_key] not in days:
         st.session_state[state_key] = selected_day if selected_day in days else days[0]
 
     selected_day = st.session_state[state_key]
-    columns = st.columns(7, gap="small")
 
+    # Native Streamlit buttons preserve the active login/session. CSS below
+    # makes them look like the compact Final Surge day strip instead of large buttons.
+    st.markdown('<div class="fs-week-strip-anchor"></div>', unsafe_allow_html=True)
+    columns = st.columns(7, gap="small")
     for column, day_value in zip(columns, days):
         has_workout = day_value in workout_dates
-        marker = " •" if has_workout else ""
-        label = f"{day_value.strftime('%a')}\n{day_value.day}{marker}"
-        button_type = "primary" if day_value == selected_day else "secondary"
-
+        dot = " •" if has_workout else ""
+        label = f"{day_value.strftime('%a')}\n{day_value.day}{dot}"
         with column:
             if st.button(
                 label,
                 key=f"{key_prefix}_{day_value.isoformat()}",
-                type=button_type,
+                type="primary" if day_value == selected_day else "secondary",
                 use_container_width=True,
             ):
                 st.session_state[state_key] = day_value
                 st.session_state.home_selected_date = day_value
                 selected_day = day_value
+                st.rerun()
 
     return selected_day
 
