@@ -1483,7 +1483,7 @@ def load_latest_coros_recovery(athlete_key):
 
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 # Direct activity polling is intentionally disabled for Strava review compliance.
-STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+STRAVA_ACTIVITIES_URL = None
 STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 
 STRAVA_REDIRECT_URI = "https://vekdyn.streamlit.app"
@@ -2048,57 +2048,74 @@ def get_valid_strava_token(athlete_key):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_strava_training_data(access_token, number_of_weeks=8):
-    """Fetch recent runs for one authenticated Strava athlete and aggregate weekly mileage.
+    """Load recent run activities for the authenticated Strava athlete.
 
-    Cached for 15 minutes so normal Streamlit reruns do not repeatedly consume
-    Strava read requests. The access token itself determines which athlete is read.
+    Results are cached for 15 minutes so Streamlit reruns do not repeatedly
+    consume Strava read requests. Returns an 8-week mileage frame plus a small
+    heart-rate summary used by the coach dashboard.
     """
-    now = datetime.now(timezone.utc)
-    after_dt = now - timedelta(weeks=number_of_weeks, days=7)
-    response = requests.get(
-        STRAVA_ACTIVITIES_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={"after": int(after_dt.timestamp()), "per_page": 100, "page": 1},
-        timeout=20,
-    )
-    response.raise_for_status()
-    activities = response.json()
+    number_of_weeks = max(1, min(int(number_of_weeks), 12))
+    today = datetime.now(ZoneInfo("America/Chicago")).date()
+    current_monday = today - timedelta(days=today.weekday())
+    first_monday = current_monday - timedelta(weeks=number_of_weeks - 1)
+    after_ts = int(datetime.combine(first_monday, datetime.min.time(), tzinfo=ZoneInfo("America/Chicago")).timestamp())
 
-    week_totals = {}
+    activities = []
+    page = 1
+    while page <= 4:
+        response = requests.get(
+            "https://www.strava.com/api/v3/athlete/activities",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"after": after_ts, "page": page, "per_page": 100},
+            timeout=20,
+        )
+        response.raise_for_status()
+        batch = response.json()
+        if not isinstance(batch, list):
+            raise RuntimeError("Strava returned an unexpected activities response.")
+        activities.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+
+    weekly = {first_monday + timedelta(weeks=i): 0.0 for i in range(number_of_weeks)}
     max_hr = None
     max_hr_date = None
+
     for activity in activities:
-        sport = str(activity.get("sport_type") or activity.get("type") or "")
-        if sport not in {"Run", "TrailRun", "VirtualRun"}:
+        if str(activity.get("type", "")).lower() not in {"run", "trailrun", "virtualrun"}:
             continue
-        started = activity.get("start_date_local") or activity.get("start_date")
-        if not started:
+        raw_date = activity.get("start_date_local") or activity.get("start_date")
+        if not raw_date:
             continue
         try:
-            activity_day = datetime.fromisoformat(str(started).replace("Z", "+00:00")).date()
+            activity_date = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00")).date()
         except ValueError:
             continue
-        week_start = activity_day - timedelta(days=activity_day.weekday())
-        miles = float(activity.get("distance") or 0) / 1609.344
-        week_totals[week_start] = week_totals.get(week_start, 0.0) + miles
+        week = activity_date - timedelta(days=activity_date.weekday())
+        if week in weekly:
+            weekly[week] += float(activity.get("distance") or 0.0) / 1609.344
 
-        activity_hr = activity.get("max_heartrate")
-        if activity_hr is not None and (max_hr is None or float(activity_hr) > max_hr):
-            max_hr = float(activity_hr)
-            max_hr_date = activity_day.strftime("%b %d, %Y")
+        activity_max_hr = activity.get("max_heartrate")
+        if activity_max_hr is not None:
+            try:
+                activity_max_hr = float(activity_max_hr)
+                if max_hr is None or activity_max_hr > max_hr:
+                    max_hr = activity_max_hr
+                    max_hr_date = activity_date.strftime("%b %d, %Y")
+            except (TypeError, ValueError):
+                pass
 
-    current_week = now.date() - timedelta(days=now.date().weekday())
-    weeks = [current_week - timedelta(weeks=i) for i in reversed(range(number_of_weeks))]
-    volume = pd.DataFrame({
-        "Week": [week.strftime("%b %d") for week in weeks],
-        "Mileage": [round(week_totals.get(week, 0.0), 2) for week in weeks],
-    })
+    frame = pd.DataFrame([
+        {"Week": week.strftime("%b %d"), "Mileage": round(miles, 2)}
+        for week, miles in sorted(weekly.items())
+    ])
     heart = {
-        "max_heart_rate": round(max_hr) if max_hr is not None else None,
+        "max_heart_rate": int(round(max_hr)) if max_hr is not None else None,
         "max_heart_rate_date": max_hr_date,
-        "last_updated": now.strftime("%b %d, %Y %I:%M %p UTC"),
+        "last_updated": datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p UTC"),
     }
-    return volume, heart
+    return frame, heart
 
 def dictionary_weekly_mileage(training):
     return pd.DataFrame(
@@ -3455,16 +3472,9 @@ error_session_key = f"strava_error_{athlete_key}"
 coros_message_key = f"coros_message_{athlete_key}"
 coros_error_key = f"coros_error_{athlete_key}"
 
-# Strava reads are cached for 15 minutes. Keep each athlete's data isolated by key.
-if active_team != DEMO_TEAM_ID and strava_is_connected(athlete_key):
-    try:
-        _token = get_valid_strava_token(athlete_key)
-        _weekly, _heart = get_strava_training_data(_token, number_of_weeks=8)
-        st.session_state[weekly_session_key] = _weekly
-        st.session_state[heart_session_key] = _heart
-        st.session_state.pop(error_session_key, None)
-    except Exception as _strava_error:
-        st.session_state[error_session_key] = str(_strava_error)
+# Never display stale Strava activity cache while VEKDYN is in webhook transition.
+st.session_state.pop(weekly_session_key, None)
+st.session_state.pop(heart_session_key, None)
 
 # =========================================================
 # FAST DASHBOARD READ CACHE
@@ -3512,7 +3522,7 @@ else:
         # pay for COROS/Neon reads just because Streamlit reran during navigation.
         coros_recovery = (
             cached_latest_coros_recovery(athlete_key)
-            if dashboard_view == "Dashboard" and cached_coros_is_connected(athlete_key)
+            if dashboard_view in {"Dashboard", "Training"} and cached_coros_is_connected(athlete_key)
             else {}
         )
     except Exception:
@@ -3532,6 +3542,20 @@ volume_source = "No live data"
 
 weekly_session_key = f"{athlete_key}_strava_weekly"
 heart_session_key = f"{athlete_key}_strava_heart_rate"
+
+# Refresh the selected athlete's Strava summary on Dashboard/Training. The
+# request itself is cached for 15 minutes by get_strava_training_data().
+if active_team != DEMO_TEAM_ID and dashboard_view in {"Dashboard", "Training"}:
+    try:
+        if strava_is_connected(athlete_key):
+            strava_token = get_valid_strava_token(athlete_key)
+            if strava_token:
+                fresh_volume, fresh_heart = get_strava_training_data(strava_token, 8)
+                st.session_state[weekly_session_key] = fresh_volume
+                st.session_state[heart_session_key] = fresh_heart
+    except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
+        # Preserve the last successful cached/session data if Strava is briefly unavailable.
+        st.session_state.setdefault(f"{athlete_key}_strava_sync_error", str(error))
 
 if weekly_session_key in st.session_state:
     strava_volume = st.session_state[weekly_session_key]
@@ -3822,19 +3846,18 @@ if dashboard_view == "Training":
                 with graph_col:
                     chart_data = volume_data.copy()
                     chart_data["Mileage"] = pd.to_numeric(chart_data["Mileage"], errors="coerce").fillna(0.0)
-                    chart = (
+                    chart_data["Order"] = range(len(chart_data))
+                    mileage_chart = (
                         alt.Chart(chart_data)
-                        .mark_line(point=True)
+                        .mark_line(point=True, strokeWidth=3)
                         .encode(
-                            x=alt.X("Week:N", sort=None, title="Week"),
+                            x=alt.X("Week:N", sort=alt.SortField("Order"), title="Week"),
                             y=alt.Y("Mileage:Q", title="Miles", scale=alt.Scale(zero=True)),
                             tooltip=[alt.Tooltip("Week:N"), alt.Tooltip("Mileage:Q", format=".1f")],
                         )
-                        .properties(height=250)
+                        .properties(height=230)
                     )
-                    st.altair_chart(chart, use_container_width=True)
-                    if st.session_state.get(error_session_key):
-                        st.caption("Strava sync issue: " + st.session_state[error_session_key])
+                    st.altair_chart(mileage_chart, use_container_width=True)
 
     with recovery_card:
         with st.container(border=True):
@@ -3852,7 +3875,7 @@ if dashboard_view == "Training":
                 sleep_hr_value = coros_recovery.get("sleep_hr_avg")
                 st.metric(
                     "Average Sleeping HR",
-                    f"{sleep_hr_value} bpm" if sleep_hr_value is not None else "None",
+                    f"{sleep_hr_value} bpm" if sleep_hr_value is not None else "—",
                 )
                 if coros_recovery.get("sleep_hr_baseline") is not None:
                     st.caption(f"7-day sleeping-HR baseline: {coros_recovery['sleep_hr_baseline']} bpm")
@@ -3863,7 +3886,7 @@ if dashboard_view == "Training":
                 coros_sleep_minutes = coros_recovery.get("sleep_minutes")
                 sleep_display = (
                     f"{coros_sleep_minutes // 60}h {coros_sleep_minutes % 60}m"
-                    if coros_sleep_minutes is not None else "None"
+                    if coros_sleep_minutes is not None else "—"
                 )
                 st.metric("Sleep Time", sleep_display)
                 if coros_recovery.get("sleep_score") is not None:
@@ -3877,7 +3900,7 @@ if dashboard_view == "Training":
                 hrv_value = coros_recovery.get("hrv_avg")
                 st.metric(
                     "Average HRV",
-                    f"{hrv_value} ms" if hrv_value is not None else "None",
+                    f"{hrv_value} ms" if hrv_value is not None else "—",
                 )
                 if coros_recovery.get("hrv_status"):
                     detail = f"COROS: {coros_recovery['hrv_status']}"
@@ -3890,7 +3913,7 @@ if dashboard_view == "Training":
 
             with recovery_right:
                 recovery_score = coros_recovery.get("recovery_score")
-                recovery_display = f"{recovery_score}%" if recovery_score is not None else "None"
+                recovery_display = f"{recovery_score}%" if recovery_score is not None else "—"
                 st.metric("VEKDYN Recovery Score", recovery_display)
                 if recovery_score is not None:
                     st.caption("Sleep + individualized HRV + average sleeping HR")
@@ -5768,15 +5791,11 @@ if dashboard_view == "Dashboard":
             st.markdown(f"### {hrv_value if hrv_value is not None else '—'} ms")
 
 # =========================================================
-# TRAINING VOLUME TAB — STRAVA CHART PAUSED FOR API REVIEW
+# TRAINING VOLUME — PLANNED WEEK SUMMARY
 # =========================================================
 
 if dashboard_view == "Training":
-    st.subheader("Training Volume")
-    st.info(
-        "The Strava training-volume chart is temporarily disabled while VEKDYN "
-        "moves activity updates to webhooks. Existing Strava authorizations remain connected."
-    )
+    st.subheader("Planned Training")
     try:
         if active_team == DEMO_TEAM_ID:
             st.metric("Planned Week", "72 mi")
