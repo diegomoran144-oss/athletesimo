@@ -1142,24 +1142,26 @@ def sync_coros_recovery(athlete_key, days=7):
 
 
 def load_latest_coros_recovery(athlete_key):
+    """Load the newest recorded non-null COROS value for each recovery metric."""
     initialize_coros_database()
     with get_database_connection() as database:
         with database.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT recovery_date, sleep_minutes, sleep_score, hrv_avg,
-                       hrv_baseline, hrv_normal_low, hrv_normal_high, hrv_status,
-                       resting_hr, vekdyn_recovery_score
-                FROM coros_recovery_daily
-                WHERE athlete_key = %s
-                ORDER BY recovery_date DESC
-                LIMIT 1
-                """,
-                (athlete_key,),
-            )
+            cursor.execute("""
+                SELECT
+                    (SELECT recovery_date FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_minutes IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT sleep_minutes FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_minutes IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT sleep_score FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_score IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_avg FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_normal_low FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_low IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_normal_high FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_high IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT hrv_status FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_status IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT resting_hr FROM coros_recovery_daily WHERE athlete_key=%s AND resting_hr IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                    (SELECT vekdyn_recovery_score FROM coros_recovery_daily WHERE athlete_key=%s AND vekdyn_recovery_score IS NOT NULL ORDER BY recovery_date DESC LIMIT 1)
+            """, (athlete_key,) * 10)
             row = cursor.fetchone()
 
-    if not row:
+    if not row or all(value is None for value in row):
         return {}
 
     return {
