@@ -3877,10 +3877,6 @@ if active_nav == "Training":
     st.header("Training")
     st.caption("Your full training block. Tap any workout day to open its sessions.")
 
-    with st.container(border=True):
-        st.subheader("Weekly Training Volume")
-        render_strava_volume_chart(athlete["athlete_key"])
-
     today = date.today()
     first_month = date(today.year, today.month, 1)
     last_month = shifted_month(first_month, 2)
