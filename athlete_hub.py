@@ -3099,56 +3099,139 @@ def workout_day_value(workout):
 
 
 def render_day_picker(week_start, workouts, selected_day, key_prefix):
-    """Render only the current week as a compact seven-day horizontal strip.
-
-    Keep the rest of the Athlete Hub unchanged. The persistent VEKDYN session
-    token is carried in each day link so selecting a date does not log the
-    athlete out.
-    """
+    """Compact seven-day strip that stays inside the authenticated Streamlit session."""
     workout_dates = {workout_day_value(item) for item in workouts}
     days = [week_start + timedelta(days=i) for i in range(7)]
 
-    requested = st.query_params.get("day")
-    if isinstance(requested, list):
-        requested = requested[0] if requested else None
-    if requested:
-        try:
-            requested_day = date.fromisoformat(str(requested))
-            if requested_day in days:
-                selected_day = requested_day
-                st.session_state.home_selected_date = requested_day
-        except ValueError:
-            pass
+    state_key = f"{key_prefix}_selected_date"
+    if state_key not in st.session_state or st.session_state[state_key] not in days:
+        st.session_state[state_key] = selected_day if selected_day in days else days[0]
 
-    # The compact HTML links do a real browser navigation. Guarantee that
-    # every link carries a valid persistent athlete session before rendering
-    # the strip, so the unified app can restore the same logged-in athlete.
-    session_token = browser_session_token()
-    if not session_token and st.session_state.get("logged_in"):
-        logged_in_athlete_id = st.session_state.get("athlete_id")
-        if logged_in_athlete_id:
-            try:
-                session_token = issue_persistent_athlete_session(logged_in_athlete_id)
-                set_browser_session_token(session_token)
-            except Exception:
-                session_token = None
+    selected_day = st.session_state[state_key]
+    strip_key = f"{key_prefix}_compact_strip"
 
-    cells = []
-    for day_value in days:
-        params = {"day": day_value.isoformat()}
-        if session_token:
-            params["session"] = session_token
-        href = "?" + urlencode(params)
-        active = " active" if day_value == selected_day else ""
-        dot = '<span class="week-dot"></span>' if day_value in workout_dates else ""
-        cells.append(
-            f'<a class="week-day{active}" href="{href}">'
-            f'<span class="week-dow">{day_value.strftime("%a")[0]}</span>'
-            f'<span class="week-num">{day_value.day}</span>{dot}</a>'
-        )
+    # IMPORTANT: do not use <a href> here. The unified VEKDYN app owns the
+    # top-level route, so a hard browser navigation can run the landing page
+    # before athlete_hub has a chance to restore its athlete session.
+    with st.container(key=strip_key):
+        cols = st.columns(7, gap="small")
+        for idx, (col, day_value) in enumerate(zip(cols, days)):
+            with col:
+                st.markdown(
+                    f"<div class='vekdyn-week-dow'>{day_value.strftime('%a')[0]}</div>",
+                    unsafe_allow_html=True,
+                )
 
-    st.markdown('<div class="week-grid">' + "".join(cells) + '</div>', unsafe_allow_html=True)
-    return selected_day
+                if st.button(
+                    str(day_value.day),
+                    key=f"{key_prefix}_day_{day_value.isoformat()}",
+                    type="primary" if day_value == selected_day else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state[state_key] = day_value
+                    st.session_state.home_selected_date = day_value
+                    st.rerun()
+
+                st.markdown(
+                    "<div class='vekdyn-week-dot active-dot'></div>"
+                    if day_value in workout_dates
+                    else "<div class='vekdyn-week-dot'></div>",
+                    unsafe_allow_html=True,
+                )
+
+    # Scope the styling to this one current-week container. This preserves the
+    # compact Final-Surge-like layout while the controls remain native buttons.
+    st.markdown(
+        f"""
+        <style>
+        .st-key-{strip_key} {{
+            margin-top: .15rem;
+            margin-bottom: .8rem;
+        }}
+        .st-key-{strip_key} div[data-testid="stHorizontalBlock"] {{
+            display: flex !important;
+            flex-wrap: nowrap !important;
+            gap: 2px !important;
+            align-items: flex-start !important;
+        }}
+        .st-key-{strip_key} div[data-testid="column"] {{
+            flex: 1 1 14.2857% !important;
+            width: 14.2857% !important;
+            min-width: 0 !important;
+        }}
+        .st-key-{strip_key} .vekdyn-week-dow {{
+            text-align: center;
+            color: #566273;
+            font-size: 13px;
+            line-height: 18px;
+            height: 18px;
+            margin: 0 0 3px 0;
+        }}
+        .st-key-{strip_key} div.stButton {{
+            display: flex;
+            justify-content: center;
+        }}
+        .st-key-{strip_key} div.stButton > button {{
+            width: 44px !important;
+            min-width: 44px !important;
+            max-width: 44px !important;
+            height: 44px !important;
+            min-height: 44px !important;
+            padding: 0 !important;
+            margin: 0 auto !important;
+            border-radius: 50% !important;
+            box-shadow: none !important;
+            font-size: 23px !important;
+            font-weight: 500 !important;
+            line-height: 44px !important;
+        }}
+        .st-key-{strip_key} div.stButton > button[kind="secondary"] {{
+            background: transparent !important;
+            border-color: transparent !important;
+            color: #566273 !important;
+        }}
+        .st-key-{strip_key} div.stButton > button[kind="primary"] {{
+            background: #2f9e44 !important;
+            border-color: #2f9e44 !important;
+            color: #ffffff !important;
+        }}
+        .st-key-{strip_key} .vekdyn-week-dot {{
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            margin: 4px auto 0;
+            background: transparent;
+            border: 1px solid transparent;
+        }}
+        .st-key-{strip_key} .vekdyn-week-dot.active-dot {{
+            background: #9fb0bd;
+            border-color: #9fb0bd;
+        }}
+        @media (max-width: 640px) {{
+            .st-key-{strip_key} div[data-testid="stHorizontalBlock"] {{
+                flex-direction: row !important;
+            }}
+            .st-key-{strip_key} div[data-testid="column"] {{
+                flex: 1 1 14.2857% !important;
+                width: 14.2857% !important;
+            }}
+            .st-key-{strip_key} div.stButton > button {{
+                width: 40px !important;
+                min-width: 40px !important;
+                max-width: 40px !important;
+                height: 40px !important;
+                min-height: 40px !important;
+                font-size: 21px !important;
+                line-height: 40px !important;
+            }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    return st.session_state[state_key]
+
 
 def render_selected_day_workouts(workouts, selected_day):
     """Show only the workout(s) for the day the athlete selected."""
