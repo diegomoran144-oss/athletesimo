@@ -60,6 +60,7 @@ def strava_secret(name, default=None):
     except (KeyError, FileNotFoundError):
         return default
 
+@st.cache_resource(show_spinner=False)
 def initialize_strava_database():
     with get_database_connection() as database:
         with database.cursor() as cursor:
@@ -315,6 +316,7 @@ COROS_PROTOCOL_VERSION = "2025-06-18"
 COROS_REDIRECT_URI = str(st.secrets.get("ATHLETE_COROS_REDIRECT_URI", "")).strip()
 
 
+@st.cache_resource(show_spinner=False)
 def initialize_coros_database():
     """Create/upgrade the shared COROS tables used by Athlete and Coach."""
     with get_database_connection() as database:
@@ -422,6 +424,7 @@ def _safe_json(response):
         ) from error
 
 
+@st.cache_resource(show_spinner=False)
 def _coros_auth_metadata():
     """Discover COROS OAuth endpoints from the protected MCP resource."""
     origin = COROS_MCP_URL.rsplit("/mcp", 1)[0]
@@ -486,6 +489,7 @@ def _coros_auth_metadata():
     raise RuntimeError("COROS authorization metadata could not be loaded.")
 
 
+@st.cache_resource(show_spinner=False)
 def _load_coros_oauth_client():
     """Return or dynamically register the OAuth client for this Athlete app."""
     initialize_coros_database()
