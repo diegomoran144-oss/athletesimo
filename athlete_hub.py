@@ -3099,39 +3099,56 @@ def workout_day_value(workout):
 
 
 def render_day_picker(week_start, workouts, selected_day, key_prefix):
-    """Compact current-week picker without browser navigation.
+    """Render only the current week as a compact seven-day horizontal strip.
 
-    Use Streamlit buttons instead of <a href> links. This changes the selected
-    day inside the existing authenticated Streamlit session, so tapping another
-    day cannot send the athlete back through the app landing route.
+    Keep the rest of the Athlete Hub unchanged. The persistent VEKDYN session
+    token is carried in each day link so selecting a date does not log the
+    athlete out.
     """
     workout_dates = {workout_day_value(item) for item in workouts}
     days = [week_start + timedelta(days=i) for i in range(7)]
 
-    # Seven equal columns keeps the corrected one-row mobile layout.
-    cols = st.columns(7, gap="small")
+    requested = st.query_params.get("day")
+    if isinstance(requested, list):
+        requested = requested[0] if requested else None
+    if requested:
+        try:
+            requested_day = date.fromisoformat(str(requested))
+            if requested_day in days:
+                selected_day = requested_day
+                st.session_state.home_selected_date = requested_day
+        except ValueError:
+            pass
 
-    for index, day_value in enumerate(days):
-        is_active = day_value == selected_day
-        has_workout = day_value in workout_dates
+    # The compact HTML links do a real browser navigation. Guarantee that
+    # every link carries a valid persistent athlete session before rendering
+    # the strip, so the unified app can restore the same logged-in athlete.
+    session_token = browser_session_token()
+    if not session_token and st.session_state.get("logged_in"):
+        logged_in_athlete_id = st.session_state.get("athlete_id")
+        if logged_in_athlete_id:
+            try:
+                session_token = issue_persistent_athlete_session(logged_in_athlete_id)
+                set_browser_session_token(session_token)
+            except Exception:
+                session_token = None
 
-        # Two-line compact label: weekday initial + date.
-        label = f"{day_value.strftime('%a')[0]}\\n{day_value.day}"
-        if has_workout:
-            label += "\\n•"
+    cells = []
+    for day_value in days:
+        params = {"day": day_value.isoformat()}
+        if session_token:
+            params["session"] = session_token
+        href = "?" + urlencode(params)
+        active = " active" if day_value == selected_day else ""
+        dot = '<span class="week-dot"></span>' if day_value in workout_dates else ""
+        cells.append(
+            f'<a class="week-day{active}" href="{href}">'
+            f'<span class="week-dow">{day_value.strftime("%a")[0]}</span>'
+            f'<span class="week-num">{day_value.day}</span>{dot}</a>'
+        )
 
-        with cols[index]:
-            if st.button(
-                label,
-                key=f"{key_prefix}_{day_value.isoformat()}",
-                use_container_width=True,
-                type="primary" if is_active else "secondary",
-            ):
-                st.session_state.home_selected_date = day_value
-                return day_value
-
+    st.markdown('<div class="week-grid">' + "".join(cells) + '</div>', unsafe_allow_html=True)
     return selected_day
-
 
 def render_selected_day_workouts(workouts, selected_day):
     """Show only the workout(s) for the day the athlete selected."""
