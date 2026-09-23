@@ -3540,7 +3540,7 @@ else:
         # pay for COROS/Neon reads just because Streamlit reran during navigation.
         coros_recovery = (
             cached_latest_coros_recovery(athlete_key)
-            if dashboard_view in {"Dashboard", "Training"} and cached_coros_is_connected(athlete_key)
+            if dashboard_view == "Dashboard" and cached_coros_is_connected(athlete_key)
             else {}
         )
     except Exception:
@@ -3565,11 +3565,11 @@ heart_session_key = f"{athlete_key}_strava_heart_rate"
 # present in this coach session. This keeps tab changes fast while still letting
 # Athlete Profile populate Max HR even when Profile is opened first.
 needs_strava_volume = (
-    dashboard_view in {"Dashboard", "Training"}
+    dashboard_view == "Dashboard"
     and weekly_session_key not in st.session_state
 )
 needs_strava_heart = (
-    dashboard_view in {"Dashboard", "Training", "Profile"}
+    dashboard_view in {"Dashboard", "Profile"}
     and heart_session_key not in st.session_state
 )
 
@@ -4689,6 +4689,7 @@ def save_team_workout(
                 ),
             )
         database.commit()
+    load_team_workouts_range.clear()
 
 def _workout_rows_to_dicts(rows):
     return [
@@ -4756,6 +4757,7 @@ def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
     return _workout_rows_to_dicts(rows)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_team_workouts_range(team_id, start_date, end_date, selected_athlete_key=None):
     """Load a complete Sunday-Saturday planning window for the selected athlete."""
     initialize_workouts_database()
@@ -4809,6 +4811,7 @@ def delete_team_workout(workout_id, team_id):
                 (int(workout_id), team_id),
             )
         database.commit()
+    load_team_workouts_range.clear()
 
 
 def workout_value(value, fallback="—"):
