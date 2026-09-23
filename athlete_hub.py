@@ -1529,6 +1529,102 @@ def handle_coros_callback_before_login():
         st.session_state["coros_callback_error"] = f"COROS connection failed: {error}"
 
 
+def athlete_id_for_athlete_key(athlete_key):
+    """Resolve the permanent VEKDYN login ID that owns an athlete_key."""
+    clean_key = str(athlete_key or "").strip()
+    if not clean_key:
+        return None
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT athlete_id
+                FROM athlete_logins
+                WHERE athlete_key = %s
+                  AND active = TRUE
+                LIMIT 1;
+                """,
+                (clean_key,),
+            )
+            row = cursor.fetchone()
+
+    return row[0] if row else None
+
+
+def handle_strava_callback_before_login():
+    """Finish Strava OAuth and restore VEKDYN login after a fresh redirect."""
+    code = st.query_params.get("code")
+    state = st.query_params.get("state")
+    oauth_error = st.query_params.get("error")
+
+    if isinstance(state, list):
+        state = state[0] if state else None
+    if isinstance(code, list):
+        code = code[0] if code else None
+    if isinstance(oauth_error, list):
+        oauth_error = oauth_error[0] if oauth_error else None
+
+    # COROS owns states beginning with coros_. Leave those callbacks alone.
+    if not state or str(state).startswith("coros_"):
+        return
+
+    athlete_key = athlete_key_from_oauth_state(str(state))
+    if not athlete_key:
+        return
+
+    athlete_id = athlete_id_for_athlete_key(athlete_key)
+    if not athlete_id:
+        st.query_params.clear()
+        st.session_state["strava_callback_error"] = (
+            "The Strava connection could not be matched to an active VEKDYN athlete."
+        )
+        return
+
+    if oauth_error:
+        # Even a cancelled Strava authorization should return the athlete to
+        # their own VEKDYN session instead of dropping them at sign-in.
+        persistent_token = issue_persistent_athlete_session(athlete_id)
+        st.session_state.logged_in = True
+        st.session_state.athlete_id = athlete_id
+        st.session_state.password_change_required = False
+        st.session_state["strava_callback_error"] = "Strava authorization was cancelled."
+        st.query_params.clear()
+        set_browser_session_token(persistent_token)
+        st.rerun()
+
+    if not code:
+        return
+
+    try:
+        connection = exchange_authorization_code(str(code), athlete_key)
+
+        # Strava can return in a brand-new Streamlit session. Reissue the
+        # persistent VEKDYN session exactly as the COROS callback does.
+        persistent_token = issue_persistent_athlete_session(athlete_id)
+        st.session_state.logged_in = True
+        st.session_state.athlete_id = athlete_id
+        st.session_state.password_change_required = False
+        st.session_state["strava_success"] = (
+            f"Connected to {connection.get('strava_name') or 'Strava'}."
+        )
+
+        st.query_params.clear()
+        set_browser_session_token(persistent_token)
+        st.rerun()
+
+    except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
+        # Restore the athlete's VEKDYN session even if Strava itself fails.
+        persistent_token = issue_persistent_athlete_session(athlete_id)
+        st.session_state.logged_in = True
+        st.session_state.athlete_id = athlete_id
+        st.session_state.password_change_required = False
+        st.session_state["strava_callback_error"] = f"Strava connection failed: {error}"
+        st.query_params.clear()
+        set_browser_session_token(persistent_token)
+        st.rerun()
+
+
 try:
     create_athlete_session_table()
 except Exception as error:
@@ -1537,9 +1633,10 @@ except Exception as error:
     )
 
 
-# COROS can return without the VEKDYN session query parameter, so process it
-# before the login page decides whether the athlete is authenticated.
+# OAuth providers can return without the VEKDYN session query parameter, so
+# process callbacks before the login page decides whether the athlete is authenticated.
 handle_coros_callback_before_login()
+handle_strava_callback_before_login()
 
 
 # =========================================================
@@ -2304,8 +2401,8 @@ logged_in_athlete_id = (
     st.session_state.athlete_id
 )
 
-# Process a Strava OAuth return only after login is established.
-handle_strava_callback()
+# Strava OAuth callbacks are processed before login restoration above so a
+# provider redirect cannot drop the athlete back at the sign-in screen.
 
 
 # =========================================================
