@@ -3540,7 +3540,7 @@ else:
         # pay for COROS/Neon reads just because Streamlit reran during navigation.
         coros_recovery = (
             cached_latest_coros_recovery(athlete_key)
-            if dashboard_view == "Dashboard" and cached_coros_is_connected(athlete_key)
+            if dashboard_view in {"Dashboard", "Training"} and cached_coros_is_connected(athlete_key)
             else {}
         )
     except Exception:
