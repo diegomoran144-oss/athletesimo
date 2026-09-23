@@ -2102,13 +2102,13 @@ st.markdown(
     .athlete-identity-row .subtext { margin:0 !important; }
 
     /* V6: real seven-column week grid; anchors do not inherit Streamlit's responsive wrapping. */
-    .week-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:6px; width:100%; margin:.3rem 0 1.15rem; }
-    .week-day { min-width:0; height:66px; box-sizing:border-box; border:1px solid #d7dde3; border-radius:10px; background:#fff; text-decoration:none !important; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#566273 !important; line-height:1; }
-    .week-dow { font-size:11px; margin-bottom:7px; }
-    .week-num { font-size:16px; font-weight:800; color:#243248; white-space:nowrap; }
-    .week-dot { display:inline-block; width:4px; height:4px; border-radius:50%; background:currentColor; margin-left:3px; vertical-align:middle; }
-    .week-day.active { background:#2f9e44; border-color:#2f9e44; color:#fff !important; }
-    .week-day.active .week-num { color:#fff; }
+    .week-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:2px; width:100%; margin:.25rem 0 1rem; align-items:start; }
+    .week-day { min-width:0; height:64px; box-sizing:border-box; border:0; border-radius:0; background:transparent; text-decoration:none !important; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; color:#566273 !important; line-height:1; padding-top:4px; }
+    .week-dow { font-size:12px; font-weight:600; margin-bottom:8px; }
+    .week-num { width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:17px; font-weight:700; color:#243248; white-space:nowrap; }
+    .week-dot { display:block; width:6px; height:6px; border-radius:50%; background:#91a0ad; margin-top:4px; }
+    .week-day.active { background:transparent; border:0; color:#566273 !important; }
+    .week-day.active .week-num { background:#2f9e44; color:#fff; }
 
     @media (max-width:480px) {
         .st-key-athlete_bottom_nav { padding-left:6px !important; padding-right:6px !important; }
@@ -3099,36 +3099,43 @@ def workout_day_value(workout):
 
 
 def render_day_picker(week_start, workouts, selected_day, key_prefix):
-    """Final-Surge-style seven-day strip without browser navigation/logout."""
+    """Render only the current week as a compact seven-day horizontal strip.
+
+    Keep the rest of the Athlete Hub unchanged. The persistent VEKDYN session
+    token is carried in each day link so selecting a date does not log the
+    athlete out.
+    """
     workout_dates = {workout_day_value(item) for item in workouts}
     days = [week_start + timedelta(days=i) for i in range(7)]
 
-    state_key = f"{key_prefix}_selected_date"
-    if state_key not in st.session_state or st.session_state[state_key] not in days:
-        st.session_state[state_key] = selected_day if selected_day in days else days[0]
+    requested = st.query_params.get("day")
+    if isinstance(requested, list):
+        requested = requested[0] if requested else None
+    if requested:
+        try:
+            requested_day = date.fromisoformat(str(requested))
+            if requested_day in days:
+                selected_day = requested_day
+                st.session_state.home_selected_date = requested_day
+        except ValueError:
+            pass
 
-    selected_day = st.session_state[state_key]
+    session_token = browser_session_token()
+    cells = []
+    for day_value in days:
+        params = {"day": day_value.isoformat()}
+        if session_token:
+            params["session"] = session_token
+        href = "?" + urlencode(params)
+        active = " active" if day_value == selected_day else ""
+        dot = '<span class="week-dot"></span>' if day_value in workout_dates else ""
+        cells.append(
+            f'<a class="week-day{active}" href="{href}">'
+            f'<span class="week-dow">{day_value.strftime("%a")[0]}</span>'
+            f'<span class="week-num">{day_value.day}</span>{dot}</a>'
+        )
 
-    # Native Streamlit buttons preserve the active login/session. CSS below
-    # makes them look like the compact Final Surge day strip instead of large buttons.
-    st.markdown('<div class="fs-week-strip-anchor"></div>', unsafe_allow_html=True)
-    columns = st.columns(7, gap="small")
-    for column, day_value in zip(columns, days):
-        has_workout = day_value in workout_dates
-        dot = " •" if has_workout else ""
-        label = f"{day_value.strftime('%a')}\n{day_value.day}{dot}"
-        with column:
-            if st.button(
-                label,
-                key=f"{key_prefix}_{day_value.isoformat()}",
-                type="primary" if day_value == selected_day else "secondary",
-                use_container_width=True,
-            ):
-                st.session_state[state_key] = day_value
-                st.session_state.home_selected_date = day_value
-                selected_day = day_value
-                st.rerun()
-
+    st.markdown('<div class="week-grid">' + "".join(cells) + '</div>', unsafe_allow_html=True)
     return selected_day
 
 def render_selected_day_workouts(workouts, selected_day):
