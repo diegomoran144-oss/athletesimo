@@ -3148,16 +3148,26 @@ def render_day_picker(week_start, workouts, selected_day, key_prefix):
             margin-top: .15rem;
             margin-bottom: .8rem;
         }}
+        .st-key-{strip_key} {{
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow: hidden !important;
+        }}
         .st-key-{strip_key} div[data-testid="stHorizontalBlock"] {{
-            display: flex !important;
-            flex-wrap: nowrap !important;
-            gap: 2px !important;
-            align-items: flex-start !important;
+            display: grid !important;
+            grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            gap: 0 !important;
+            align-items: start !important;
         }}
         .st-key-{strip_key} div[data-testid="column"] {{
-            flex: 1 1 14.2857% !important;
-            width: 14.2857% !important;
+            display: block !important;
+            width: 100% !important;
             min-width: 0 !important;
+            max-width: none !important;
+            flex: none !important;
+            padding: 0 !important;
         }}
         .st-key-{strip_key} .vekdyn-week-dow {{
             text-align: center;
@@ -3208,21 +3218,41 @@ def render_day_picker(week_start, workouts, selected_day, key_prefix):
             border-color: #9fb0bd;
         }}
         @media (max-width: 640px) {{
+            .st-key-{strip_key} {{
+                padding-left: 0 !important;
+                padding-right: 0 !important;
+            }}
             .st-key-{strip_key} div[data-testid="stHorizontalBlock"] {{
-                flex-direction: row !important;
+                display: grid !important;
+                grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                gap: 0 !important;
             }}
             .st-key-{strip_key} div[data-testid="column"] {{
-                flex: 1 1 14.2857% !important;
-                width: 14.2857% !important;
+                width: 100% !important;
+                min-width: 0 !important;
+                max-width: none !important;
+                padding: 0 !important;
             }}
             .st-key-{strip_key} div.stButton > button {{
-                width: 40px !important;
-                min-width: 40px !important;
-                max-width: 40px !important;
-                height: 40px !important;
-                min-height: 40px !important;
-                font-size: 21px !important;
-                line-height: 40px !important;
+                width: 34px !important;
+                min-width: 34px !important;
+                max-width: 34px !important;
+                height: 34px !important;
+                min-height: 34px !important;
+                padding: 0 !important;
+                font-size: 18px !important;
+                line-height: 34px !important;
+            }}
+            .st-key-{strip_key} .vekdyn-week-dow {{
+                font-size: 11px !important;
+                line-height: 15px !important;
+                height: 15px !important;
+                margin-bottom: 2px !important;
+            }}
+            .st-key-{strip_key} .vekdyn-week-dot {{
+                margin-top: 3px !important;
             }}
         }}
         </style>
