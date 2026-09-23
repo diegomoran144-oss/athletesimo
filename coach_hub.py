@@ -61,6 +61,7 @@ def make_athlete_id(name):
     return value
 
 
+@st.cache_data(show_spinner=False)
 def load_team_roster(roster_path, default_school="", default_team="Distance"):
     """
     Load either roster format currently used by VEKDYN.
@@ -3490,10 +3491,9 @@ error_session_key = f"strava_error_{athlete_key}"
 coros_message_key = f"coros_message_{athlete_key}"
 coros_error_key = f"coros_error_{athlete_key}"
 
-# Never display stale Strava activity cache while VEKDYN is in webhook transition.
-st.session_state.pop(weekly_session_key, None)
-st.session_state.pop(heart_session_key, None)
-
+# Keep the most recently loaded Strava summary in this coach session.
+# Tab navigation reruns Streamlit, so deleting these values here forced VEKDYN
+# to rebuild the same summary and also made Athlete Profile lose Max HR.
 # =========================================================
 # FAST DASHBOARD READ CACHE
 # =========================================================
@@ -3561,9 +3561,19 @@ volume_source = "No live data"
 weekly_session_key = f"{athlete_key}_strava_weekly"
 heart_session_key = f"{athlete_key}_strava_heart_rate"
 
-# Refresh the selected athlete's Strava summary on Dashboard/Training. The
-# request itself is cached for 15 minutes by get_strava_training_data().
-if active_team != DEMO_TEAM_ID and dashboard_view in {"Dashboard", "Training"}:
+# Load Strava only when the active view needs a summary that is not already
+# present in this coach session. This keeps tab changes fast while still letting
+# Athlete Profile populate Max HR even when Profile is opened first.
+needs_strava_volume = (
+    dashboard_view in {"Dashboard", "Training"}
+    and weekly_session_key not in st.session_state
+)
+needs_strava_heart = (
+    dashboard_view in {"Dashboard", "Training", "Profile"}
+    and heart_session_key not in st.session_state
+)
+
+if active_team != DEMO_TEAM_ID and (needs_strava_volume or needs_strava_heart):
     try:
         if strava_is_connected(athlete_key):
             strava_token = get_valid_strava_token(athlete_key)
@@ -3572,7 +3582,7 @@ if active_team != DEMO_TEAM_ID and dashboard_view in {"Dashboard", "Training"}:
                 st.session_state[weekly_session_key] = fresh_volume
                 st.session_state[heart_session_key] = fresh_heart
     except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
-        # Preserve the last successful cached/session data if Strava is briefly unavailable.
+        # Preserve the last successful session data if Strava is briefly unavailable.
         st.session_state.setdefault(f"{athlete_key}_strava_sync_error", str(error))
 
 if weekly_session_key in st.session_state:
