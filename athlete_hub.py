@@ -1182,6 +1182,36 @@ def load_latest_coros_recovery(athlete_key):
     }
 
 
+def coros_recovery_sync_due(athlete_key, hours=6):
+    """Return True when connected COROS recovery has never synced or is stale."""
+    initialize_coros_database()
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT MAX(updated_at)
+                FROM coros_recovery_daily
+                WHERE athlete_key = %s
+                """,
+                (athlete_key,),
+            )
+            row = cursor.fetchone()
+
+    last_sync = row[0] if row else None
+    if last_sync is None:
+        return True
+
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                "SELECT %s < NOW() - (%s * INTERVAL '1 hour')",
+                (last_sync, int(hours)),
+            )
+            stale_row = cursor.fetchone()
+
+    return bool(stale_row and stale_row[0])
+
+
 # =========================================================
 # ATHLETE LOGIN TABLE
 # =========================================================
@@ -1520,9 +1550,19 @@ def handle_coros_callback_before_login():
         st.session_state.logged_in = True
         st.session_state.athlete_id = athlete_id
         st.session_state.password_change_required = False
-        st.session_state["coros_success"] = (
-            "COROS connected. Recovery data is ready to sync."
-        )
+
+        # Pull the first seven days immediately so a newly connected athlete
+        # returns to VEKDYN with recovery data already populated. A recovery
+        # fetch failure does not undo the valid COROS OAuth connection.
+        try:
+            latest_recovery = sync_coros_recovery(athlete_key, days=7)
+            st.session_state["coros_latest_recovery"] = latest_recovery
+            st.session_state["coros_success"] = (
+                "COROS connected and recovery data synced."
+            )
+        except (requests.RequestException, RuntimeError, psycopg2.Error) as sync_error:
+            st.session_state["coros_success"] = "COROS connected."
+            st.session_state["coros_sync_error"] = str(sync_error)
 
         st.query_params.clear()
         set_browser_session_token(persistent_token)
@@ -2435,6 +2475,28 @@ if athlete is None:
 if st.session_state.get("password_changed_success"):
     st.success("Password created successfully. You are signed in to VEKDYN ✓")
     st.session_state.password_changed_success = False
+
+
+# Keep COROS recovery current without requiring the athlete to press Sync.
+# The database timestamp prevents normal Streamlit reruns from repeatedly
+# contacting COROS; connected athletes refresh at most once every six hours.
+try:
+    active_athlete_key = athlete.get("athlete_key")
+    if (
+        active_athlete_key
+        and coros_is_connected(active_athlete_key)
+        and coros_recovery_sync_due(active_athlete_key, hours=6)
+    ):
+        try:
+            st.session_state["coros_latest_recovery"] = sync_coros_recovery(
+                active_athlete_key,
+                days=7,
+            )
+        except (requests.RequestException, RuntimeError, psycopg2.Error) as sync_error:
+            # Keep the app usable and preserve the valid COROS connection.
+            st.session_state["coros_sync_error"] = str(sync_error)
+except (psycopg2.Error, RuntimeError):
+    pass
 
 
 # =========================================================
