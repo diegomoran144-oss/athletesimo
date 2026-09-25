@@ -2485,7 +2485,7 @@ try:
     if (
         active_athlete_key
         and coros_is_connected(active_athlete_key)
-        and coros_recovery_sync_due(active_athlete_key, hours=6)
+        and coros_recovery_sync_due(active_athlete_key, hours=1)
     ):
         try:
             st.session_state["coros_latest_recovery"] = sync_coros_recovery(
