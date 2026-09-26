@@ -293,8 +293,12 @@ def handle_strava_callback():
     try:
         connection = exchange_authorization_code(code, oauth_athlete_key)
         st.session_state["strava_success"] = f"Connected to {connection.get('strava_name') or 'Strava'}."
+        st.session_state["athlete_nav"] = "Connections"
+        current_session = browser_session_token()
         st.query_params.clear()
-        st.rerun()
+        if current_session:
+            set_browser_session_token(current_session, view="Connections")
+        return
     except (requests.RequestException, RuntimeError) as error:
         st.error(f"Strava connection failed: {error}")
 
@@ -1573,7 +1577,11 @@ def handle_coros_callback_before_login():
 
         st.query_params.clear()
         set_browser_session_token(persistent_token, view="Connections")
-        st.rerun()
+        # Do not force st.rerun() here. The callback already restored
+        # logged_in/athlete_id, so this same run can render Connections.
+        # Avoiding an immediate rerun also gives the browser time to persist
+        # the session token in the URL after the external COROS redirect.
+        return
 
     except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
         st.query_params.clear()
@@ -1641,8 +1649,12 @@ def handle_strava_callback_before_login():
         st.session_state.password_change_required = False
         st.session_state["strava_callback_error"] = "Strava authorization was cancelled."
         st.query_params.clear()
-        set_browser_session_token(persistent_token)
-        st.rerun()
+        set_browser_session_token(persistent_token, view="Connections")
+        # Do not force st.rerun() here. The callback already restored
+        # logged_in/athlete_id, so this same run can render Connections.
+        # Avoiding an immediate rerun also gives the browser time to persist
+        # the session token in the URL after the external COROS redirect.
+        return
 
     if not code:
         return
@@ -1661,8 +1673,12 @@ def handle_strava_callback_before_login():
         )
 
         st.query_params.clear()
-        set_browser_session_token(persistent_token)
-        st.rerun()
+        set_browser_session_token(persistent_token, view="Connections")
+        # Do not force st.rerun() here. The callback already restored
+        # logged_in/athlete_id, so this same run can render Connections.
+        # Avoiding an immediate rerun also gives the browser time to persist
+        # the session token in the URL after the external COROS redirect.
+        return
 
     except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
         # Restore the athlete's VEKDYN session even if Strava itself fails.
@@ -1672,8 +1688,12 @@ def handle_strava_callback_before_login():
         st.session_state.password_change_required = False
         st.session_state["strava_callback_error"] = f"Strava connection failed: {error}"
         st.query_params.clear()
-        set_browser_session_token(persistent_token)
-        st.rerun()
+        set_browser_session_token(persistent_token, view="Connections")
+        # Do not force st.rerun() here. The callback already restored
+        # logged_in/athlete_id, so this same run can render Connections.
+        # Avoiding an immediate rerun also gives the browser time to persist
+        # the session token in the URL after the external COROS redirect.
+        return
 
 
 try:
