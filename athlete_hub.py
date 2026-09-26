@@ -3923,106 +3923,117 @@ def shifted_month(base_date, offset):
     return date(year, zero_based_month + 1, 1)
 
 
-def render_expanded_training_calendar(start_month, workouts, month_count=3):
-    """Final-Surge-style expanded calendar: full month grids stacked vertically."""
-    workouts_by_day = {}
-    for item in workouts:
-        workout_date = workout_day_value(item)
-        workouts_by_day.setdefault(workout_date, []).append(item)
+def render_expanded_training_calendar(
+    start_month,
+    workouts,
+    month_count=3,
+):
+    """Render Training calendar with native Streamlit buttons.
 
+    A day click stays inside the current Streamlit session, switches to Home,
+    selects that exact date, and lets Home render the containing week.
+    """
     today = date.today()
-    selected_raw = st.query_params.get("calday")
-    if isinstance(selected_raw, list):
-        selected_raw = selected_raw[0] if selected_raw else None
-    try:
-        selected_day = date.fromisoformat(str(selected_raw)) if selected_raw else None
-    except ValueError:
-        selected_day = None
+    workout_dates = {
+        item.get("date")
+        for item in workouts
+        if item.get("date") is not None
+    }
 
-    session_token = browser_session_token()
     weekday_labels = ["S", "M", "T", "W", "T", "F", "S"]
-    blocks = []
 
     for month_offset in range(month_count):
         month_first = shifted_month(start_month, month_offset)
         cal = calendar.Calendar(firstweekday=6)
         weeks = cal.monthdatescalendar(month_first.year, month_first.month)
 
-        header = ''.join(f'<div class="fs-weekday">{label}</div>' for label in weekday_labels)
-        day_cells = []
-        for week in weeks:
-            for day_value in week:
-                if day_value.month != month_first.month:
-                    day_cells.append('<div class="fs-day fs-outside"></div>')
-                    continue
-
-                params = {"calday": day_value.isoformat(), "view": "Home"}
-                if session_token:
-                    params["session"] = session_token
-                href = "?" + urlencode(params)
-
-                day_workouts = workouts_by_day.get(day_value, [])
-                classes = ["fs-day"]
-                if day_value == today:
-                    classes.append("fs-today")
-                if day_value == selected_day:
-                    classes.append("fs-selected")
-
-                dots = ''
-                if day_workouts:
-                    # One compact marker per AM/PM assignment, capped at three.
-                    dots = '<div class="fs-dots">' + ''.join(
-                        '<span class="fs-dot"></span>' for _ in day_workouts[:3]
-                    ) + '</div>'
-
-                day_cells.append(
-                    f'<a class="{" ".join(classes)}" href="{href}">'
-                    f'<span class="fs-number">{day_value.day}</span>{dots}</a>'
-                )
-
-        blocks.append(
-            f'<section class="fs-month">'
-            f'<div class="fs-month-title">{month_first.strftime("%B %Y")}</div>'
-            f'<div class="fs-weekdays">{header}</div>'
-            f'<div class="fs-grid">{"".join(day_cells)}</div>'
-            f'</section>'
+        st.markdown(
+            f"<div class='fs-native-month-title'>{month_first.strftime('%B %Y')}</div>",
+            unsafe_allow_html=True,
         )
 
+        weekday_cols = st.columns(7, gap="small")
+        for idx, label in enumerate(weekday_labels):
+            with weekday_cols[idx]:
+                st.markdown(
+                    f"<div class='fs-native-weekday'>{label}</div>",
+                    unsafe_allow_html=True,
+                )
+
+        for week_index, week in enumerate(weeks):
+            cols = st.columns(7, gap="small")
+            for day_index, day_value in enumerate(week):
+                with cols[day_index]:
+                    if day_value.month != month_first.month:
+                        st.markdown(
+                            "<div class='fs-native-empty'></div>",
+                            unsafe_allow_html=True,
+                        )
+                        continue
+
+                    has_workout = day_value in workout_dates
+                    marker = " •" if has_workout else ""
+                    label = f"{day_value.day}{marker}"
+
+                    if st.button(
+                        label,
+                        key=(
+                            f"training_calendar_{month_first.year}_"
+                            f"{month_first.month}_{day_value.isoformat()}"
+                        ),
+                        use_container_width=True,
+                        type="primary" if day_value == today else "secondary",
+                    ):
+                        # No URL/query-param navigation at all.
+                        st.session_state.home_selected_date = day_value
+                        st.session_state.athlete_nav = "Home"
+                        st.rerun()
+
+        st.markdown("<div class='fs-native-month-gap'></div>", unsafe_allow_html=True)
+
     st.markdown(
-        f"""
+        """
         <style>
-          .fs-calendar {{max-width:760px;margin:0 auto 1rem;}}
-          .fs-month {{margin:0 0 30px;}}
-          .fs-month-title {{font-size:24px;font-weight:850;color:#111827;margin:10px 0 12px;}}
-          .fs-weekdays,.fs-grid {{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));}}
-          .fs-weekdays {{border-bottom:1px solid #e5e7eb;}}
-          .fs-weekday {{text-align:center;padding:6px 0 10px;font-size:13px;font-weight:700;color:#6b7280;}}
-          .fs-grid {{border-bottom:1px solid #eef0ee;}}
-          .fs-day {{height:76px;display:flex;flex-direction:column;align-items:center;justify-content:center;
-            text-decoration:none!important;color:#111827!important;border-bottom:1px solid #eef0ee;position:relative;}}
-          .fs-outside {{pointer-events:none;}}
-          .fs-number {{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-            font-size:20px;font-weight:650;}}
-          .fs-today .fs-number {{background:#2f9e44;color:#fff;font-weight:850;}}
-          .fs-selected:not(.fs-today) .fs-number {{outline:2px solid #2f9e44;outline-offset:1px;}}
-          .fs-dots {{height:10px;margin-top:2px;display:flex;gap:3px;align-items:center;justify-content:center;}}
-          .fs-dot {{width:6px;height:6px;border-radius:50%;background:#91a6b5;display:block;}}
-          .fs-selected .fs-dot,.fs-today .fs-dot {{background:#2f9e44;}}
-          .fs-day:hover {{background:#f7faf7;}}
-          @media(max-width:720px) {{
-            .fs-calendar {{margin-left:-2px;margin-right:-2px;}}
-            .fs-month {{margin-bottom:26px;}}
-            .fs-month-title {{font-size:21px;margin:8px 0 10px;}}
-            .fs-day {{height:64px;}}
-            .fs-number {{width:34px;height:34px;font-size:18px;}}
-            .fs-weekday {{font-size:12px;padding-bottom:8px;}}
-          }}
+        .fs-native-month-title {
+            font-size:24px;
+            font-weight:850;
+            color:#111827;
+            margin:10px 0 12px;
+        }
+        .fs-native-weekday {
+            text-align:center;
+            padding:6px 0 10px;
+            font-size:13px;
+            font-weight:700;
+            color:#6b7280;
+            border-bottom:1px solid #e5e7eb;
+        }
+        .fs-native-empty { height:48px; }
+        .fs-native-month-gap { height:24px; }
+
+        /* Training calendar buttons: compact date cells, not navigation links. */
+        div[data-testid="stButton"] > button {
+            min-height:48px;
+        }
+
+        @media(max-width:720px) {
+            .fs-native-month-title {
+                font-size:21px;
+                margin:8px 0 10px;
+            }
+            .fs-native-weekday {
+                font-size:12px;
+                padding-bottom:8px;
+            }
+            .fs-native-empty { height:44px; }
+            .fs-native-month-gap { height:20px; }
+        }
         </style>
-        <div class="fs-calendar">{"".join(blocks)}</div>
         """,
         unsafe_allow_html=True,
     )
-    return selected_day
+
+    return None
 
 
 if active_nav == "Training":
@@ -4040,19 +4051,11 @@ if active_nav == "Training":
 
     # One database read supplies all three expanded months.
     training_workouts = get_workouts(first_month, last_day)
-    selected_training_day = render_expanded_training_calendar(
+    render_expanded_training_calendar(
         first_month,
         training_workouts,
         month_count=3,
     )
-
-    if selected_training_day:
-        st.markdown(
-            f"<div style='font-size:20px;font-weight:850;margin:.5rem 0 .7rem;'>"
-            f"{selected_training_day.strftime('%A, %B %d')}</div>",
-            unsafe_allow_html=True,
-        )
-        render_selected_day_workouts(training_workouts, selected_training_day)
 
     planned_values = [
         item.get("planned_miles")
