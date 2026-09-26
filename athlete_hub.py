@@ -1144,7 +1144,7 @@ def sync_coros_recovery(athlete_key, days=7):
     days = max(1, min(int(days), 7))
     arguments = {"startDate": "", "endDate": "", "days": days, "timezone": COROS_TIMEZONE}
 
-    sleep_text = coros_mcp_tool_call(access_token, "querySleepData", arguments)
+    sleep_text = coros_mcp_tool_call(access_token, "querySleepOverview", arguments)
     hrv_text = coros_mcp_tool_call(access_token, "querySleepHrv", arguments)
     resting_text = coros_mcp_tool_call(
         access_token,
