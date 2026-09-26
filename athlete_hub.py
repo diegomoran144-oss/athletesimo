@@ -1557,6 +1557,7 @@ def handle_coros_callback_before_login():
         st.session_state.logged_in = True
         st.session_state.athlete_id = athlete_id
         st.session_state.password_change_required = False
+        st.session_state["oauth_just_restored"] = True
         # Return the athlete to the Connections page after COROS OAuth.
         # A COROS redirect can create a fresh Streamlit session, so set this
         # before the final rerun instead of allowing navigation to default Home.
@@ -1647,6 +1648,7 @@ def handle_strava_callback_before_login():
         st.session_state.logged_in = True
         st.session_state.athlete_id = athlete_id
         st.session_state.password_change_required = False
+        st.session_state["oauth_just_restored"] = True
         st.session_state["strava_callback_error"] = "Strava authorization was cancelled."
         st.query_params.clear()
         set_browser_session_token(persistent_token, view="Connections")
@@ -1668,6 +1670,7 @@ def handle_strava_callback_before_login():
         st.session_state.logged_in = True
         st.session_state.athlete_id = athlete_id
         st.session_state.password_change_required = False
+        st.session_state["oauth_just_restored"] = True
         st.session_state["strava_success"] = (
             f"Connected to {connection.get('strava_name') or 'Strava'}."
         )
@@ -1686,6 +1689,7 @@ def handle_strava_callback_before_login():
         st.session_state.logged_in = True
         st.session_state.athlete_id = athlete_id
         st.session_state.password_change_required = False
+        st.session_state["oauth_just_restored"] = True
         st.session_state["strava_callback_error"] = f"Strava connection failed: {error}"
         st.query_params.clear()
         set_browser_session_token(persistent_token, view="Connections")
@@ -1702,12 +1706,6 @@ except Exception as error:
     st.error(
         f"Could not initialize persistent athlete sessions: {error}"
     )
-
-
-# OAuth providers can return without the VEKDYN session query parameter, so
-# process callbacks before the login page decides whether the athlete is authenticated.
-handle_coros_callback_before_login()
-handle_strava_callback_before_login()
 
 
 # =========================================================
@@ -1926,6 +1924,11 @@ if "home_selected_date" not in st.session_state:
 if "password_change_required" not in st.session_state:
     st.session_state.password_change_required = False
 
+# External OAuth can return in a fresh Streamlit session. Initialize state first,
+# then let the callback restore authentication before login-page routing runs.
+handle_coros_callback_before_login()
+handle_strava_callback_before_login()
+
 _return_view = st.query_params.get("view")
 if isinstance(_return_view, list):
     _return_view = _return_view[0] if _return_view else None
@@ -1935,7 +1938,7 @@ if _return_view in {"Home", "Training", "Performance", "Connections"}:
 
 # A hard browser refresh creates a new Streamlit session. Restore the
 # authenticated athlete from the persistent Neon-backed token.
-if not st.session_state.logged_in:
+if not st.session_state.logged_in and not st.session_state.pop("oauth_just_restored", False):
     saved_session_token = browser_session_token()
 
     if saved_session_token:
