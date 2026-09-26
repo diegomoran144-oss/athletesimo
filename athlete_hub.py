@@ -1493,11 +1493,14 @@ def browser_session_token():
     return str(cached_token).strip() if cached_token else None
 
 
-def set_browser_session_token(raw_token):
+def set_browser_session_token(raw_token, view=None):
     if raw_token:
         clean_token = str(raw_token).strip()
         st.session_state["persistent_athlete_session"] = clean_token
         st.query_params["session"] = clean_token
+    if view:
+        st.session_state["athlete_nav"] = str(view)
+        st.query_params["view"] = str(view)
 
 
 def clear_oauth_params_keep_session():
@@ -1569,7 +1572,7 @@ def handle_coros_callback_before_login():
             st.session_state["coros_sync_error"] = str(sync_error)
 
         st.query_params.clear()
-        set_browser_session_token(persistent_token)
+        set_browser_session_token(persistent_token, view="Connections")
         st.rerun()
 
     except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
@@ -1902,6 +1905,12 @@ if "home_selected_date" not in st.session_state:
 
 if "password_change_required" not in st.session_state:
     st.session_state.password_change_required = False
+
+_return_view = st.query_params.get("view")
+if isinstance(_return_view, list):
+    _return_view = _return_view[0] if _return_view else None
+if _return_view in {"Home", "Training", "Performance", "Connections"}:
+    st.session_state["athlete_nav"] = _return_view
 
 
 # A hard browser refresh creates a new Streamlit session. Restore the
@@ -2481,10 +2490,8 @@ if st.session_state.get("password_changed_success"):
     st.session_state.password_changed_success = False
 
 
-# COROS recovery is intentionally NOT auto-synced during ordinary app reruns.
-# Streamlit reruns the whole script for navigation, so network recovery calls here
-# made every tab transition feel slow (especially for athletes with no sleep data).
-# COROS still syncs immediately after OAuth and from the manual Sync button.
+# COROS recovery is synced automatically in the successful OAuth callback.
+# Do not contact COROS during ordinary tab/navigation reruns.
 
 
 # =========================================================
@@ -3004,12 +3011,29 @@ def get_threshold_profile(team_id, athlete_key):
 # WORKOUT DATABASE
 # =========================================================
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _get_workouts_cached(team_id, athlete_key, start_date, end_date):
-    """Short-lived Neon cache keyed to the exact athlete and date range."""
+def get_workouts(
+    start_date,
+    end_date,
+):
+    """
+    Read workouts written in VEKDYN Coach from the shared
+    Neon team_workouts table.
+
+    The athlete receives:
+
+    1. Team workouts:
+       athlete_key IS NULL
+
+    2. Individual workouts:
+       athlete_key matches this athlete
+    """
+
     conn = get_database_connection()
+
     try:
+
         with conn.cursor() as cursor:
+
             cursor.execute(
                 """
                 SELECT
@@ -3036,42 +3060,65 @@ def _get_workouts_cached(team_id, athlete_key, start_date, end_date):
                     CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
                     id ASC;
                 """,
-                (team_id, start_date, end_date, athlete_key),
+                (
+                    athlete["team_id"],
+                    start_date,
+                    end_date,
+                    athlete["athlete_key"],
+                ),
             )
+
             rows = cursor.fetchall()
+
+    except Exception as error:
+
+        st.error(
+            f"Workout database error: {error}"
+        )
+
+        return []
+
     finally:
+
         conn.close()
 
-    return [
-        {
-            "date": row[0],
-            "title": row[1] or "Training",
-            "warmup": row[2] or "",
-            "main": row[3] or "",
-            "cooldown": row[4] or "",
-            "coach_notes": row[5] or "",
-            "assigned_to": row[6],
-            "video_url": row[7] or "",
-            "session": (row[8] or "AM").upper(),
-            "effort": row[9] or "",
-            "planned_miles": float(row[10]) if row[10] is not None else None,
-        }
-        for row in rows
-    ]
 
+    workouts = []
 
-def get_workouts(start_date, end_date):
-    """Fast athlete-scoped workout loader used by Home and Training."""
-    try:
-        return _get_workouts_cached(
-            athlete["team_id"],
-            athlete["athlete_key"],
-            start_date,
-            end_date,
+    for row in rows:
+
+        workouts.append(
+            {
+                "date": row[0],
+                "title": (
+                    row[1]
+                    or "Training"
+                ),
+                "warmup": (
+                    row[2]
+                    or ""
+                ),
+                "main": (
+                    row[3]
+                    or ""
+                ),
+                "cooldown": (
+                    row[4]
+                    or ""
+                ),
+                "coach_notes": (
+                    row[5]
+                    or ""
+                ),
+                "assigned_to": row[6],
+                "video_url": row[7] or "",
+                "session": (row[8] or "AM").upper(),
+                "effort": row[9] or "",
+                "planned_miles": float(row[10]) if row[10] is not None else None,
+            }
         )
-    except Exception as error:
-        st.error(f"Workout database error: {error}")
-        return []
+
+    return workouts
 
 
 # =========================================================
