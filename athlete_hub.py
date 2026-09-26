@@ -1537,7 +1537,29 @@ def handle_coros_callback_before_login():
         return
 
     if oauth_error:
-        st.query_params.clear()
+        try:
+            pending = _coros_pending_oauth(str(state))
+            if pending and pending.get("athlete_id"):
+                persistent_token = issue_persistent_athlete_session(
+                    pending["athlete_id"]
+                )
+                clean_return_params = urlencode({
+                    "session": persistent_token,
+                    "view": "Connections",
+                })
+                st.markdown(
+                    f"""
+                    <meta http-equiv="refresh" content="0; url=?{clean_return_params}">
+                    <script>
+                        window.location.replace("?{clean_return_params}");
+                    </script>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.stop()
+        except Exception:
+            pass
+
         st.session_state["coros_callback_error"] = (
             "COROS authorization was cancelled or denied."
         )
@@ -1576,13 +1598,27 @@ def handle_coros_callback_before_login():
             st.session_state["coros_success"] = "COROS connected."
             st.session_state["coros_sync_error"] = str(sync_error)
 
-        st.query_params.clear()
-        set_browser_session_token(persistent_token, view="Connections")
-        # Do not force st.rerun() here. The callback already restored
-        # logged_in/athlete_id, so this same run can render Connections.
-        # Avoiding an immediate rerun also gives the browser time to persist
-        # the session token in the URL after the external COROS redirect.
-        return
+        # COROS returns through a full external browser redirect. Instead of
+        # relying on this callback's Streamlit session surviving, immediately
+        # replace the callback URL with a clean authenticated VEKDYN URL.
+        #
+        # The HTML redirect happens in the browser after the persistent token
+        # has already been committed to Neon, so the next Streamlit request can
+        # restore the athlete from scratch even if this session disappears.
+        clean_return_params = urlencode({
+            "session": persistent_token,
+            "view": "Connections",
+        })
+        st.markdown(
+            f"""
+            <meta http-equiv="refresh" content="0; url=?{clean_return_params}">
+            <script>
+                window.location.replace("?{clean_return_params}");
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.stop()
 
     except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
         st.query_params.clear()
@@ -3938,12 +3974,12 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
         """
         <style>
         /* Training calendar rows */
-        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker) {
+        div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7)) {
             gap: 0 !important;
             flex-wrap: nowrap !important;
             width: 100% !important;
         }
-        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
         > div[data-testid="stColumn"] {
             width: 14.2857% !important;
             flex: 1 1 14.2857% !important;
@@ -3982,7 +4018,7 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
         .vekdyn-cal-gap {height:28px;}
 
         /* Only buttons in rows containing our hidden marker get calendar styling. */
-        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
         div[data-testid="stButton"] > button {
             height:76px !important;
             min-height:76px !important;
@@ -3995,11 +4031,11 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
             box-shadow:none !important;
             color:#111827 !important;
         }
-        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
         div[data-testid="stButton"] > button:hover {
             background:#f7faf7 !important;
         }
-        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
         div[data-testid="stButton"] > button p {
             font-size:20px !important;
             font-weight:650 !important;
@@ -4008,12 +4044,12 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
         }
 
         @media(max-width:720px) {
-            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker) {
+            div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7)) {
                 display:flex !important;
                 flex-direction:row !important;
                 flex-wrap:nowrap !important;
             }
-            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+            div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
             > div[data-testid="stColumn"] {
                 width:14.2857% !important;
                 flex:0 0 14.2857% !important;
@@ -4028,12 +4064,12 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
                 padding:6px 0 8px;
             }
             .vekdyn-cal-empty,
-            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+            div[data-testid="stHorizontalBlock"]
             div[data-testid="stButton"] > button {
                 height:64px !important;
                 min-height:64px !important;
             }
-            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+            div[data-testid="stHorizontalBlock"]
             div[data-testid="stButton"] > button p {
                 font-size:18px !important;
             }
@@ -4044,6 +4080,11 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
         }
         </style>
         """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        "<div id='vekdyn-training-calendar-start'></div>",
         unsafe_allow_html=True,
     )
 
@@ -4060,12 +4101,6 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
         header_cols = st.columns(7, gap=None)
         for idx, label in enumerate(weekday_labels):
             with header_cols[idx]:
-                # Hidden marker makes CSS identify this exact horizontal row.
-                if idx == 0:
-                    st.markdown(
-                        "<span class='vekdyn-cal-marker' style='display:none'></span>",
-                        unsafe_allow_html=True,
-                    )
                 st.markdown(
                     f"<div class='vekdyn-cal-weekday'>{label}</div>",
                     unsafe_allow_html=True,
@@ -4075,12 +4110,6 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
             cols = st.columns(7, gap=None)
             for idx, day_value in enumerate(week):
                 with cols[idx]:
-                    if idx == 0:
-                        st.markdown(
-                            "<span class='vekdyn-cal-marker' style='display:none'></span>",
-                            unsafe_allow_html=True,
-                        )
-
                     if day_value.month != month_first.month:
                         st.markdown(
                             "<div class='vekdyn-cal-empty'></div>",
