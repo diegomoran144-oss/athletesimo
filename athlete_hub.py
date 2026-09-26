@@ -3923,40 +3923,40 @@ def shifted_month(base_date, offset):
     return date(year, zero_based_month + 1, 1)
 
 
-def render_expanded_training_calendar(
-    start_month,
-    workouts,
-    month_count=3,
-):
-    """Original-style calendar using native Streamlit buttons.
-
-    The visual shell mimics the former HTML calendar, but date clicks stay
-    inside Streamlit session_state so authentication is never lost.
-    """
+def render_expanded_training_calendar(start_month, workouts, month_count=3):
+    """Native Streamlit calendar with the original 7-column visual layout."""
     today = date.today()
     workout_dates = {
-        item.get("date")
-        for item in workouts
-        if item.get("date") is not None
+        item.get("date") for item in workouts if item.get("date") is not None
     }
     weekday_labels = ["S", "M", "T", "W", "T", "F", "S"]
 
-    # Styling is scoped to the Training calendar container so other app buttons
-    # keep their normal appearance.
+    # IMPORTANT: don't wrap st.columns inside a keyed container. On mobile the
+    # prior scoped CSS/container interaction collapsed each 7-column row into
+    # one vertical column. Style each generated row directly instead.
     st.markdown(
         """
         <style>
-        .st-key-training_native_calendar {
-            max-width:760px;
-            margin:0 auto 1rem;
+        /* Training calendar rows */
+        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker) {
+            gap: 0 !important;
+            flex-wrap: nowrap !important;
+            width: 100% !important;
         }
-        .st-key-training_native_calendar .fs-native-month-title {
+        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        > div[data-testid="stColumn"] {
+            width: 14.2857% !important;
+            flex: 1 1 14.2857% !important;
+            min-width: 0 !important;
+        }
+
+        .vekdyn-cal-month {
             font-size:24px;
             font-weight:850;
             color:#111827;
             margin:10px 0 12px;
         }
-        .st-key-training_native_calendar .fs-native-weekday {
+        .vekdyn-cal-weekday {
             text-align:center;
             padding:6px 0 10px;
             font-size:13px;
@@ -3964,24 +3964,30 @@ def render_expanded_training_calendar(
             color:#6b7280;
             border-bottom:1px solid #e5e7eb;
         }
-        .st-key-training_native_calendar .fs-native-empty {
+        .vekdyn-cal-empty {
             height:76px;
             border-bottom:1px solid #eef0ee;
         }
-        .st-key-training_native_calendar .fs-native-month-gap {
-            height:28px;
+        .vekdyn-cal-dot {
+            height:0;
+            position:relative;
+            z-index:2;
+            top:-18px;
+            text-align:center;
+            pointer-events:none;
+            color:#91a6b5;
+            font-size:18px;
+            line-height:0;
         }
+        .vekdyn-cal-gap {height:28px;}
 
-        /* Make native Streamlit buttons visually match the old HTML date cells. */
-        .st-key-training_native_calendar div[data-testid="stButton"] {
-            margin:0 !important;
-        }
-        .st-key-training_native_calendar div[data-testid="stButton"] > button {
+        /* Only buttons in rows containing our hidden marker get calendar styling. */
+        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        div[data-testid="stButton"] > button {
             height:76px !important;
             min-height:76px !important;
             width:100% !important;
             padding:0 !important;
-            margin:0 !important;
             border:0 !important;
             border-radius:0 !important;
             border-bottom:1px solid #eef0ee !important;
@@ -3989,71 +3995,51 @@ def render_expanded_training_calendar(
             box-shadow:none !important;
             color:#111827 !important;
         }
-        .st-key-training_native_calendar div[data-testid="stButton"] > button:hover {
+        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        div[data-testid="stButton"] > button:hover {
             background:#f7faf7 !important;
         }
-        .st-key-training_native_calendar div[data-testid="stButton"] > button p {
+        div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+        div[data-testid="stButton"] > button p {
             font-size:20px !important;
             font-weight:650 !important;
             color:#111827 !important;
-            line-height:1.1 !important;
             margin:0 !important;
         }
 
-        /* Workout dot is supplied as the second line of the native button label. */
-        .st-key-training_native_calendar .fs-workout-dot {
-            text-align:center;
-            height:0;
-            position:relative;
-            top:-22px;
-            pointer-events:none;
-            color:#91a6b5;
-            font-size:19px;
-            line-height:0;
-        }
-
-        /* Today's cell: reproduce the green circular date from the old calendar. */
-        .st-key-training_native_calendar .fs-today-cell div[data-testid="stButton"] > button p {
-            width:38px !important;
-            height:38px !important;
-            border-radius:50% !important;
-            background:#2f9e44 !important;
-            color:white !important;
-            display:flex !important;
-            align-items:center !important;
-            justify-content:center !important;
-            margin:auto !important;
-            font-weight:850 !important;
-        }
-
         @media(max-width:720px) {
-            .st-key-training_native_calendar {
-                margin-left:-2px;
-                margin-right:-2px;
+            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker) {
+                display:flex !important;
+                flex-direction:row !important;
+                flex-wrap:nowrap !important;
             }
-            .st-key-training_native_calendar .fs-native-month-title {
+            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+            > div[data-testid="stColumn"] {
+                width:14.2857% !important;
+                flex:0 0 14.2857% !important;
+                min-width:0 !important;
+            }
+            .vekdyn-cal-month {
                 font-size:21px;
                 margin:8px 0 10px;
             }
-            .st-key-training_native_calendar .fs-native-weekday {
+            .vekdyn-cal-weekday {
                 font-size:12px;
-                padding-bottom:8px;
+                padding:6px 0 8px;
             }
-            .st-key-training_native_calendar .fs-native-empty,
-            .st-key-training_native_calendar div[data-testid="stButton"] > button {
+            .vekdyn-cal-empty,
+            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+            div[data-testid="stButton"] > button {
                 height:64px !important;
                 min-height:64px !important;
             }
-            .st-key-training_native_calendar div[data-testid="stButton"] > button p {
+            div[data-testid="stHorizontalBlock"]:has(.vekdyn-cal-marker)
+            div[data-testid="stButton"] > button p {
                 font-size:18px !important;
             }
-            .st-key-training_native_calendar .fs-today-cell div[data-testid="stButton"] > button p {
-                width:34px !important;
-                height:34px !important;
-            }
-            .st-key-training_native_calendar .fs-workout-dot {
-                top:-18px;
-                font-size:17px;
+            .vekdyn-cal-dot {
+                top:-15px;
+                font-size:16px;
             }
         }
         </style>
@@ -4061,69 +4047,66 @@ def render_expanded_training_calendar(
         unsafe_allow_html=True,
     )
 
-    with st.container(key="training_native_calendar"):
-        for month_offset in range(month_count):
-            month_first = shifted_month(start_month, month_offset)
-            cal = calendar.Calendar(firstweekday=6)
-            weeks = cal.monthdatescalendar(month_first.year, month_first.month)
+    for month_offset in range(month_count):
+        month_first = shifted_month(start_month, month_offset)
+        cal = calendar.Calendar(firstweekday=6)
+        weeks = cal.monthdatescalendar(month_first.year, month_first.month)
 
-            st.markdown(
-                f"<div class='fs-native-month-title'>{month_first.strftime('%B %Y')}</div>",
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            f"<div class='vekdyn-cal-month'>{month_first.strftime('%B %Y')}</div>",
+            unsafe_allow_html=True,
+        )
 
-            weekday_cols = st.columns(7, gap=None)
-            for idx, label in enumerate(weekday_labels):
-                with weekday_cols[idx]:
+        header_cols = st.columns(7, gap=None)
+        for idx, label in enumerate(weekday_labels):
+            with header_cols[idx]:
+                # Hidden marker makes CSS identify this exact horizontal row.
+                if idx == 0:
                     st.markdown(
-                        f"<div class='fs-native-weekday'>{label}</div>",
+                        "<span class='vekdyn-cal-marker' style='display:none'></span>",
                         unsafe_allow_html=True,
                     )
+                st.markdown(
+                    f"<div class='vekdyn-cal-weekday'>{label}</div>",
+                    unsafe_allow_html=True,
+                )
 
-            for week in weeks:
-                cols = st.columns(7, gap=None)
-                for day_index, day_value in enumerate(week):
-                    with cols[day_index]:
-                        if day_value.month != month_first.month:
-                            st.markdown(
-                                "<div class='fs-native-empty'></div>",
-                                unsafe_allow_html=True,
-                            )
-                            continue
-
-                        has_workout = day_value in workout_dates
-
-                        # A tiny wrapper gives today's native button its old green circle.
-                        if day_value == today:
-                            st.markdown(
-                                "<div class='fs-today-cell'>",
-                                unsafe_allow_html=True,
-                            )
-
-                        clicked = st.button(
-                            str(day_value.day),
-                            key=f"training_calendar_{day_value.isoformat()}",
-                            use_container_width=True,
+        for week in weeks:
+            cols = st.columns(7, gap=None)
+            for idx, day_value in enumerate(week):
+                with cols[idx]:
+                    if idx == 0:
+                        st.markdown(
+                            "<span class='vekdyn-cal-marker' style='display:none'></span>",
+                            unsafe_allow_html=True,
                         )
 
-                        if day_value == today:
-                            st.markdown("</div>", unsafe_allow_html=True)
+                    if day_value.month != month_first.month:
+                        st.markdown(
+                            "<div class='vekdyn-cal-empty'></div>",
+                            unsafe_allow_html=True,
+                        )
+                        continue
 
-                        if has_workout:
-                            st.markdown(
-                                "<div class='fs-workout-dot'>•</div>",
-                                unsafe_allow_html=True,
-                            )
+                    clicked = st.button(
+                        str(day_value.day),
+                        key=f"training_calendar_{day_value.isoformat()}",
+                        use_container_width=True,
+                        type="primary" if day_value == today else "secondary",
+                    )
 
-                        if clicked:
-                            st.session_state.home_selected_date = day_value
-                            st.session_state.athlete_nav = "Home"
-                            st.rerun()
+                    if day_value in workout_dates:
+                        st.markdown(
+                            "<div class='vekdyn-cal-dot'>•</div>",
+                            unsafe_allow_html=True,
+                        )
 
-            st.markdown(
-                "<div class='fs-native-month-gap'></div>",
-                unsafe_allow_html=True,
-            )
+                    if clicked:
+                        st.session_state.home_selected_date = day_value
+                        st.session_state.athlete_nav = "Home"
+                        st.rerun()
+
+        st.markdown("<div class='vekdyn-cal-gap'></div>", unsafe_allow_html=True)
 
     return None
 
