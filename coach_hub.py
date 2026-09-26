@@ -5316,8 +5316,13 @@ def render_team_workouts():
         st.warning(f"VEKDYN could not load workouts: {error}")
         return
 
-    # Team sessions are the default. If this athlete has an individual session
-    # on the same date + AM/PM slot, use the individual session instead.
+    # Build the athlete's effective plan one date + AM/PM slot at a time.
+    # Priority:
+    #   1) newest individual workout for this athlete
+    #   2) newest team workout
+    # This makes an individual workout truly override the team workout in the
+    # same slot, and also lets a newly-written individual workout replace an
+    # older individual workout instead of leaving the older one in the calendar.
     effective = {}
     for item in workouts:
         day = item.get("Date")
@@ -5325,9 +5330,23 @@ def render_team_workouts():
             day = day.date()
         slot = str(item.get("Session") or "AM").upper()
         key = (day, slot)
+
         existing = effective.get(key)
-        if existing is None or (item.get("athlete_key") == athlete_key and existing.get("athlete_key") is None):
+        item_is_individual = item.get("athlete_key") == athlete_key
+        existing_is_individual = bool(
+            existing and existing.get("athlete_key") == athlete_key
+        )
+
+        if existing is None:
             effective[key] = item
+        elif item_is_individual and not existing_is_individual:
+            # Individual beats team for the same date/session.
+            effective[key] = item
+        elif item_is_individual == existing_is_individual:
+            # Same assignment level: newest saved workout wins.
+            if int(item.get("id") or 0) > int(existing.get("id") or 0):
+                effective[key] = item
+
     calendar_workouts = list(effective.values())
 
     try:
