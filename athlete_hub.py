@@ -995,6 +995,68 @@ def coros_mcp_tool_call(access_token, tool_name, arguments):
     return "\n".join(text_parts)
 
 
+def coros_mcp_list_tools(access_token):
+    """Ask the authenticated COROS MCP server which tools it currently exposes."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": COROS_PROTOCOL_VERSION,
+    }
+
+    initialize_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": COROS_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "VEKDYN Athlete", "version": "1.0"},
+        },
+    }
+    initialize_response = requests.post(
+        COROS_MCP_URL, headers=headers, json=initialize_payload,
+        timeout=25, allow_redirects=True,
+    )
+    initialize_data = _mcp_response_json(initialize_response)
+    if initialize_data.get("error"):
+        raise RuntimeError(str(initialize_data["error"]))
+
+    session_id = initialize_response.headers.get("Mcp-Session-Id")
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+
+    initialized_response = requests.post(
+        COROS_MCP_URL,
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        },
+        timeout=15,
+        allow_redirects=True,
+    )
+    if initialized_response.status_code >= 400:
+        initialized_response.raise_for_status()
+
+    list_response = requests.post(
+        COROS_MCP_URL,
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        timeout=30,
+        allow_redirects=True,
+    )
+    list_data = _mcp_response_json(list_response)
+    if list_data.get("error"):
+        raise RuntimeError(str(list_data["error"]))
+
+    tools = list_data.get("result", {}).get("tools", [])
+    if not isinstance(tools, list):
+        raise RuntimeError("COROS returned an unexpected tools/list response.")
+    return tools
+
+
 def _parse_coros_sleep(text):
     records = {}
     pattern = re.compile(
@@ -3664,6 +3726,50 @@ def render_connections_page():
                     psycopg2.Error,
                 ) as error:
                     st.warning(f"COROS reconnect unavailable: {error}")
+
+            # Temporary diagnostic: ask COROS itself which MCP tools are available.
+            # This avoids guessing names such as querySleepData. No access token is shown.
+            if st.button(
+                "Discover COROS Tools",
+                use_container_width=True,
+                key="athlete_connections_discover_coros_tools",
+            ):
+                try:
+                    token = get_valid_coros_token(athlete_key)
+                    discovered_tools = coros_mcp_list_tools(token)
+                    st.session_state["coros_discovered_tools"] = discovered_tools
+                except (
+                    requests.RequestException,
+                    RuntimeError,
+                    psycopg2.Error,
+                ) as error:
+                    st.session_state["coros_tool_discovery_error"] = str(error)
+                st.rerun()
+
+            if st.session_state.get("coros_discovered_tools") is not None:
+                discovered_tools = st.session_state["coros_discovered_tools"]
+                st.markdown("#### COROS MCP tools")
+                if discovered_tools:
+                    for tool in discovered_tools:
+                        if not isinstance(tool, dict):
+                            continue
+                        name = str(tool.get("name") or "Unnamed tool")
+                        description = str(tool.get("description") or "").strip()
+                        st.code(name, language=None)
+                        if description:
+                            st.caption(description)
+                        input_schema = tool.get("inputSchema")
+                        if input_schema:
+                            with st.expander(f"{name} input schema"):
+                                st.json(input_schema)
+                else:
+                    st.info("COROS returned an empty MCP tool list for this account.")
+
+            if st.session_state.get("coros_tool_discovery_error"):
+                st.warning(
+                    "COROS tool discovery: "
+                    + st.session_state.pop("coros_tool_discovery_error")
+                )
 
             try:
                 latest_recovery = load_latest_coros_recovery(athlete_key)
