@@ -1935,6 +1935,17 @@ if isinstance(_return_view, list):
 if _return_view in {"Home", "Training", "Performance", "Connections"}:
     st.session_state["athlete_nav"] = _return_view
 
+_calendar_day = st.query_params.get("calday")
+if isinstance(_calendar_day, list):
+    _calendar_day = _calendar_day[0] if _calendar_day else None
+if _calendar_day:
+    try:
+        _calendar_day = date.fromisoformat(str(_calendar_day))
+        st.session_state["home_selected_date"] = _calendar_day
+        st.session_state["athlete_nav"] = "Home"
+    except ValueError:
+        pass
+
 
 # A hard browser refresh creates a new Streamlit session. Restore the
 # authenticated athlete from the persistent Neon-backed token.
@@ -3840,17 +3851,22 @@ if active_nav == "Home":
     st.markdown('<div class="mobile-section-title">My workouts</div>', unsafe_allow_html=True)
 
     today = date.today()
-    current_sunday = (
-        today
-        - timedelta(days=(today.weekday() + 1) % 7)
+    selected_day = st.session_state.home_selected_date
+
+    # Show the week containing the selected calendar day, not always today's week.
+    current_sunday = selected_day - timedelta(
+        days=(selected_day.weekday() + 1) % 7
     )
     current_saturday = current_sunday + timedelta(days=6)
 
-    # Home is the athlete's current week. Keep one selected day, like Final Surge.
-    selected_day = st.session_state.home_selected_date
-    if not (current_sunday <= selected_day <= current_saturday):
-        selected_day = today
-        st.session_state.home_selected_date = selected_day
+    # The selected calendar day is now stored in session state. Clean the
+    # one-shot URL value while keeping the persistent athlete session.
+    if st.query_params.get("calday"):
+        _session = browser_session_token()
+        st.query_params.clear()
+        if _session:
+            st.query_params["session"] = _session
+        st.query_params["view"] = "Home"
 
     st.markdown(
         f"<div class='mobile-week-range'>"
@@ -3940,7 +3956,7 @@ def render_expanded_training_calendar(start_month, workouts, month_count=3):
                     day_cells.append('<div class="fs-day fs-outside"></div>')
                     continue
 
-                params = {"calday": day_value.isoformat()}
+                params = {"calday": day_value.isoformat(), "view": "Home"}
                 if session_token:
                     params["session"] = session_token
                 href = "?" + urlencode(params)
