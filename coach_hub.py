@@ -3745,9 +3745,7 @@ if dashboard_view == "Profile":
     # PERFORMANCE BESTS AND DATA SOURCE
     # =========================================================
 
-    pb_card, source_card = st.columns([2, 1])
-
-    with pb_card:
+    if True:
         with st.container(border=True):
             st.subheader("Performance Bests")
             performance_view = st.radio(
@@ -3814,33 +3812,12 @@ if dashboard_view == "Profile":
                 else:
                     st.caption("No XC 8K or 10K PB is entered in ollu_roster_csv.")
 
-    with source_card:
-        with st.container(border=True):
-            st.subheader("Heart Rate Benchmark")
-            max_observed_hr = live_heart_rate.get(
-                "max_heart_rate",
-                recovery.get("max_observed_heart_rate", "--"),
-            )
-            max_hr_date = live_heart_rate.get(
-                "max_heart_rate_date",
-                recovery.get("max_heart_rate_date", "Not available"),
-            )
-            st.metric("8-Week Max Observed HR", f"{max_observed_hr} bpm")
-            st.caption(f"Recorded: {max_hr_date}")
-            st.caption(f"Training source: {volume_source}")
-            if live_heart_rate:
-                st.markdown("<span class='green-text'>● Strava</span>", unsafe_allow_html=True)
-            elif strava_is_connected(athlete_key):
-                st.caption("Sync an HR-enabled Strava run to update this benchmark.")
-
 if dashboard_view == "Training":
     # =========================================================
     # WEEKLY TRAINING VOLUME + HEART RATE & RECOVERY
     # =========================================================
 
-    volume_card, recovery_card = st.columns([3, 2])
-
-    with volume_card:
+    if True:
         with st.container(border=True):
             st.subheader("Weekly Training Volume")
 
@@ -3886,67 +3863,6 @@ if dashboard_view == "Training":
                         .properties(height=230)
                     )
                     st.altair_chart(mileage_chart, use_container_width=True)
-
-    with recovery_card:
-        with st.container(border=True):
-            st.subheader("Heart Rate & Recovery")
-
-            heart_updated = live_heart_rate.get(
-                "last_updated",
-                recovery.get("last_updated", "Not available"),
-            )
-            st.caption(f"Last updated: {heart_updated}")
-
-            sleep_left, sleep_right = st.columns(2)
-
-            with sleep_left:
-                sleep_hr_value = coros_recovery.get("sleep_hr_avg")
-                if sleep_hr_value is None:
-                    sleep_hr_value = coros_recovery.get("resting_hr")
-                st.metric(
-                    "Average Sleeping HR",
-                    f"{sleep_hr_value} bpm" if sleep_hr_value is not None else "—",
-                )
-                if coros_recovery.get("sleep_hr_baseline") is not None:
-                    st.caption(f"7-day sleeping-HR baseline: {coros_recovery['sleep_hr_baseline']} bpm")
-                elif coros_is_connected(athlete_key):
-                    st.caption("COROS connected")
-
-            with sleep_right:
-                coros_sleep_minutes = coros_recovery.get("sleep_minutes")
-                sleep_display = (
-                    f"{coros_sleep_minutes // 60}h {coros_sleep_minutes % 60}m"
-                    if coros_sleep_minutes is not None else "—"
-                )
-                st.metric("Sleep Time", sleep_display)
-                if coros_recovery.get("sleep_score") is not None:
-                    st.caption(f"COROS sleep score: {coros_recovery['sleep_score']}")
-
-            st.divider()
-
-            recovery_left, recovery_right = st.columns(2)
-
-            with recovery_left:
-                hrv_value = coros_recovery.get("hrv_avg")
-                st.metric(
-                    "Average HRV",
-                    f"{hrv_value} ms" if hrv_value is not None else "—",
-                )
-                if coros_recovery.get("hrv_status"):
-                    detail = f"COROS: {coros_recovery['hrv_status']}"
-                    if coros_recovery.get("hrv_baseline") is not None:
-                        detail += f" · baseline {coros_recovery['hrv_baseline']} ms"
-                    if (coros_recovery.get("hrv_normal_low") is not None
-                            and coros_recovery.get("hrv_normal_high") is not None):
-                        detail += f" · normal {coros_recovery['hrv_normal_low']}–{coros_recovery['hrv_normal_high']} ms"
-                    st.caption(detail)
-
-            with recovery_right:
-                recovery_score = coros_recovery.get("recovery_score")
-                recovery_display = f"{recovery_score}%" if recovery_score is not None else "—"
-                st.metric("VEKDYN Recovery Score", recovery_display)
-                if recovery_score is not None:
-                    st.caption("Sleep + individualized HRV + average sleeping HR")
 
 # =========================================================
 # VEKDYN PERFORMANCE PREDICTION ENGINE
@@ -5787,66 +5703,104 @@ if dashboard_view == "Dashboard":
 # COMPACT DASHBOARD — HEART RATE & SLEEP
 # =========================================================
 
+def classify_team_recovery(data):
+    """Conservative coaching flags; no data is never interpreted as normal."""
+    if not data:
+        return "No Data", ["No recent recovery measurements available."]
+    flags = []
+    measured = 0
+    sleep = data.get("sleep_minutes")
+    if sleep is not None:
+        measured += 1
+        if sleep < 360:
+            flags.append("Sleep under 6 hours")
+        elif sleep < 420:
+            flags.append("Sleep under 7 hours")
+    hrv = data.get("hrv_avg")
+    low = data.get("hrv_normal_low")
+    if hrv is not None and low is not None:
+        measured += 1
+        if hrv < low:
+            flags.append("HRV below personal normal range")
+    heart = data.get("sleep_hr_avg")
+    baseline = data.get("sleep_hr_baseline")
+    if heart is not None and baseline:
+        measured += 1
+        if heart > baseline * 1.08:
+            flags.append("Sleeping heart rate elevated over baseline")
+    if measured == 0:
+        return "No Data", ["Insufficient baseline data for a recovery assessment."]
+    if len(flags) >= 2:
+        return "Attention", flags
+    if flags:
+        return "Monitor", flags
+    return "Normal", ["Available indicators show no flagged deviations."]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_team_recovery_snapshots(team_id, athlete_keys):
+    """Read the latest stored recovery for each team member, without external API calls."""
+    results = {}
+    for key in athlete_keys:
+        try:
+            results[key] = cached_latest_coros_recovery(key)
+        except Exception:
+            results[key] = {}
+    return results
+
+
 if dashboard_view == "Dashboard":
-    st.markdown('<div class="compact-section-title">Heart Rate & Sleep</div>', unsafe_allow_html=True)
-    max_hr = (
-        194
-        if active_team == DEMO_TEAM_ID
-        else live_heart_rate.get("max_heart_rate", "—")
-    )
-    resting_hr = coros_recovery.get("sleep_hr_avg")
-    if resting_hr is None:
-        resting_hr = coros_recovery.get("resting_hr")
-    sleep_minutes = coros_recovery.get("sleep_minutes")
-    hrv_value = coros_recovery.get("hrv_avg")
-
-    if sleep_minutes is not None:
-        sleep_hours = int(sleep_minutes) // 60
-        sleep_remainder = int(sleep_minutes) % 60
-        sleep_display = f"{sleep_hours}h {sleep_remainder:02d}m"
+    st.subheader("Team Recovery Overview")
+    st.caption("Recovery indicators are screening flags, not medical diagnoses or definitive readiness scores.")
+    if active_team == DEMO_TEAM_ID:
+        snapshots = {key: {} for key in athletes}
     else:
-        sleep_display = "—"
+        snapshots = load_team_recovery_snapshots(active_team, tuple(sorted(athletes)))
 
-    # Small color-coded metric accents make each recovery card easier to scan
-    # without changing the clean white-card layout or the value typography.
-    metric_label_style = (
-        "font-size:0.78rem;font-weight:700;letter-spacing:0.02em;"
-        "color:#667085;display:flex;align-items:center;gap:0.42rem;"
-        "margin-bottom:0.25rem;white-space:nowrap;"
-    )
+    with st.container(border=True):
+        heading_left, heading_right, heading_detail = st.columns([3, 2, 1])
+        heading_left.markdown("**Athlete**")
+        heading_right.markdown("**Recovery**")
+        heading_detail.markdown("**Details**")
 
-    hr1, hr2, hr3, hr4 = st.columns(4)
-    with hr1:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#ef4444;font-size:1.05rem;line-height:1;">♥</span><span>MAX HR</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {max_hr} bpm")
-
-    with hr2:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#3b82f6;font-size:1.05rem;line-height:1;">●</span><span>RESTING HR</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {resting_hr if resting_hr is not None else '—'} bpm")
-
-    with hr3:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#8b5cf6;font-size:1.08rem;line-height:1;">☾</span><span>SLEEP</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {sleep_display}")
-
-    with hr4:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#22c55e;font-size:0.98rem;line-height:1;letter-spacing:-0.12rem;">▮▮</span><span>HRV</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {hrv_value if hrv_value is not None else '—'} ms")
+        status_colors = {
+            "Normal": "#15803d",
+            "Monitor": "#b45309",
+            "Attention": "#b91c1c",
+            "No Data": "#667085",
+        }
+        for member_key, member in sorted(
+            athletes.items(), key=lambda item: item[1]["profile"]["name"].lower()
+        ):
+            snapshot = snapshots.get(member_key) or {}
+            status, reasons = classify_team_recovery(snapshot)
+            name = member["profile"]["name"]
+            with st.expander(f"{name}    •    {status}", expanded=False):
+                st.markdown(
+                    f'<span style="font-weight:700;color:{status_colors[status]}">'
+                    f'{status}</span>',
+                    unsafe_allow_html=True,
+                )
+                metrics = st.columns(3)
+                minutes = snapshot.get("sleep_minutes")
+                metrics[0].metric(
+                    "Sleep",
+                    f"{int(minutes)//60}h {int(minutes)%60:02d}m"
+                    if minutes is not None else "—",
+                )
+                hrv = snapshot.get("hrv_avg")
+                metrics[1].metric("HRV", f"{hrv} ms" if hrv is not None else "—")
+                hr = snapshot.get("sleep_hr_avg")
+                if hr is None:
+                    hr = snapshot.get("resting_hr")
+                metrics[2].metric("Heart Rate", f"{hr} bpm" if hr is not None else "—")
+                if snapshot.get("hrv_baseline") is not None:
+                    st.caption(f"HRV baseline: {snapshot['hrv_baseline']} ms")
+                if snapshot.get("sleep_hr_baseline") is not None:
+                    st.caption(f"Sleeping HR baseline: {snapshot['sleep_hr_baseline']} bpm")
+                for reason in reasons:
+                    st.caption(f"• {reason}")
+        st.caption("Missing measurements are never classified as normal. Review trends and athlete feedback before changing training.")
 
 # =========================================================
 # TRAINING VOLUME — PLANNED WEEK SUMMARY
