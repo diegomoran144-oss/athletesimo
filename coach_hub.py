@@ -689,6 +689,10 @@ def initialize_athlete_login_database():
                 """
             )
 
+            # Email is a login alias, never the permanent athlete identifier.
+            cursor.execute("ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS login_email TEXT")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS athlete_logins_login_email_unique ON athlete_logins (LOWER(login_email)) WHERE login_email IS NOT NULL")
+
             # ---------------------------------------------------------
             # MIGRATE VALUES FROM OLDER ATHLETE-APP COLUMN NAMES
             # ---------------------------------------------------------
@@ -762,7 +766,8 @@ def get_athlete_login_account(athlete_key):
                     event_group,
                     active,
                     password_updated_at,
-                    COALESCE(must_change_password, FALSE)
+                    COALESCE(must_change_password, FALSE),
+                    login_email
                 FROM athlete_logins
                 WHERE athlete_key = %s
                    OR athlete_id = %s
@@ -784,6 +789,7 @@ def get_athlete_login_account(athlete_key):
         "active": bool(row[5]),
         "password_updated_at": row[6],
         "must_change_password": bool(row[7]),
+        "login_email": row[8],
     }
 
 
@@ -890,109 +896,91 @@ def set_athlete_login_active(athlete_key, active):
         database.commit()
 
 
-def render_athlete_account_manager(athlete_key, profile, team_id):
-    """Coach-facing controls for one athlete's VEKDYN Athlete login."""
+def set_athlete_login_email(athlete_key, email):
+    """Set a unique email alias without changing the permanent athlete ID."""
+    import re
+    normalized = str(email or "").strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized):
+        raise ValueError("Enter a valid athlete email address.")
+    initialize_athlete_login_database()
+    with get_database_connection() as database:
+        with database.cursor() as cursor:
+            cursor.execute(
+                "UPDATE athlete_logins SET login_email = %s WHERE athlete_key = %s OR athlete_id = %s RETURNING athlete_id",
+                (normalized, athlete_key, athlete_key),
+            )
+            if not cursor.fetchone():
+                raise ValueError("Create the athlete account before assigning an email.")
+        database.commit()
+    return normalized
 
+
+def render_athlete_account_manager(athlete_key, profile, team_id):
+    """Coach-facing email alias setup; legacy credentials remain until athlete app migrates."""
     athlete_name = profile.get("name", athlete_key)
     event_group = profile.get("team", "Distance") or "Distance"
-
+    st.subheader("Athlete Account")
+    st.caption("Athletes will use their email address to sign in once the VEKDYN Athlete login is updated. Existing account IDs and device links are preserved.")
     try:
         account = get_athlete_login_account(athlete_key)
     except psycopg2.Error as error:
-        st.error(f"VEKDYN could not load this athlete account: {error}")
+        st.error(f"Could not load athlete account: {error}")
         return
 
-    st.subheader("Athlete Account")
-    st.caption(
-        "Create the private login this athlete will use in VEKDYN Athlete. "
-        "The temporary password is never stored in readable form."
-    )
-
     with st.container(border=True):
-        status_col, id_col = st.columns([1, 2])
-
-        with status_col:
-            if account and account.get("active"):
-                st.success("Login active")
-            elif account:
-                st.warning("Login disabled")
-            else:
-                st.info("No login created")
-
-        with id_col:
-            login_id = account.get("athlete_id") if account else str(athlete_key).lower()
-            st.markdown(f"**Athlete ID:** `{login_id}`")
-            st.caption(f"Linked to {athlete_name} · {team_config(team_id)['short_name']}")
-
-        button_label = (
-            "Reset Temporary Password"
-            if account
-            else "Create Athlete Login"
-        )
-
-        if st.button(
-                button_label,
-                type="primary",
-                use_container_width=True,
-                key=f"athlete_login_create_reset_{team_id}_{athlete_key}",
-        ):
-            try:
-                new_athlete_id, temporary_password = create_or_reset_athlete_login(
-                    athlete_key=athlete_key,
-                    team_id=team_id,
-                    display_name=athlete_name,
-                    event_group=event_group,
-                )
-
-                st.session_state[f"temp_login_id_{athlete_key}"] = new_athlete_id
-                st.session_state[f"temp_password_{athlete_key}"] = temporary_password
-                st.session_state[f"temp_password_notice_{athlete_key}"] = True
-
-                st.rerun()
-
-            except (ValueError, psycopg2.Error) as error:
-                st.error(f"VEKDYN could not create the athlete login: {error}")
-
-        temp_password = st.session_state.get(f"temp_password_{athlete_key}")
-        temp_login_id = st.session_state.get(f"temp_login_id_{athlete_key}")
-
-        if temp_password and temp_login_id:
-            st.success("Temporary athlete credentials generated.")
-            st.code(
-                f"Athlete ID: {temp_login_id}\n"
-                f"Temporary password: {temp_password}",
-                language=None,
-            )
-            st.caption(
-                "Give these credentials directly to the athlete. "
-                "The readable password is only being kept in this coach session."
-            )
-
-            if st.button(
-                    "Clear Temporary Password",
-                    use_container_width=True,
-                    key=f"clear_temp_password_{team_id}_{athlete_key}",
-            ):
-                st.session_state.pop(f"temp_login_id_{athlete_key}", None)
-                st.session_state.pop(f"temp_password_{athlete_key}", None)
-                st.session_state.pop(f"temp_password_notice_{athlete_key}", None)
-                st.rerun()
-
         if account:
-            st.divider()
-            active_now = bool(account.get("active"))
-            toggle_label = "Disable Athlete Login" if active_now else "Enable Athlete Login"
+            st.success("Account active" if account.get("active") else "Account disabled")
+            st.caption(f"{athlete_name} · {team_config(team_id)['short_name']}")
+            email = st.text_input(
+                "Athlete email / future username",
+                value=account.get("login_email") or "",
+                key=f"athlete_email_{team_id}_{athlete_key}",
+                placeholder="athlete@university.edu",
+            )
+            if st.button("Save athlete email", key=f"save_email_{team_id}_{athlete_key}"):
+                try:
+                    saved = set_athlete_login_email(athlete_key, email)
+                    st.success(f"Email saved: {saved}")
+                    st.rerun()
+                except psycopg2.errors.UniqueViolation:
+                    st.error("This email is already linked to another athlete.")
+                except (ValueError, psycopg2.Error) as error:
+                    st.error(f"Could not save email: {error}")
+            st.caption("Email sign-in and self-service password setup require the matching update in VEKDYN Athlete. Saving an email here does not send an invitation.")
+        else:
+            st.info("This athlete does not have a login account yet.")
 
+        # Preserve existing sign-in until the athlete application is migrated.
+        with st.expander("Legacy account administration", expanded=False):
             if st.button(
-                    toggle_label,
-                    use_container_width=True,
-                    key=f"toggle_athlete_login_{team_id}_{athlete_key}_{active_now}",
+                "Reset temporary password" if account else "Create legacy athlete login",
+                key=f"athlete_login_create_reset_{team_id}_{athlete_key}",
             ):
                 try:
-                    set_athlete_login_active(athlete_key, not active_now)
+                    login_id, password = create_or_reset_athlete_login(
+                        athlete_key=athlete_key, team_id=team_id,
+                        display_name=athlete_name, event_group=event_group,
+                    )
+                    st.session_state[f"temp_login_id_{athlete_key}"] = login_id
+                    st.session_state[f"temp_password_{athlete_key}"] = password
                     st.rerun()
-                except psycopg2.Error as error:
-                    st.error(f"VEKDYN could not update login status: {error}")
+                except (ValueError, psycopg2.Error) as error:
+                    st.error(f"Could not create/reset login: {error}")
+            password = st.session_state.get(f"temp_password_{athlete_key}")
+            if password:
+                st.code(f"Legacy ID: {st.session_state.get(f'temp_login_id_{athlete_key}')}\nTemporary password: {password}")
+                if st.button("Clear credentials", key=f"clear_temp_password_{team_id}_{athlete_key}"):
+                    st.session_state.pop(f"temp_login_id_{athlete_key}", None)
+                    st.session_state.pop(f"temp_password_{athlete_key}", None)
+                    st.rerun()
+            if account:
+                active = bool(account.get("active"))
+                if st.button("Disable login" if active else "Enable login", key=f"toggle_athlete_login_{team_id}_{athlete_key}_{active}"):
+                    try:
+                        set_athlete_login_active(athlete_key, not active)
+                        st.rerun()
+                    except psycopg2.Error as error:
+                        st.error(f"Could not update account: {error}")
 
 
 # =========================================================
@@ -3765,7 +3753,6 @@ if dashboard_view == "Profile":
                                 f"""
                                 <div class="pb-event">{event.upper()}</div>
                                 <div class="pb-time">{personal_bests[event]}</div>
-                                <div class="green-text">Watch Race ↗</div>
                                 """,
                                 unsafe_allow_html=True,
                             )
