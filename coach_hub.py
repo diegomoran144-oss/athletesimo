@@ -915,6 +915,77 @@ def set_athlete_login_email(athlete_key, email):
     return normalized
 
 
+
+# =========================================================
+# SECURE ATHLETE INVITATIONS (shared Neon database)
+# =========================================================
+
+def initialize_athlete_invitations():
+    with get_database_connection() as db:
+        with db.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS athlete_invitations (
+                token_hash TEXT PRIMARY KEY,
+                athlete_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at TIMESTAMPTZ
+            )""")
+            cur.execute("CREATE INDEX IF NOT EXISTS athlete_invitations_athlete_idx ON athlete_invitations (athlete_id)")
+        db.commit()
+
+
+def send_athlete_invitation(athlete_key, athlete_email):
+    """Issue a single-use, 24-hour invitation and send it using configured SMTP."""
+    import secrets, hashlib, smtplib, ssl
+    from email.message import EmailMessage
+    from urllib.parse import urlencode
+    email = str(athlete_email or "").strip().lower()
+    smtp_host = str(st.secrets.get("INVITE_SMTP_HOST", "")).strip()
+    smtp_user = str(st.secrets.get("INVITE_SMTP_USER", "")).strip()
+    smtp_password = str(st.secrets.get("INVITE_SMTP_PASSWORD", ""))
+    sender = str(st.secrets.get("INVITE_FROM_EMAIL", "")).strip()
+    athlete_url = str(st.secrets.get("VEKDYN_ATHLETE_URL", "")).strip().rstrip("/")
+    smtp_port = int(st.secrets.get("INVITE_SMTP_PORT", 587))
+    if not all([smtp_host, smtp_user, smtp_password, sender, athlete_url]):
+        raise RuntimeError("Configure INVITE_SMTP_HOST, INVITE_SMTP_USER, INVITE_SMTP_PASSWORD, INVITE_FROM_EMAIL and VEKDYN_ATHLETE_URL in Coach Streamlit Secrets.")
+    if not athlete_url.startswith("https://"):
+        raise ValueError("VEKDYN_ATHLETE_URL must be HTTPS.")
+    initialize_athlete_invitations()
+    raw_token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(raw_token.encode()).hexdigest()
+    with get_database_connection() as db:
+        with db.cursor() as cur:
+            cur.execute("""SELECT athlete_id, login_email, active FROM athlete_logins
+                           WHERE athlete_key=%s OR athlete_id=%s FOR UPDATE""", (athlete_key, athlete_key))
+            row = cur.fetchone()
+            if not row or not row[2] or not row[1] or row[1].strip().lower() != email:
+                raise ValueError("An active athlete account with the saved email is required.")
+            athlete_id = row[0]
+            cur.execute("DELETE FROM athlete_invitations WHERE athlete_id=%s AND used_at IS NULL", (athlete_id,))
+            cur.execute("""INSERT INTO athlete_invitations (token_hash, athlete_id, email, expires_at)
+                           VALUES (%s,%s,%s,NOW() + INTERVAL '24 hours')""", (digest, athlete_id, email))
+        db.commit()
+    link = athlete_url + "?" + urlencode({"invite": raw_token})
+    msg = EmailMessage()
+    msg["Subject"] = "Activate your VEKDYN Athlete account"
+    msg["From"] = sender
+    msg["To"] = email
+    msg.set_content("Welcome to VEKDYN Athlete. Set your password using this one-time link (expires in 24 hours):\n\n" + link + "\n\nIf you weren't expecting this, ignore this message.")
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.starttls(context=ssl.create_default_context())
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+    except Exception:
+        # Never leave an unsent invitation valid.
+        with get_database_connection() as db:
+            with db.cursor() as cur:
+                cur.execute("DELETE FROM athlete_invitations WHERE token_hash=%s", (digest,))
+            db.commit()
+        raise RuntimeError("Invitation email could not be sent. Check SMTP configuration and retry.")
+    return email
+
 def render_athlete_account_manager(athlete_key, profile, team_id):
     """Coach-facing email alias setup; legacy credentials remain until athlete app migrates."""
     athlete_name = profile.get("name", athlete_key)
@@ -946,7 +1017,13 @@ def render_athlete_account_manager(athlete_key, profile, team_id):
                     st.error("This email is already linked to another athlete.")
                 except (ValueError, psycopg2.Error) as error:
                     st.error(f"Could not save email: {error}")
-            st.caption("Email sign-in and self-service password setup require the matching update in VEKDYN Athlete. Saving an email here does not send an invitation.")
+            st.caption("After saving the email, send a one-time invitation. The athlete sets their own password.")
+            if st.button("Send invitation email", key=f"invite_{team_id}_{athlete_key}", disabled=not account.get("login_email") or not account.get("active")):
+                try:
+                    destination = send_athlete_invitation(athlete_key, account.get("login_email"))
+                    st.success(f"Invitation sent to {destination}. Link expires in 24 hours.")
+                except (ValueError, RuntimeError, psycopg2.Error) as error:
+                    st.error(str(error))
         else:
             st.info("This athlete does not have a login account yet.")
 

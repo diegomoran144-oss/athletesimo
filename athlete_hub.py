@@ -2355,6 +2355,98 @@ st.markdown(
 )
 
 
+
+# =========================================================
+# SECURE ATHLETE INVITATIONS (shared Neon database)
+# =========================================================
+
+def initialize_athlete_invitations():
+    with get_database_connection() as db:
+        with db.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS athlete_invitations (
+                token_hash TEXT PRIMARY KEY,
+                athlete_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at TIMESTAMPTZ
+            )""")
+            cur.execute("CREATE INDEX IF NOT EXISTS athlete_invitations_athlete_idx ON athlete_invitations (athlete_id)")
+        db.commit()
+
+
+def invitation_details(raw_token):
+    """Look up a valid invitation; never reveal tokens or password hashes."""
+    initialize_athlete_invitations()
+    digest = hashlib.sha256(str(raw_token).encode()).hexdigest()
+    with get_database_connection() as db:
+        with db.cursor() as cur:
+            cur.execute("""SELECT i.athlete_id, i.email
+                           FROM athlete_invitations i JOIN athlete_logins a ON a.athlete_id=i.athlete_id
+                           WHERE i.token_hash=%s AND i.used_at IS NULL AND i.expires_at>NOW()
+                             AND a.active=TRUE AND LOWER(TRIM(a.login_email))=i.email""", (digest,))
+            return cur.fetchone()
+
+
+def accept_athlete_invitation(raw_token, new_password):
+    """Consume token once and set password atomically, invalidating old sessions."""
+    if len(new_password) < 12 or len(new_password.encode('utf-8')) > 72:
+        raise ValueError("Use a password of 12–72 UTF-8 bytes.")
+    digest = hashlib.sha256(str(raw_token).encode()).hexdigest()
+    hashed = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode()
+    with get_database_connection() as db:
+        with db.cursor() as cur:
+            cur.execute("""SELECT athlete_id, email FROM athlete_invitations
+                           WHERE token_hash=%s AND used_at IS NULL AND expires_at>NOW() FOR UPDATE""", (digest,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("This invitation has expired or has already been used.")
+            cur.execute("""UPDATE athlete_logins SET password_hash=%s, must_change_password=FALSE,
+                           password_updated_at=NOW() WHERE athlete_id=%s AND active=TRUE
+                           AND LOWER(TRIM(login_email))=%s""", (hashed, row[0], row[1]))
+            if cur.rowcount != 1:
+                raise ValueError("The invitation no longer matches an active account.")
+            cur.execute("UPDATE athlete_invitations SET used_at=NOW() WHERE token_hash=%s", (digest,))
+            cur.execute("UPDATE athlete_sessions SET revoked=TRUE WHERE athlete_id=%s", (row[0],))
+        db.commit()
+    return row[0]
+
+# =========================================================
+# INVITATION ACTIVATION — BEFORE SIGN-IN
+# =========================================================
+if not st.session_state.logged_in and st.query_params.get("invite"):
+    invitation_token = str(st.query_params.get("invite"))
+    st.title("Activate VEKDYN Athlete")
+    try:
+        invitation = invitation_details(invitation_token)
+    except psycopg2.Error:
+        invitation = None
+        st.error("Unable to verify the invitation right now. Try again later.")
+    if invitation:
+        st.caption(f"Create a password for {invitation[1]}. This link is valid once.")
+        with st.form("accept_invitation_form"):
+            password = st.text_input("New password (12 characters minimum)", type="password")
+            confirmation = st.text_input("Confirm password", type="password")
+            activate = st.form_submit_button("Activate my account", type="primary")
+        if activate:
+            if password != confirmation:
+                st.error("Passwords do not match.")
+            else:
+                try:
+                    athlete_id = accept_athlete_invitation(invitation_token, password)
+                    st.query_params.clear()
+                    st.session_state.logged_in = True
+                    st.session_state.athlete_id = athlete_id
+                    st.session_state.password_change_required = False
+                    session = issue_persistent_athlete_session(athlete_id)
+                    set_browser_session_token(session)
+                    st.rerun()
+                except (ValueError, psycopg2.Error) as error:
+                    st.error(str(error))
+    else:
+        st.warning("Invitation expired, already used, or invalid. Ask your coach to send a new one.")
+    st.stop()
+
 # =========================================================
 # LOGIN PAGE
 # =========================================================
