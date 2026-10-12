@@ -4463,11 +4463,97 @@ def load_conference_results(team_id, season, event, division):
             return cursor.fetchall()
 
 
+def sync_bundled_rrac_results(team_id):
+    """Import bundled RRAC results once per file revision, not on every rerun.
+
+    The CSV must also be committed to the Streamlit Cloud GitHub repository.
+    This imports a local snapshot; it does not fetch live TFRRS results.
+    """
+    if team_id != "ollu_distance":
+        return None
+    base = Path(__file__).resolve().parent
+    candidates = [base / "rrac_top8_2026_championship.csv", base / "rrac_results.csv"]
+    csv_path = next((candidate for candidate in candidates if candidate.exists() and candidate.stat().st_size > 100), None)
+    if csv_path is None:
+        return "No bundled RRAC results CSV found in deployed project."
+    raw = csv_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    frame = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    frame.columns = [str(column).strip().lower() for column in frame.columns]
+    required = {"athlete", "school", "gender", "event", "performance", "season"}
+    missing = required - set(frame.columns)
+    if missing:
+        return f"RRAC CSV missing columns: {', '.join(sorted(missing))}"
+    # Normalize the season label used by the downloaded results CSV.
+    frame["season"] = frame["season"].str.strip().replace({
+        "2026 Outdoor": "Outdoor 2026", "2026 Indoor": "Indoor 2026",
+        "2027 Outdoor": "Outdoor 2027", "2027 Indoor": "Indoor 2027",
+    })
+    frame["division"] = frame["gender"].str.strip().str.lower().map({
+        "m": "Men", "men": "Men", "male": "Men",
+        "f": "Women", "women": "Women", "female": "Women",
+    })
+    frame["event"] = frame["event"].str.strip()
+    frame["athlete"] = frame["athlete"].str.strip()
+    frame["school"] = frame["school"].str.strip()
+    frame["performance"] = frame["performance"].str.strip()
+    frame = frame[(frame["division"].notna()) & (frame["athlete"] != "") &
+                  (frame["school"] != "") & (frame["performance"] != "")].copy()
+    if frame.empty:
+        return "RRAC CSV has no usable performances."
+    # Validate the entire file before touching the database.
+    records = []
+    for _, item in frame.iterrows():
+        records.append((team_id, item["season"], item["event"], item["division"],
+                        item["athlete"], item["school"],
+                        parse_conference_time(item["performance"]), item["performance"],
+                        item.get("meet_date", "")))
+    # Preserve the best mark for duplicate athlete/event combinations.
+    best = {}
+    for record in records:
+        key = (record[0], record[1], record[2], record[3], record[4].casefold(), record[5].casefold())
+        if key not in best or record[6] < best[key][6]:
+            best[key] = record
+    records = list(best.values())
+    initialize_conference_results_database()
+    with get_database_connection() as db:
+        with db.cursor() as cursor:
+            cursor.execute("""CREATE TABLE IF NOT EXISTS conference_csv_imports (
+                team_id TEXT NOT NULL, filename TEXT NOT NULL, sha256 TEXT NOT NULL,
+                imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (team_id, filename))""")
+            cursor.execute("SELECT sha256 FROM conference_csv_imports WHERE team_id=%s AND filename=%s",
+                           (team_id, csv_path.name))
+            previous = cursor.fetchone()
+            if previous and previous[0] == digest:
+                return None
+            # Only replace the event/season/division groups included in this file.
+            groups = sorted({(r[1], r[2], r[3]) for r in records})
+            for season, event, division in groups:
+                cursor.execute("""DELETE FROM conference_results
+                    WHERE team_id=%s AND season=%s AND event=%s AND division=%s""",
+                    (team_id, season, event, division))
+            cursor.executemany("""INSERT INTO conference_results
+                (team_id,season,event,division,athlete,school,performance_seconds,performance_text,meet_date)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", records)
+            cursor.execute("""INSERT INTO conference_csv_imports (team_id,filename,sha256)
+                VALUES (%s,%s,%s) ON CONFLICT (team_id,filename) DO UPDATE SET
+                sha256=EXCLUDED.sha256, imported_at=NOW()""", (team_id, csv_path.name, digest))
+        db.commit()
+    return f"Imported {len(records)} RRAC results from {csv_path.name}."
+
+
 def render_conference_rankings(team_id, athlete_profile, prediction):
     st.markdown("---")
     with st.container(border=True):
         st.subheader("Conference Rankings")
         st.caption(CONFERENCE_BY_TEAM.get(team_id, "Conference not configured"))
+        try:
+            sync_status = sync_bundled_rrac_results(team_id)
+            if sync_status:
+                st.caption(sync_status)
+        except (ValueError, psycopg2.Error, pd.errors.ParserError, OSError) as error:
+            st.warning(f"Bundled RRAC import failed: {error}")
         event_col, season_col, division_col = st.columns(3)
         with event_col:
             event = st.selectbox("Event", ["1500m", "800m", "Mile", "3000m", "5000m", "10000m"], key="conference_event")
@@ -4523,7 +4609,7 @@ def render_conference_rankings(team_id, athlete_profile, prediction):
         c.metric("Potential Scoring Position", "Top 8" if projected_rank and projected_rank <= 8 else "—")
         st.caption("Projected rank compares the model's 1500m estimate with imported marks; ties and championship entry rules may affect actual placement. Scoring position is illustrative, not guaranteed points.")
         display = pd.DataFrame([{"Rank": i+1, "Athlete": r[0], "School": r[1], "Time": r[3], "Date": r[4] or "—"}
-                                for i, r in enumerate(rows)])
+                                for i, r in enumerate(rows[:8])])
         st.dataframe(display, hide_index=True, use_container_width=True)
 
 
