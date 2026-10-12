@@ -4606,12 +4606,10 @@ def render_conference_rankings(team_id, athlete_profile, prediction):
             if prediction.get(seconds_key) is not None:
                 projected = float(prediction[seconds_key])
                 projected_label = prediction.get(label_key)
-        current_rank = own + 1 if own is not None else None
         # Do not count the athlete's own existing mark as an opponent.
         projected_rank = (1 + sum(1 for i, r in enumerate(rows)
                                   if i != own and float(r[2]) < projected)) if projected is not None else None
-        a, b, c = st.columns(3)
-        a.metric("Current Conference Rank", f"#{current_rank}" if current_rank else "—")
+        b, c = st.columns(2)
         b.metric("Projected Conference Rank", f"#{projected_rank}" if projected_rank else "—")
         c.metric("Potential Scoring Position", "Top 8" if projected_rank and projected_rank <= 8 else "—")
         if projected is not None:
@@ -4621,13 +4619,13 @@ def render_conference_rankings(team_id, athlete_profile, prediction):
         if event == "5000m" and projected is not None:
             st.caption("5K estimate is provisional: it blends the existing 5K PB with the model's 1500m-equivalent estimate. It is not an independently calibrated 5K model.")
         st.caption("Official performances remain unchanged. Projected rank is hypothetical, based on imported results; ties and championship entry rules may affect actual placement.")
-        display_rows = [{"Rank": i+1, "Athlete": r[0], "School": r[1], "Time": r[3], "Date": r[4] or "—", "Type": "Official"}
+        display_rows = [{"Rank": i+1, "Athlete": r[0], "School": r[1], "Time": r[3], "Type": "Official"}
                         for i, r in enumerate(rows)]
         if projected is not None:
             # Insert a clearly labeled projection without altering any official marks.
             projection_row = {"Rank": projected_rank, "Athlete": athlete_profile.get("name", "Selected athlete"),
                               "School": athlete_profile.get("school", ""), "Time": projected_label,
-                              "Date": "—", "Type": "VEKDYN projection"}
+                              "Type": "VEKDYN projection"}
             display_rows.insert(max(0, projected_rank - 1), projection_row)
             # Recalculate display positions to avoid duplicate numeric labels.
             for index, item in enumerate(display_rows):
@@ -4656,91 +4654,75 @@ if dashboard_view == "Predictor":
     )
 
     with st.container(border=True):
-
         st.subheader("Performance Predictions")
+        st.caption("Projected race performances based on the current athlete profile.")
 
-        if vekdyn_prediction.get("is_female"):
-            st.caption(
-                "VEKDYN Women's V1: 5K aerobic strength is the primary anchor, "
-                "with 800m speed reserve and volume as modifiers. Threshold calibration is pending coach testing data."
-            )
-        else:
-            st.caption(
-                "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
-                "supported by threshold, volume compatibility, and preserved elasticity."
-            )
-
-        prediction_col, confidence_col, factors_col = st.columns([2, 1, 2])
-
+        prediction_col, confidence_col = st.columns([3, 1])
         with prediction_col:
-            st.caption("Predicted 1500m Range")
-
-            if vekdyn_prediction["available"]:
-                st.markdown(f"## {vekdyn_prediction['1500_range']}")
-                st.caption(
-                    f"Estimated mile capability: {vekdyn_prediction['mile_display']}"
-                )
-                if vekdyn_prediction.get("5000_display"):
-                    st.caption(f"Provisional 5000m estimate: {vekdyn_prediction['5000_display']}")
+            if vekdyn_prediction.get("available"):
+                race_a, race_b = st.columns(2)
+                with race_a:
+                    st.caption("Projected 1500m Range")
+                    st.markdown(f"## {vekdyn_prediction['1500_range']}")
+                    st.caption(f"Projected mile: {vekdyn_prediction['mile_display']}")
+                with race_b:
+                    st.caption("Projected 5000m")
+                    if vekdyn_prediction.get("5000_display"):
+                        st.markdown(f"## {vekdyn_prediction['5000_display']}")
+                        st.caption("Provisional estimate — calibration ongoing")
+                    else:
+                        st.markdown("## --")
+                        st.caption("Insufficient data for a 5000m estimate")
             else:
                 st.markdown("## --")
-                st.caption(vekdyn_prediction["reason"])
-
-            st.caption("Prediction updates as athlete and training data change.")
+                st.caption(vekdyn_prediction.get("reason", "Insufficient data for a prediction."))
+            st.caption("Predictions update as athlete and training data change.")
 
         with confidence_col:
             confidence = vekdyn_prediction.get("confidence", 0)
-
-            st.metric(
-                "Confidence",
-                f"{confidence}%"
-            )
-
+            st.metric("Confidence", f"{confidence}%")
             if confidence >= 85:
                 confidence_label = "High Confidence"
             elif confidence >= 70:
                 confidence_label = "Moderate Confidence"
             else:
                 confidence_label = "Developing Confidence"
-
             st.caption(confidence_label)
 
-            recent_miles = vekdyn_prediction.get("weekly_miles")
-            if recent_miles is not None:
-                st.caption(f"Recent volume: {recent_miles:.1f} mi/wk")
-
-        with factors_col:
+        # Coaches see the predictions first; the model explanation is optional.
+        with st.expander("Why VEKDYN predicts these times", expanded=False):
+            if vekdyn_prediction.get("is_female"):
+                st.caption(
+                    "VEKDYN Women's V1: 5K aerobic strength is the primary anchor, "
+                    "with 800m speed reserve and volume as modifiers. "
+                    "Threshold calibration is pending coach testing data."
+                )
+            else:
+                st.caption(
+                    "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
+                    "supported by threshold, volume compatibility, and preserved elasticity."
+                )
             st.write("**Performance Factors**")
-
-            st.progress(
-                vekdyn_prediction.get("aerobic_score", 0) / 100,
-                text="Aerobic Fitness"
-            )
-
+            st.progress(vekdyn_prediction.get("aerobic_score", 0) / 100, text="Aerobic Fitness")
             if vekdyn_prediction.get("is_female"):
                 st.progress(
                     vekdyn_prediction.get("threshold_score", 50) / 100,
-                    text="Threshold — calibration pending"
+                    text="Threshold — calibration pending",
                 )
             else:
                 st.progress(
                     vekdyn_prediction.get("threshold_score", 0) / 100,
-                    text="Threshold Fitness"
+                    text="Threshold Fitness",
                 )
-
-            st.progress(
-                vekdyn_prediction.get("speed_score", 0) / 100,
-                text="Speed Reserve"
-            )
-
+            st.progress(vekdyn_prediction.get("speed_score", 0) / 100, text="Speed Reserve")
             st.progress(
                 vekdyn_prediction.get("elasticity_score", 0) / 100,
-                text="Elasticity Preservation"
+                text="Elasticity Preservation",
             )
-
-            st.caption(
-                f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}"
-            )
+            st.caption(f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}")
+            recent_miles = vekdyn_prediction.get("weekly_miles")
+            if recent_miles is not None:
+                st.caption(f"Recent volume: {recent_miles:.1f} mi/wk")
 
     render_conference_rankings(active_team, profile, vekdyn_prediction)
 
