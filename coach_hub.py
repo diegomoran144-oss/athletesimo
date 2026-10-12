@@ -4382,6 +4382,152 @@ def vekdyn_predict_1500(
     }
 
 
+# =========================================================
+# CONFERENCE RANKINGS — VERIFIED RESULTS IMPORT
+# =========================================================
+CONFERENCE_BY_TEAM = {
+    "ollu_distance": "Red River Athletic Conference (RRAC)",
+    "sam_houston": "Conference (configure in school settings)",
+    "dark_horse_endurance": "Unattached / club",
+    DEMO_TEAM_ID: "Demo conference",
+}
+
+@st.cache_resource(show_spinner=False)
+def initialize_conference_results_database():
+    with get_database_connection() as db:
+        with db.cursor() as cursor:
+            cursor.execute("""CREATE TABLE IF NOT EXISTS conference_results (
+                team_id TEXT NOT NULL, season TEXT NOT NULL,
+                event TEXT NOT NULL, division TEXT NOT NULL,
+                athlete TEXT NOT NULL, school TEXT NOT NULL,
+                performance_seconds DOUBLE PRECISION NOT NULL,
+                performance_text TEXT NOT NULL,
+                meet_date TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (team_id,season,event,division,athlete,school)
+            )""")
+        db.commit()
+
+
+def parse_conference_time(value):
+    text_value = str(value).strip()
+    parts = text_value.split(":")
+    if not parts or len(parts) > 3:
+        raise ValueError("Invalid performance time")
+    try:
+        seconds = 0.0
+        for part in parts:
+            seconds = seconds * 60 + float(part)
+    except ValueError as exc:
+        raise ValueError("Invalid performance time") from exc
+    if seconds <= 0 or seconds > 86400:
+        raise ValueError("Invalid performance time")
+    return seconds
+
+
+def save_conference_results(team_id, season, event, division, frame):
+    required = {"athlete", "school", "time"}
+    if not required.issubset(frame.columns):
+        raise ValueError("CSV must have athlete, school, and time columns; meet_date is optional.")
+    rows = []
+    for _, item in frame.iterrows():
+        athlete_name = str(item["athlete"]).strip()
+        school_name = str(item["school"]).strip()
+        if not athlete_name or not school_name:
+            continue
+        mark = str(item["time"]).strip()
+        rows.append((team_id, season, event, division, athlete_name,
+                     school_name, parse_conference_time(mark), mark,
+                     str(item.get("meet_date", "")).strip()))
+    if not rows:
+        raise ValueError("No valid performances in uploaded CSV.")
+    initialize_conference_results_database()
+    with get_database_connection() as db:
+        with db.cursor() as cursor:
+            cursor.execute("DELETE FROM conference_results WHERE team_id=%s AND season=%s AND event=%s AND division=%s",
+                           (team_id, season, event, division))
+            cursor.executemany("""INSERT INTO conference_results
+                (team_id,season,event,division,athlete,school,performance_seconds,performance_text,meet_date)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", rows)
+        db.commit()
+    return len(rows)
+
+
+def load_conference_results(team_id, season, event, division):
+    initialize_conference_results_database()
+    with get_database_connection() as db:
+        with db.cursor() as cursor:
+            cursor.execute("""SELECT athlete,school,performance_seconds,performance_text,meet_date,updated_at
+                FROM conference_results WHERE team_id=%s AND season=%s AND event=%s AND division=%s
+                ORDER BY performance_seconds,athlete""", (team_id, season, event, division))
+            return cursor.fetchall()
+
+
+def render_conference_rankings(team_id, athlete_profile, prediction):
+    st.markdown("---")
+    with st.container(border=True):
+        st.subheader("Conference Rankings")
+        st.caption(CONFERENCE_BY_TEAM.get(team_id, "Conference not configured"))
+        event_col, season_col, division_col = st.columns(3)
+        with event_col:
+            event = st.selectbox("Event", ["1500m", "800m", "Mile", "3000m", "5000m", "10000m"], key="conference_event")
+        with season_col:
+            season = st.selectbox("Season", ["Outdoor 2026", "Indoor 2026", "Outdoor 2027", "Indoor 2027"], key="conference_season")
+        with division_col:
+            sex = str(athlete_profile.get("sex", "")).strip().lower()
+            default = 1 if sex in ("f", "female", "women", "woman") else 0
+            division = st.selectbox("Division", ["Men", "Women"], index=default, key="conference_division")
+        st.caption("Refresh cadence: every 14 days. Automated imports require a configured, authorized CSV feed; manual CSV import remains available.")
+        with st.expander("Import official conference performance list (CSV)"):
+            st.caption("Upload columns: athlete, school, time, optional meet_date. Upload a complete list for the selected event and season; it replaces the previous import for that selection.")
+            file = st.file_uploader("Performance list CSV", type=["csv"], key="conference_csv")
+            if file is not None and st.button("Save conference results", key="conference_save"):
+                try:
+                    imported = pd.read_csv(file, dtype=str).fillna("")
+                    imported.columns = [str(c).strip().lower() for c in imported.columns]
+                    count = save_conference_results(team_id, season, event, division, imported)
+                    st.success(f"Saved {count} results to Neon.")
+                    st.rerun()
+                except (ValueError, psycopg2.Error, pd.errors.ParserError) as error:
+                    st.error(f"Could not import results: {error}")
+        try:
+            rows = load_conference_results(team_id, season, event, division)
+        except psycopg2.Error as error:
+            st.warning(f"Conference rankings unavailable: {error}")
+            return
+        if not rows:
+            st.info("No conference results imported yet. Upload an official performance list to enable rankings.")
+            return
+        updated = max(row[5] for row in rows if row[5] is not None)
+        next_update = updated + timedelta(days=14)
+        st.caption(
+            f"Last results update: {updated.strftime('%b %d, %Y')} · "
+            f"Next scheduled check: {next_update.strftime('%b %d, %Y')} · "
+            f"{len(rows)} performances"
+        )
+        if datetime.now(timezone.utc) >= next_update:
+            st.info("Results are due for a refresh. The scheduled importer will update them when an authorized feed is configured.")
+        athlete_name = str(athlete_profile.get("name", "")).strip().casefold()
+        school_name = str(athlete_profile.get("school", "")).strip().casefold()
+        own = next((i for i, r in enumerate(rows) if r[0].strip().casefold() == athlete_name
+                    and (not school_name or school_name in r[1].strip().casefold() or r[1].strip().casefold() in school_name)), None)
+        projected = None
+        if event == "1500m" and prediction.get("available") and prediction.get("1500_seconds") is not None:
+            projected = float(prediction["1500_seconds"])
+        current_rank = own + 1 if own is not None else None
+        projected_rank = (1 + sum(1 for i, r in enumerate(rows)
+                                  if i != own and float(r[2]) < projected)) if projected is not None else None
+        a, b, c = st.columns(3)
+        a.metric("Current Conference Rank", f"#{current_rank}" if current_rank else "—")
+        b.metric("Projected Conference Rank", f"#{projected_rank}" if projected_rank else "—")
+        c.metric("Potential Scoring Position", "Top 8" if projected_rank and projected_rank <= 8 else "—")
+        st.caption("Projected rank compares the model's 1500m estimate with imported marks; ties and championship entry rules may affect actual placement. Scoring position is illustrative, not guaranteed points.")
+        display = pd.DataFrame([{"Rank": i+1, "Athlete": r[0], "School": r[1], "Time": r[3], "Date": r[4] or "—"}
+                                for i, r in enumerate(rows)])
+        st.dataframe(display, hide_index=True, use_container_width=True)
+
+
+
 if dashboard_view == "Predictor":
     # =========================================================
     # PERFORMANCE PREDICTIONS — LIVE VEKDYN MODEL
@@ -4485,6 +4631,8 @@ if dashboard_view == "Predictor":
             st.caption(
                 f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}"
             )
+
+    render_conference_rankings(active_team, profile, vekdyn_prediction)
 
 # =========================================================
 # TEAM WORKOUTS — WEEKLY COACH PLANNER + NEON
