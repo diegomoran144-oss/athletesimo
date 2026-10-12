@@ -1262,6 +1262,11 @@ def create_login_table():
                 "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;"
             )
 
+            # Coach Hub stores email as an alias; the internal athlete_id stays stable.
+            cursor.execute(
+                "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS login_email TEXT;"
+            )
+
 
             cursor.execute(
                 """
@@ -1814,7 +1819,7 @@ def load_logged_in_athlete_profile(athlete_id):
 
 def authenticate_athlete(athlete_id, password):
     """
-    Verify the athlete's current password.
+    Verify the athlete's password using email or legacy athlete ID.
 
     Returns:
         (stored_athlete_id, must_change_password) when valid
@@ -1838,9 +1843,10 @@ def authenticate_athlete(athlete_id, password):
                     COALESCE(must_change_password, FALSE)
                 FROM athlete_logins
                 WHERE LOWER(TRIM(athlete_id)) = %s
+                   OR LOWER(TRIM(login_email)) = %s
                 LIMIT 1;
                 """,
-                (athlete_id,),
+                (athlete_id, athlete_id),
             )
 
             account = cursor.fetchone()
@@ -2365,7 +2371,7 @@ if not st.session_state.logged_in:
     )
 
     st.caption(
-        "Sign in with your VEKDYN athlete account."
+        "Sign in using the email saved by your coach or your existing Athlete ID. First-time athletes can use a temporary password supplied by their coach."
     )
 
     with st.form(
@@ -2374,8 +2380,8 @@ if not st.session_state.logged_in:
     ):
 
         athlete_id_input = st.text_input(
-            "Athlete ID",
-            placeholder="Enter Athlete ID",
+            "Email address or Athlete ID",
+            placeholder="athlete@example.com",
         )
 
         password_input = st.text_input(
@@ -2404,7 +2410,7 @@ if not st.session_state.logged_in:
         if not clean_athlete_id:
 
             st.error(
-                "Enter your Athlete ID."
+                "Enter your email address or Athlete ID."
             )
 
         elif not clean_password:
@@ -2445,7 +2451,7 @@ if not st.session_state.logged_in:
             else:
 
                 st.error(
-                    "Incorrect Athlete ID or password."
+                    "Incorrect email/athlete ID or password."
                 )
 
     st.stop()
