@@ -5750,57 +5750,93 @@ def load_team_recovery_snapshots(team_id, athlete_keys):
 
 
 if dashboard_view == "Dashboard":
-    st.subheader("Team Recovery Overview")
-    st.caption("Recovery indicators are screening flags, not medical diagnoses or definitive readiness scores.")
     if active_team == DEMO_TEAM_ID:
         snapshots = {key: {} for key in athletes}
     else:
         snapshots = load_team_recovery_snapshots(active_team, tuple(sorted(athletes)))
 
-    with st.container(border=True):
-        heading_left, heading_right, heading_detail = st.columns([3, 2, 1])
-        heading_left.markdown("**Athlete**")
-        heading_right.markdown("**Recovery**")
-        heading_detail.markdown("**Details**")
+    status_colors = {
+        "Normal": ("#dcfce7", "#166534"),
+        "Monitor": ("#ffedd5", "#9a3412"),
+        "Attention": ("#fee2e2", "#991b1b"),
+        "No Data": ("#e5e7eb", "#374151"),
+    }
+    priority = {"Attention": 0, "Monitor": 1, "Normal": 2, "No Data": 3}
+    recovery_rows = []
+    for member_key, member in athletes.items():
+        snapshot = snapshots.get(member_key) or {}
+        status, reasons = classify_team_recovery(snapshot)
+        recovery_rows.append((member_key, member["profile"]["name"], status, reasons, snapshot))
+    recovery_rows.sort(key=lambda row: (priority[row[2]], row[1].casefold()))
 
-        status_colors = {
-            "Normal": "#15803d",
-            "Monitor": "#b45309",
-            "Attention": "#b91c1c",
-            "No Data": "#667085",
-        }
-        for member_key, member in sorted(
-            athletes.items(), key=lambda item: item[1]["profile"]["name"].lower()
-        ):
-            snapshot = snapshots.get(member_key) or {}
-            status, reasons = classify_team_recovery(snapshot)
-            name = member["profile"]["name"]
-            with st.expander(f"{name}    •    {status}", expanded=False):
-                st.markdown(
-                    f'<span style="font-weight:700;color:{status_colors[status]}">'
-                    f'{status}</span>',
-                    unsafe_allow_html=True,
-                )
-                metrics = st.columns(3)
-                minutes = snapshot.get("sleep_minutes")
-                metrics[0].metric(
-                    "Sleep",
-                    f"{int(minutes)//60}h {int(minutes)%60:02d}m"
-                    if minutes is not None else "—",
-                )
-                hrv = snapshot.get("hrv_avg")
-                metrics[1].metric("HRV", f"{hrv} ms" if hrv is not None else "—")
-                hr = snapshot.get("sleep_hr_avg")
-                if hr is None:
-                    hr = snapshot.get("resting_hr")
-                metrics[2].metric("Heart Rate", f"{hr} bpm" if hr is not None else "—")
-                if snapshot.get("hrv_baseline") is not None:
-                    st.caption(f"HRV baseline: {snapshot['hrv_baseline']} ms")
-                if snapshot.get("sleep_hr_baseline") is not None:
-                    st.caption(f"Sleeping HR baseline: {snapshot['sleep_hr_baseline']} bpm")
-                for reason in reasons:
-                    st.caption(f"• {reason}")
-        st.caption("Missing measurements are never classified as normal. Review trends and athlete feedback before changing training.")
+    st.markdown("""<style>
+    .vekdyn-recovery-header {font-size:0.83rem;font-weight:650;color:#64748b;padding:0.25rem 0;}
+    .vekdyn-recovery-name {font-size:0.95rem;font-weight:500;padding-top:0.45rem;}
+    .vekdyn-recovery-pill {display:inline-block;border-radius:999px;padding:0.25rem 0.75rem;
+      font-size:0.8rem;font-weight:700;margin-top:0.32rem;white-space:nowrap;}
+    div[data-testid="stHorizontalBlock"]:has(.vekdyn-recovery-name) {align-items:center;}
+    </style>""", unsafe_allow_html=True)
+
+    with st.container(border=True):
+        title_col, count_col = st.columns([5, 1], vertical_alignment="center")
+        with title_col:
+            st.markdown("### Team Recovery Overview")
+            st.caption(f"{team_config(active_team)['name']} · Latest available measurements")
+        with count_col:
+            st.caption(f"{len(recovery_rows)} athletes")
+
+        left, middle, right = st.columns([5, 2, 2], vertical_alignment="center")
+        left.markdown('<div class="vekdyn-recovery-header">Athlete</div>', unsafe_allow_html=True)
+        middle.markdown('<div class="vekdyn-recovery-header">Recovery</div>', unsafe_allow_html=True)
+        right.markdown('<div class="vekdyn-recovery-header">Details</div>', unsafe_allow_html=True)
+        st.divider()
+
+        for member_key, name, status, reasons, snapshot in recovery_rows:
+            bg, fg = status_colors[status]
+            row_left, row_middle, row_right = st.columns([5, 2, 2], vertical_alignment="center")
+            row_left.markdown(
+                f'<div class="vekdyn-recovery-name">{html.escape(name)}</div>',
+                unsafe_allow_html=True,
+            )
+            row_middle.markdown(
+                f'<span class="vekdyn-recovery-pill" style="background:{bg};color:{fg}">{status}</span>',
+                unsafe_allow_html=True,
+            )
+            state_key = f"recovery_expanded_{active_team}_{member_key}"
+            is_open = st.session_state.get(state_key, False)
+            if row_right.button(
+                "⌃ Close" if is_open else "⌄ Expand",
+                key=f"recovery_toggle_{active_team}_{member_key}",
+                use_container_width=True,
+            ):
+                st.session_state[state_key] = not is_open
+                st.rerun()
+
+            if is_open:
+                with st.container(border=True):
+                    metrics = st.columns(3)
+                    minutes = snapshot.get("sleep_minutes")
+                    metrics[0].metric(
+                        "Sleep",
+                        f"{int(minutes)//60}h {int(minutes)%60:02d}m" if minutes is not None else "—",
+                    )
+                    hrv = snapshot.get("hrv_avg")
+                    metrics[1].metric("HRV", f"{hrv} ms" if hrv is not None else "—")
+                    hr = snapshot.get("sleep_hr_avg")
+                    if hr is None:
+                        hr = snapshot.get("resting_hr")
+                    metrics[2].metric("Heart Rate", f"{hr} bpm" if hr is not None else "—")
+                    if snapshot.get("hrv_baseline") is not None:
+                        st.caption(f"HRV baseline: {snapshot['hrv_baseline']} ms")
+                    if snapshot.get("sleep_hr_baseline") is not None:
+                        st.caption(f"Sleeping HR baseline: {snapshot['sleep_hr_baseline']} bpm")
+                    for reason in reasons:
+                        st.caption(f"• {reason}")
+            st.divider()
+        st.caption(
+            "Status reflects available measurements only; it is not a medical diagnosis or "
+            "definitive readiness assessment. Missing data is never treated as normal."
+        )
 
 # =========================================================
 # TRAINING VOLUME — PLANNED WEEK SUMMARY
