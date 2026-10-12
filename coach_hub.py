@@ -4347,8 +4347,17 @@ def vekdyn_predict_1500(
     if elasticity_status in {"Uncertain", "Suppressed"}:
         half_range += 1.5
 
+    # Provisional 5K estimate: retain the athlete's actual 5K as the aerobic
+    # anchor, adjusted conservatively toward the 1500m model's equivalent.
+    # This is NOT a separately calibrated 5K prediction model.
+    equivalent_5k = adjusted_1500 * (5000.0 / 1500.0) ** 1.06
+    predicted_5k = (0.80 * five_k_seconds + 0.20 * equivalent_5k) if five_k_seconds else None
+
     return {
         "available": True,
+        "5000_seconds": predicted_5k,
+        "5000_display": vekdyn_seconds_to_time(predicted_5k, 1) if predicted_5k else None,
+        "5000_method": "Provisional: 80% 5K PB + 20% 1500m-equivalent estimate",
         "mile_seconds": adjusted_mile,
         "mile_display": vekdyn_seconds_to_time(adjusted_mile, 1),
         "1500_seconds": adjusted_1500,
@@ -4563,26 +4572,14 @@ def render_conference_rankings(team_id, athlete_profile, prediction):
             sex = str(athlete_profile.get("sex", "")).strip().lower()
             default = 1 if sex in ("f", "female", "women", "woman") else 0
             division = st.selectbox("Division", ["Men", "Women"], index=default, key="conference_division")
-        st.caption("Refresh cadence: every 14 days. Automated imports require a configured, authorized CSV feed; manual CSV import remains available.")
-        with st.expander("Import official conference performance list (CSV)"):
-            st.caption("Upload columns: athlete, school, time, optional meet_date. Upload a complete list for the selected event and season; it replaces the previous import for that selection.")
-            file = st.file_uploader("Performance list CSV", type=["csv"], key="conference_csv")
-            if file is not None and st.button("Save conference results", key="conference_save"):
-                try:
-                    imported = pd.read_csv(file, dtype=str).fillna("")
-                    imported.columns = [str(c).strip().lower() for c in imported.columns]
-                    count = save_conference_results(team_id, season, event, division, imported)
-                    st.success(f"Saved {count} results to Neon.")
-                    st.rerun()
-                except (ValueError, psycopg2.Error, pd.errors.ParserError) as error:
-                    st.error(f"Could not import results: {error}")
+        st.caption("Results load automatically from the bundled conference CSV. External feed checks are planned every 14 days once configured.")
         try:
             rows = load_conference_results(team_id, season, event, division)
         except psycopg2.Error as error:
             st.warning(f"Conference rankings unavailable: {error}")
             return
         if not rows:
-            st.info("No conference results imported yet. Upload an official performance list to enable rankings.")
+            st.info("No results available for this event, season, and division. Check the bundled conference CSV and deployment.")
             return
         updated = max(row[5] for row in rows if row[5] is not None)
         next_update = updated + timedelta(days=14)
@@ -4597,20 +4594,45 @@ def render_conference_rankings(team_id, athlete_profile, prediction):
         school_name = str(athlete_profile.get("school", "")).strip().casefold()
         own = next((i for i, r in enumerate(rows) if r[0].strip().casefold() == athlete_name
                     and (not school_name or school_name in r[1].strip().casefold() or r[1].strip().casefold() in school_name)), None)
+        projection_keys = {
+            "1500m": ("1500_seconds", "1500_mid"),
+            "Mile": ("mile_seconds", "mile_display"),
+            "5000m": ("5000_seconds", "5000_display"),
+        }
         projected = None
-        if event == "1500m" and prediction.get("available") and prediction.get("1500_seconds") is not None:
-            projected = float(prediction["1500_seconds"])
+        projected_label = None
+        if prediction.get("available") and event in projection_keys:
+            seconds_key, label_key = projection_keys[event]
+            if prediction.get(seconds_key) is not None:
+                projected = float(prediction[seconds_key])
+                projected_label = prediction.get(label_key)
         current_rank = own + 1 if own is not None else None
+        # Do not count the athlete's own existing mark as an opponent.
         projected_rank = (1 + sum(1 for i, r in enumerate(rows)
                                   if i != own and float(r[2]) < projected)) if projected is not None else None
         a, b, c = st.columns(3)
         a.metric("Current Conference Rank", f"#{current_rank}" if current_rank else "—")
         b.metric("Projected Conference Rank", f"#{projected_rank}" if projected_rank else "—")
         c.metric("Potential Scoring Position", "Top 8" if projected_rank and projected_rank <= 8 else "—")
-        st.caption("Projected rank compares the model's 1500m estimate with imported marks; ties and championship entry rules may affect actual placement. Scoring position is illustrative, not guaranteed points.")
-        display = pd.DataFrame([{"Rank": i+1, "Athlete": r[0], "School": r[1], "Time": r[3], "Date": r[4] or "—"}
-                                for i, r in enumerate(rows[:8])])
-        st.dataframe(display, hide_index=True, use_container_width=True)
+        if projected is not None:
+            st.caption(f"VEKDYN projected {event}: {projected_label} · projected conference position #{projected_rank}.")
+        elif event not in projection_keys:
+            st.caption("No VEKDYN prediction model for this event yet; official rankings remain available.")
+        if event == "5000m" and projected is not None:
+            st.caption("5K estimate is provisional: it blends the existing 5K PB with the model's 1500m-equivalent estimate. It is not an independently calibrated 5K model.")
+        st.caption("Official performances remain unchanged. Projected rank is hypothetical, based on imported results; ties and championship entry rules may affect actual placement.")
+        display_rows = [{"Rank": i+1, "Athlete": r[0], "School": r[1], "Time": r[3], "Date": r[4] or "—", "Type": "Official"}
+                        for i, r in enumerate(rows)]
+        if projected is not None:
+            # Insert a clearly labeled projection without altering any official marks.
+            projection_row = {"Rank": projected_rank, "Athlete": athlete_profile.get("name", "Selected athlete"),
+                              "School": athlete_profile.get("school", ""), "Time": projected_label,
+                              "Date": "—", "Type": "VEKDYN projection"}
+            display_rows.insert(max(0, projected_rank - 1), projection_row)
+            # Recalculate display positions to avoid duplicate numeric labels.
+            for index, item in enumerate(display_rows):
+                item["Rank"] = index + 1
+        st.dataframe(pd.DataFrame(display_rows[:8]), hide_index=True, use_container_width=True)
 
 
 
@@ -4658,6 +4680,8 @@ if dashboard_view == "Predictor":
                 st.caption(
                     f"Estimated mile capability: {vekdyn_prediction['mile_display']}"
                 )
+                if vekdyn_prediction.get("5000_display"):
+                    st.caption(f"Provisional 5000m estimate: {vekdyn_prediction['5000_display']}")
             else:
                 st.markdown("## --")
                 st.caption(vekdyn_prediction["reason"])
