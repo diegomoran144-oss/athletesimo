@@ -1,5229 +1,5485 @@
-import base64
-import hashlib
-import hmac
-import html
-import json
-import re
-import secrets
-import sqlite3
-import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import urlencode
-from zoneinfo import ZoneInfo
-import string
-import bcrypt
-
-import altair as alt
-import pandas as pd
-import psycopg2
-import requests
+# VEKDYN — Unified Coach + Athlete application
+# Both original hubs are preserved. Routing happens before either UI runs.
+# Coach invitations: ?invite=<one-time-token> -> Athlete activation.
+# Athlete sign in: ?role=athlete. Coach landing: /.
 import streamlit as st
 
-# =================================================
-# TEAM ROSTERS — CSV FILES ARE THE SOURCE OF TRUTH
-# =================================================
-
-OLLU_ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
-SAM_HOUSTON_ROSTER_PATH = Path(__file__).with_name("sam_houston_csv")
-DARK_HORSE_ROSTER_PATH = Path(__file__).with_name("dark_horse_endurance_csv")
-
-TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
-TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
-
-
-def get_team_logo(team_id):
-    """Return the same team-specific school image used on the landing card."""
-    return get_team_image(team_id)
-
-
-def get_team_image(image_id):
-    """Return a VEKDYN-controlled image from team_images by its unique ID."""
-    for extension in (".png", ".jpg", ".jpeg", ".webp"):
-        image_path = TEAM_IMAGES_DIR / f"{image_id}{extension}"
-        if image_path.exists():
-            return image_path
-    return None
-
-
-def clean_csv_value(value, default=""):
-    """Turn blank/NaN CSV values into safe VEKDYN values."""
-    if pd.isna(value):
-        return default
-    value = str(value).strip()
-    return default if value.lower() == "nan" else value
-
-
-def make_athlete_id(name):
-    """Create a stable simple athlete ID when a CSV does not already provide one."""
-    value = clean_csv_value(name).lower()
-    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
-    return value
-
-
-def load_team_roster(roster_path, default_school="", default_team="Distance"):
-    """
-    Load either roster format currently used by VEKDYN.
-
-    OLLU format:
-        athlete_id, first_name, last_name, school, team, class_year, ...
-
-    Sam Houston format:
-        name, sex, class_year, pb_800, pb_1500, pb_mile, pb_3k, pb_5k, pb_8k
-
-    Both formats are converted into the same athlete dictionary so the
-    dashboard can render each school separately with the same UI.
-    """
-    if not roster_path.exists():
-        raise FileNotFoundError(f"Roster file not found: {roster_path}")
-
-    roster = pd.read_csv(
-        roster_path,
-        dtype=str,
-        keep_default_na=False,
-    ).fillna("")
-
-    # Normalize column names in case whitespace was accidentally added.
-    roster.columns = [str(column).strip() for column in roster.columns]
-
-    # -------------------------------------------------
-    # NORMALIZE NAME / ID FIELDS
-    # -------------------------------------------------
-    if "athlete_id" not in roster.columns:
-        if "name" not in roster.columns:
-            raise RuntimeError(
-                f"{roster_path.name} must contain either athlete_id/first_name/last_name "
-                "or a name column."
-            )
-
-        roster["name"] = roster["name"].astype(str).str.strip()
-        roster["athlete_id"] = roster["name"].apply(make_athlete_id)
-
-        split_names = roster["name"].str.split()
-        roster["first_name"] = split_names.str[0].fillna("")
-        roster["last_name"] = split_names.apply(
-            lambda parts: " ".join(parts[1:]) if isinstance(parts, list) and len(parts) > 1 else ""
-        )
-    else:
-        if "first_name" not in roster.columns:
-            roster["first_name"] = ""
-        if "last_name" not in roster.columns:
-            roster["last_name"] = ""
-
-    # Supply team fields for the compact Sam Houston CSV.
-    if "school" not in roster.columns:
-        roster["school"] = default_school
-
-    if "team" not in roster.columns:
-        roster["team"] = default_team
-
-    if "class_year" not in roster.columns:
-        roster["class_year"] = "FR"
-
-    roster["athlete_id"] = roster["athlete_id"].astype(str).str.strip()
-
-    # Ignore blank IDs when checking duplicates.
-    nonblank_ids = roster.loc[
-        roster["athlete_id"] != "",
-        "athlete_id",
-    ]
-
-    duplicate_ids = nonblank_ids[
-        nonblank_ids.duplicated(keep=False)
-    ].tolist()
-
-    if duplicate_ids:
-        raise RuntimeError(
-            f"{roster_path.name} has duplicate athlete_id values: "
-            + ", ".join(sorted(set(duplicate_ids)))
-        )
-
-    athletes = {}
-
-    # -------------------------------------------------
-    # BUILD ATHLETE DICTIONARY
-    # -------------------------------------------------
-    for _, row in roster.iterrows():
-        athlete_id = clean_csv_value(row.get("athlete_id"))
-        if not athlete_id:
-            continue
-
-        first_name = clean_csv_value(row.get("first_name"))
-        last_name = clean_csv_value(row.get("last_name"))
-        full_name = f"{first_name} {last_name}".strip()
-
-        if not full_name:
-            full_name = clean_csv_value(row.get("name"), athlete_id)
-
-        # ---------------------------------------------
-        # TRACK PERSONAL BESTS
-        # ---------------------------------------------
-        pbs = {}
-
-        pb_map = {
-            "800": "pb_800",
-            "1500": "pb_1500",
-            "mile": "pb_mile",
-            "3k": "pb_3k",
-            "5k": "pb_5k",
-        }
-
-        for event, column in pb_map.items():
-            value = clean_csv_value(row.get(column))
-            if value:
-                pbs[event] = value
-
-        # ---------------------------------------------
-        # CROSS COUNTRY RESULTS
-        # ---------------------------------------------
-        xc_results = {}
-
-        # OLLU uses xc_8k_pb; the compact Sam Houston CSV uses pb_8k.
-        xc_8k = clean_csv_value(
-            row.get("xc_8k_pb"),
-            clean_csv_value(row.get("pb_8k")),
-        )
-
-        xc_10k = clean_csv_value(row.get("xc_10k_pb"))
-
-        # Future women's 6K support if pb_6k or xc_6k_pb is added.
-        xc_6k = clean_csv_value(
-            row.get("xc_6k_pb"),
-            clean_csv_value(row.get("pb_6k")),
-        )
-
-        if xc_6k:
-            xc_results["6k"] = [
-                {"time": xc_6k, "meet": "XC Personal Best", "date": ""}
-            ]
-
-        if xc_8k:
-            xc_results["8k"] = [
-                {"time": xc_8k, "meet": "XC Personal Best", "date": ""}
-            ]
-
-        if xc_10k:
-            xc_results["10k"] = [
-                {"time": xc_10k, "meet": "XC Personal Best", "date": ""}
-            ]
-
-        # ---------------------------------------------
-        # THRESHOLD DATA
-        # ---------------------------------------------
-        threshold = {
-            "short_reps": {
-                "pace": clean_csv_value(row.get("threshold_short_pace"), "--"),
-                "lactate": clean_csv_value(row.get("threshold_short_lactate"), "--"),
-            },
-            "medium_reps": {
-                "pace": clean_csv_value(row.get("threshold_medium_pace"), "--"),
-                "lactate": clean_csv_value(row.get("threshold_medium_lactate"), "--"),
-            },
-            "long_reps": {
-                "pace": clean_csv_value(row.get("threshold_long_pace"), "--"),
-                "lactate": clean_csv_value(row.get("threshold_long_lactate"), "--"),
-            },
-        }
-
-        athletes[athlete_id] = {
-            "profile": {
-                "name": full_name or athlete_id,
-                "first_name": first_name,
-                "last_name": last_name,
-                "school": clean_csv_value(row.get("school"), default_school),
-                "team": clean_csv_value(row.get("team"), default_team),
-                "class": clean_csv_value(row.get("class_year"), "FR"),
-                "sex": clean_csv_value(row.get("sex")),
-            },
-            "pbs": pbs,
-            "xc_results": xc_results,
-            "threshold": threshold,
-
-            # Live training/HR is intentionally not stored in the roster CSV.
-            "training": {},
-            "recovery": {},
-
-            "strava_connected_csv": (
-                    clean_csv_value(row.get("strava_connected")).lower() == "true"
-            ),
-            "coros_connected_csv": (
-                    clean_csv_value(row.get("coros_connected")).lower() == "true"
-            ),
-        }
-
-    if not athletes:
-        raise RuntimeError(
-            f"No athletes were loaded from {roster_path.name}."
-        )
-
-    return roster, athletes
-
-
-# =========================================================
-# LOAD EACH TEAM SEPARATELY
-# =========================================================
-
-ollu_roster, ollu_athletes = load_team_roster(
-    OLLU_ROSTER_PATH,
-    default_school="OLLU",
-    default_team="Distance",
-)
-
-sam_houston_roster, sam_houston_athletes = load_team_roster(
-    SAM_HOUSTON_ROSTER_PATH,
-    default_school="Sam Houston",
-    default_team="Distance",
-)
-
-# Dark Horse can be deployed before the roster is populated. Replace the
-# header-only template with the real CSV when the coach is ready.
-try:
-    dark_horse_roster, dark_horse_athletes = load_team_roster(
-        DARK_HORSE_ROSTER_PATH,
-        default_school="Dark Horse Endurance",
-        default_team="Endurance",
-    )
-except (FileNotFoundError, RuntimeError):
-    dark_horse_roster = pd.DataFrame()
-    dark_horse_athletes = {}
-
-# Public sales-demo workspace. This uses a static snapshot so a coach can
-# explore VEKDYN without touching a real team's roster, OAuth tokens or Neon data.
-DEMO_TEAM_ID = "oregon_ducks_demo"
-DEMO_ATHLETE_KEY = "demo_diego_moran"
-DEMO_ATHLETES = {
-    DEMO_ATHLETE_KEY: {
-        "profile": {
-            "name": "Diego Moran", "first_name": "Diego", "last_name": "Moran",
-            "school": "Oregon Ducks", "team": "Distance", "class": "SR", "sex": "M",
-        },
-        "pbs": {"800": "2:02", "1500": "4:02", "mile": "4:22", "3k": "8:52", "5k": "14:55"},
-        "xc_results": {
-            "8k": [{"time": "26:18", "meet": "XC Personal Best", "date": ""}],
-            "10k": [],
-        },
-        "threshold": {
-            "short_reps": {"pace": "5:18/mi", "lactate": 2.4},
-            "medium_reps": {"pace": "5:30/mi", "lactate": 2.6},
-            "long_reps": {"pace": "5:40/mi", "lactate": 2.8},
-        },
-        "training": {
-            "weekly_mileage": {"Week 1": 67, "Week 2": 71, "Week 3": 73, "Week 4": 69, "Week 5": 74, "Week 6": 72},
-        },
-        "recovery": {},
-        "strava_connected_csv": True,
-        "coros_connected_csv": True,
-    }
-}
-
-
-# =========================================================
-# TEAM ROUTING
-# =========================================================
-
-def get_team_athletes(team_id):
-    """Return only the roster belonging to the selected VEKDYN team."""
-    if team_id == "ollu_distance":
-        return ollu_athletes
-
-    if team_id == "sam_houston":
-        return sam_houston_athletes
-
-    if team_id == "dark_horse_endurance":
-        return dark_horse_athletes
-
-    if team_id == DEMO_TEAM_ID:
-        return DEMO_ATHLETES
-
-    return {}
-
-
-# =========================================================
-# GLOBAL ATHLETE LOOKUP — USED BY STRAVA OAUTH
-# =========================================================
-# The dashboard still swaps `athletes` to the active team's roster later.
-# Strava OAuth, however, returns to a fresh Streamlit run before that team
-# routing happens. Therefore OAuth needs a lookup containing BOTH schools.
-
-all_athletes = {
-    **ollu_athletes,
-    **sam_houston_athletes,
-    **dark_horse_athletes,
-    **DEMO_ATHLETES,
-}
-
-# Map every athlete key back to the team that owns that profile.
-athlete_team_lookup = {
-    **{athlete_key: "ollu_distance" for athlete_key in ollu_athletes},
-    **{athlete_key: "sam_houston" for athlete_key in sam_houston_athletes},
-    **{athlete_key: "dark_horse_endurance" for athlete_key in dark_horse_athletes},
-    **{athlete_key: DEMO_TEAM_ID for athlete_key in DEMO_ATHLETES},
-}
-
-# Fail early if the same athlete_id exists in both schools. Athlete keys are
-# also the primary keys used by Neon for Strava connections, so they must be
-# globally unique across VEKDYN.
-team_roster_ids = {
-    "OLLU": set(ollu_athletes),
-    "Sam Houston": set(sam_houston_athletes),
-    "Dark Horse Endurance": set(dark_horse_athletes),
-}
-duplicate_cross_team_ids = set()
-team_id_sets = list(team_roster_ids.values())
-for left_index in range(len(team_id_sets)):
-    for right_index in range(left_index + 1, len(team_id_sets)):
-        duplicate_cross_team_ids.update(
-            team_id_sets[left_index].intersection(team_id_sets[right_index])
-        )
-if duplicate_cross_team_ids:
-    raise RuntimeError(
-        "These athlete_id values are duplicated across VEKDYN teams: "
-        + ", ".join(sorted(duplicate_cross_team_ids))
-        + ". Give each athlete a globally unique athlete_id before using Strava."
-    )
-
-# Used by the public landing page before a private workspace is selected.
-# The private dashboard replaces this with get_team_athletes(active_team).
-athletes = ollu_athletes
-
-# =========================================================
-# PAGE SETTINGS
-# =========================================================
-
-st.set_page_config(
-    page_title="VEKDYN",
-    page_icon="🏃",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# =========================================================
-# AUTHENTICATION / PERSISTENT LOGIN / PAGE ROUTING
-# =========================================================
-
-LOGIN_SESSION_DAYS = 7
-
-TEAM_CONFIG = {
-    "ollu_distance": {
-        "name": "OLLU Distance",
-        "short_name": "OLLU",
-    },
-    "sam_houston": {
-        "name": "Sam Houston Distance",
-        "short_name": "Sam Houston",
-    },
-    "dark_horse_endurance": {
-        "name": "Dark Horse Endurance",
-        "short_name": "Dark Horse",
-    },
-    DEMO_TEAM_ID: {
-        "name": "Oregon Ducks — VEKDYN Demo",
-        "short_name": "Oregon Ducks",
-    },
-}
-
-
-def team_config(team_id):
-    """Return display settings for one VEKDYN team."""
-    return TEAM_CONFIG.get(
-        team_id,
-        {"name": "VEKDYN Team", "short_name": "Team"},
-    )
-
-
-def check_login(team_id, username, password):
-    """
-    Check credentials for the selected team.
-
-    secrets.toml format:
-
-    [team_logins.ollu_distance]
-    username = "..."
-    password = "..."
-
-    [team_logins.sam_houston]
-    username = "..."
-    password = "..."
-    """
-    try:
-        team_login = st.secrets["team_logins"][team_id]
-        correct_username = team_login["username"]
-        correct_password = team_login["password"]
-    except (KeyError, TypeError, FileNotFoundError):
-        return False
-
-    return (
-            hmac.compare_digest(str(username), str(correct_username))
-            and hmac.compare_digest(str(password), str(correct_password))
-    )
-
-
-def get_login_signing_secret():
-    """
-    Sign VEKDYN login sessions without ever storing the coach password
-    in the browser. A dedicated LOGIN_SECRET can be added later.
-    """
-    try:
-        return str(st.secrets["LOGIN_SECRET"])
-    except (KeyError, FileNotFoundError):
-        return str(st.secrets["STRAVA_CLIENT_SECRET"])
-
-
-def create_login_token(username, team_id):
-    """Create a signed login token tied to one VEKDYN team."""
-    expires_at = int(
-        time.time() + timedelta(days=LOGIN_SESSION_DAYS).total_seconds()
-    )
-    payload = f"{team_id}:{username}:{expires_at}"
-    signature = hmac.new(
-        get_login_signing_secret().encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{payload}:{signature}"
-
-
-def validate_login_token(token):
-    """Return (username, team_id) when a signed team session is valid."""
-    if not token:
+params = st.query_params
+invite = params.get("invite")
+role = str(params.get("role") or "").lower()
+session = str(params.get("session") or "")
+state = str(params.get("state") or "")
+# A coach session is signed as team:username:expiry:signature;
+# an athlete session is a long URL-safe random bearer token.
+athlete_session = bool(session and ":" not in session and len(session) >= 48)
+athlete_oauth = bool(state and (state.startswith("coros_") or state.count(":") >= 2))
+mode = "athlete" if (invite or role == "athlete" or athlete_session or athlete_oauth) else "coach"
+# Keep the active role across Streamlit reruns that remove URL parameters.
+if not (invite or role or session or state):
+    mode = st.session_state.get("vekdyn_app_mode", "coach")
+if st.session_state.get("vekdyn_app_mode") != mode:
+    # Avoid mixing coach and athlete sessions: both original apps use logged_in.
+    for key in ("logged_in", "logged_in_user", "active_team", "pending_team",
+                "page", "athlete_id", "password_change_required",
+                "persistent_athlete_session", "just_logged_out"):
+        st.session_state.pop(key, None)
+st.session_state["vekdyn_app_mode"] = mode
+
+
+def _run_coach():
+    import base64
+    import hashlib
+    import hmac
+    import html
+    import json
+    import re
+    import secrets
+    import sqlite3
+    import time
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+    from urllib.parse import urlencode
+    from zoneinfo import ZoneInfo
+    import string
+    import bcrypt
+
+    import altair as alt
+    import pandas as pd
+    import psycopg2
+    import requests
+    import streamlit as st
+
+    # =================================================
+    # TEAM ROSTERS — CSV FILES ARE THE SOURCE OF TRUTH
+    # =================================================
+
+    OLLU_ROSTER_PATH = Path(__file__).with_name("ollu_roster_csv")
+    SAM_HOUSTON_ROSTER_PATH = Path(__file__).with_name("sam_houston_csv")
+    DARK_HORSE_ROSTER_PATH = Path(__file__).with_name("dark_horse_endurance_csv")
+
+    TEAM_IMAGES_DIR = Path(__file__).with_name("team_images")
+    TEAM_LOGOS_DIR = Path(__file__).with_name("team_logos")
+
+
+    def get_team_logo(team_id):
+        """Return the same team-specific school image used on the landing card."""
+        return get_team_image(team_id)
+
+
+    def get_team_image(image_id):
+        """Return a VEKDYN-controlled image from team_images by its unique ID."""
+        for extension in (".png", ".jpg", ".jpeg", ".webp"):
+            image_path = TEAM_IMAGES_DIR / f"{image_id}{extension}"
+            if image_path.exists():
+                return image_path
         return None
 
+
+    def clean_csv_value(value, default=""):
+        """Turn blank/NaN CSV values into safe VEKDYN values."""
+        if pd.isna(value):
+            return default
+        value = str(value).strip()
+        return default if value.lower() == "nan" else value
+
+
+    def make_athlete_id(name):
+        """Create a stable simple athlete ID when a CSV does not already provide one."""
+        value = clean_csv_value(name).lower()
+        value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+        return value
+
+
+    @st.cache_data(show_spinner=False)
+    def load_team_roster(roster_path, default_school="", default_team="Distance"):
+        """
+        Load either roster format currently used by VEKDYN.
+
+        OLLU format:
+            athlete_id, first_name, last_name, school, team, class_year, ...
+
+        Sam Houston format:
+            name, sex, class_year, pb_800, pb_1500, pb_mile, pb_3k, pb_5k, pb_8k
+
+        Both formats are converted into the same athlete dictionary so the
+        dashboard can render each school separately with the same UI.
+        """
+        if not roster_path.exists():
+            raise FileNotFoundError(f"Roster file not found: {roster_path}")
+
+        roster = pd.read_csv(
+            roster_path,
+            dtype=str,
+            keep_default_na=False,
+        ).fillna("")
+
+        # Normalize column names in case whitespace was accidentally added.
+        roster.columns = [str(column).strip() for column in roster.columns]
+
+        # -------------------------------------------------
+        # NORMALIZE NAME / ID FIELDS
+        # -------------------------------------------------
+        if "athlete_id" not in roster.columns:
+            if "name" not in roster.columns:
+                raise RuntimeError(
+                    f"{roster_path.name} must contain either athlete_id/first_name/last_name "
+                    "or a name column."
+                )
+
+            roster["name"] = roster["name"].astype(str).str.strip()
+            roster["athlete_id"] = roster["name"].apply(make_athlete_id)
+
+            split_names = roster["name"].str.split()
+            roster["first_name"] = split_names.str[0].fillna("")
+            roster["last_name"] = split_names.apply(
+                lambda parts: " ".join(parts[1:]) if isinstance(parts, list) and len(parts) > 1 else ""
+            )
+        else:
+            if "first_name" not in roster.columns:
+                roster["first_name"] = ""
+            if "last_name" not in roster.columns:
+                roster["last_name"] = ""
+
+        # Supply team fields for the compact Sam Houston CSV.
+        if "school" not in roster.columns:
+            roster["school"] = default_school
+
+        if "team" not in roster.columns:
+            roster["team"] = default_team
+
+        if "class_year" not in roster.columns:
+            roster["class_year"] = "FR"
+
+        roster["athlete_id"] = roster["athlete_id"].astype(str).str.strip()
+
+        # Ignore blank IDs when checking duplicates.
+        nonblank_ids = roster.loc[
+            roster["athlete_id"] != "",
+            "athlete_id",
+        ]
+
+        duplicate_ids = nonblank_ids[
+            nonblank_ids.duplicated(keep=False)
+        ].tolist()
+
+        if duplicate_ids:
+            raise RuntimeError(
+                f"{roster_path.name} has duplicate athlete_id values: "
+                + ", ".join(sorted(set(duplicate_ids)))
+            )
+
+        athletes = {}
+
+        # -------------------------------------------------
+        # BUILD ATHLETE DICTIONARY
+        # -------------------------------------------------
+        for _, row in roster.iterrows():
+            athlete_id = clean_csv_value(row.get("athlete_id"))
+            if not athlete_id:
+                continue
+
+            first_name = clean_csv_value(row.get("first_name"))
+            last_name = clean_csv_value(row.get("last_name"))
+            full_name = f"{first_name} {last_name}".strip()
+
+            if not full_name:
+                full_name = clean_csv_value(row.get("name"), athlete_id)
+
+            # ---------------------------------------------
+            # TRACK PERSONAL BESTS
+            # ---------------------------------------------
+            pbs = {}
+
+            pb_map = {
+                "800": "pb_800",
+                "1500": "pb_1500",
+                "mile": "pb_mile",
+                "3k": "pb_3k",
+                "5k": "pb_5k",
+            }
+
+            for event, column in pb_map.items():
+                value = clean_csv_value(row.get(column))
+                if value:
+                    pbs[event] = value
+
+            # ---------------------------------------------
+            # CROSS COUNTRY RESULTS
+            # ---------------------------------------------
+            xc_results = {}
+
+            # OLLU uses xc_8k_pb; the compact Sam Houston CSV uses pb_8k.
+            xc_8k = clean_csv_value(
+                row.get("xc_8k_pb"),
+                clean_csv_value(row.get("pb_8k")),
+            )
+
+            xc_10k = clean_csv_value(row.get("xc_10k_pb"))
+
+            # Future women's 6K support if pb_6k or xc_6k_pb is added.
+            xc_6k = clean_csv_value(
+                row.get("xc_6k_pb"),
+                clean_csv_value(row.get("pb_6k")),
+            )
+
+            if xc_6k:
+                xc_results["6k"] = [
+                    {"time": xc_6k, "meet": "XC Personal Best", "date": ""}
+                ]
+
+            if xc_8k:
+                xc_results["8k"] = [
+                    {"time": xc_8k, "meet": "XC Personal Best", "date": ""}
+                ]
+
+            if xc_10k:
+                xc_results["10k"] = [
+                    {"time": xc_10k, "meet": "XC Personal Best", "date": ""}
+                ]
+
+            # ---------------------------------------------
+            # THRESHOLD DATA
+            # ---------------------------------------------
+            threshold = {
+                "short_reps": {
+                    "pace": clean_csv_value(row.get("threshold_short_pace"), "--"),
+                    "lactate": clean_csv_value(row.get("threshold_short_lactate"), "--"),
+                },
+                "medium_reps": {
+                    "pace": clean_csv_value(row.get("threshold_medium_pace"), "--"),
+                    "lactate": clean_csv_value(row.get("threshold_medium_lactate"), "--"),
+                },
+                "long_reps": {
+                    "pace": clean_csv_value(row.get("threshold_long_pace"), "--"),
+                    "lactate": clean_csv_value(row.get("threshold_long_lactate"), "--"),
+                },
+            }
+
+            athletes[athlete_id] = {
+                "profile": {
+                    "name": full_name or athlete_id,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "school": clean_csv_value(row.get("school"), default_school),
+                    "team": clean_csv_value(row.get("team"), default_team),
+                    "class": clean_csv_value(row.get("class_year"), "FR"),
+                    "sex": clean_csv_value(row.get("sex")),
+                },
+                "pbs": pbs,
+                "xc_results": xc_results,
+                "threshold": threshold,
+
+                # Live training/HR is intentionally not stored in the roster CSV.
+                "training": {},
+                "recovery": {},
+
+                "strava_connected_csv": (
+                        clean_csv_value(row.get("strava_connected")).lower() == "true"
+                ),
+                "coros_connected_csv": (
+                        clean_csv_value(row.get("coros_connected")).lower() == "true"
+                ),
+            }
+
+        if not athletes:
+            raise RuntimeError(
+                f"No athletes were loaded from {roster_path.name}."
+            )
+
+        return roster, athletes
+
+
+    # =========================================================
+    # LOAD EACH TEAM SEPARATELY
+    # =========================================================
+
+    ollu_roster, ollu_athletes = load_team_roster(
+        OLLU_ROSTER_PATH,
+        default_school="OLLU",
+        default_team="Distance",
+    )
+
+    sam_houston_roster, sam_houston_athletes = load_team_roster(
+        SAM_HOUSTON_ROSTER_PATH,
+        default_school="Sam Houston",
+        default_team="Distance",
+    )
+
+    # Dark Horse can be deployed before the roster is populated. Replace the
+    # header-only template with the real CSV when the coach is ready.
     try:
-        token_parts = str(token).rsplit(":", 3)
-        if len(token_parts) != 4:
+        dark_horse_roster, dark_horse_athletes = load_team_roster(
+            DARK_HORSE_ROSTER_PATH,
+            default_school="Dark Horse Endurance",
+            default_team="Endurance",
+        )
+    except (FileNotFoundError, RuntimeError):
+        dark_horse_roster = pd.DataFrame()
+        dark_horse_athletes = {}
+
+    # Public sales-demo workspace. This uses a static snapshot so a coach can
+    # explore VEKDYN without touching a real team's roster, OAuth tokens or Neon data.
+    DEMO_TEAM_ID = "oregon_ducks_demo"
+    DEMO_ATHLETE_KEY = "demo_diego_moran"
+    DEMO_ATHLETES = {
+        DEMO_ATHLETE_KEY: {
+            "profile": {
+                "name": "Diego Moran", "first_name": "Diego", "last_name": "Moran",
+                "school": "Oregon Ducks", "team": "Distance", "class": "SR", "sex": "M",
+            },
+            "pbs": {"800": "2:02", "1500": "4:02", "mile": "4:22", "3k": "8:52", "5k": "14:55"},
+            "xc_results": {
+                "8k": [{"time": "26:18", "meet": "XC Personal Best", "date": ""}],
+                "10k": [],
+            },
+            "threshold": {
+                "short_reps": {"pace": "5:18/mi", "lactate": 2.4},
+                "medium_reps": {"pace": "5:30/mi", "lactate": 2.6},
+                "long_reps": {"pace": "5:40/mi", "lactate": 2.8},
+            },
+            "training": {
+                "weekly_mileage": {"Week 1": 67, "Week 2": 71, "Week 3": 73, "Week 4": 69, "Week 5": 74, "Week 6": 72},
+            },
+            "recovery": {},
+            "strava_connected_csv": True,
+            "coros_connected_csv": True,
+        }
+    }
+
+
+    # =========================================================
+    # TEAM ROUTING
+    # =========================================================
+
+    def get_team_athletes(team_id):
+        """Return only the roster belonging to the selected VEKDYN team."""
+        if team_id == "ollu_distance":
+            return ollu_athletes
+
+        if team_id == "sam_houston":
+            return sam_houston_athletes
+
+        if team_id == "dark_horse_endurance":
+            return dark_horse_athletes
+
+        if team_id == DEMO_TEAM_ID:
+            return DEMO_ATHLETES
+
+        return {}
+
+
+    # =========================================================
+    # GLOBAL ATHLETE LOOKUP — USED BY STRAVA OAUTH
+    # =========================================================
+    # The dashboard still swaps `athletes` to the active team's roster later.
+    # Strava OAuth, however, returns to a fresh Streamlit run before that team
+    # routing happens. Therefore OAuth needs a lookup containing BOTH schools.
+
+    all_athletes = {
+        **ollu_athletes,
+        **sam_houston_athletes,
+        **dark_horse_athletes,
+        **DEMO_ATHLETES,
+    }
+
+    # Map every athlete key back to the team that owns that profile.
+    athlete_team_lookup = {
+        **{athlete_key: "ollu_distance" for athlete_key in ollu_athletes},
+        **{athlete_key: "sam_houston" for athlete_key in sam_houston_athletes},
+        **{athlete_key: "dark_horse_endurance" for athlete_key in dark_horse_athletes},
+        **{athlete_key: DEMO_TEAM_ID for athlete_key in DEMO_ATHLETES},
+    }
+
+    # Fail early if the same athlete_id exists in both schools. Athlete keys are
+    # also the primary keys used by Neon for Strava connections, so they must be
+    # globally unique across VEKDYN.
+    team_roster_ids = {
+        "OLLU": set(ollu_athletes),
+        "Sam Houston": set(sam_houston_athletes),
+        "Dark Horse Endurance": set(dark_horse_athletes),
+    }
+    duplicate_cross_team_ids = set()
+    team_id_sets = list(team_roster_ids.values())
+    for left_index in range(len(team_id_sets)):
+        for right_index in range(left_index + 1, len(team_id_sets)):
+            duplicate_cross_team_ids.update(
+                team_id_sets[left_index].intersection(team_id_sets[right_index])
+            )
+    if duplicate_cross_team_ids:
+        raise RuntimeError(
+            "These athlete_id values are duplicated across VEKDYN teams: "
+            + ", ".join(sorted(duplicate_cross_team_ids))
+            + ". Give each athlete a globally unique athlete_id before using Strava."
+        )
+
+    # Used by the public landing page before a private workspace is selected.
+    # The private dashboard replaces this with get_team_athletes(active_team).
+    athletes = ollu_athletes
+
+    # =========================================================
+    # PAGE SETTINGS
+    # =========================================================
+
+    st.set_page_config(
+        page_title="VEKDYN",
+        page_icon="🏃",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # =========================================================
+    # AUTHENTICATION / PERSISTENT LOGIN / PAGE ROUTING
+    # =========================================================
+
+    LOGIN_SESSION_DAYS = 7
+
+    TEAM_CONFIG = {
+        "ollu_distance": {
+            "name": "OLLU Distance",
+            "short_name": "OLLU",
+        },
+        "sam_houston": {
+            "name": "Sam Houston Distance",
+            "short_name": "Sam Houston",
+        },
+        "dark_horse_endurance": {
+            "name": "Dark Horse Endurance",
+            "short_name": "Dark Horse",
+        },
+        DEMO_TEAM_ID: {
+            "name": "Oregon Ducks — VEKDYN Demo",
+            "short_name": "Oregon Ducks",
+        },
+    }
+
+
+    def team_config(team_id):
+        """Return display settings for one VEKDYN team."""
+        return TEAM_CONFIG.get(
+            team_id,
+            {"name": "VEKDYN Team", "short_name": "Team"},
+        )
+
+
+    def check_login(team_id, username, password):
+        """
+        Check credentials for the selected team.
+
+        secrets.toml format:
+
+        [team_logins.ollu_distance]
+        username = "..."
+        password = "..."
+
+        [team_logins.sam_houston]
+        username = "..."
+        password = "..."
+        """
+        try:
+            team_login = st.secrets["team_logins"][team_id]
+            correct_username = team_login["username"]
+            correct_password = team_login["password"]
+        except (KeyError, TypeError, FileNotFoundError):
+            return False
+
+        return (
+                hmac.compare_digest(str(username), str(correct_username))
+                and hmac.compare_digest(str(password), str(correct_password))
+        )
+
+
+    def get_login_signing_secret():
+        """
+        Sign VEKDYN login sessions without ever storing the coach password
+        in the browser. A dedicated LOGIN_SECRET can be added later.
+        """
+        try:
+            return str(st.secrets["LOGIN_SECRET"])
+        except (KeyError, FileNotFoundError):
+            return str(st.secrets["STRAVA_CLIENT_SECRET"])
+
+
+    def create_login_token(username, team_id):
+        """Create a signed login token tied to one VEKDYN team."""
+        expires_at = int(
+            time.time() + timedelta(days=LOGIN_SESSION_DAYS).total_seconds()
+        )
+        payload = f"{team_id}:{username}:{expires_at}"
+        signature = hmac.new(
+            get_login_signing_secret().encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"{payload}:{signature}"
+
+
+    def validate_login_token(token):
+        """Return (username, team_id) when a signed team session is valid."""
+        if not token:
             return None
 
-        team_id, username, expires_at, returned_signature = token_parts
-        expires_at = int(expires_at)
-    except (ValueError, TypeError, AttributeError):
-        return None
-
-    if team_id not in TEAM_CONFIG or time.time() > expires_at:
-        return None
-
-    payload = f"{team_id}:{username}:{expires_at}"
-    expected_signature = hmac.new(
-        get_login_signing_secret().encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(returned_signature, expected_signature):
-        return None
-
-    return username, team_id
-
-
-def restore_login_session():
-    """Restore the correct team workspace after a browser refresh."""
-
-    # The unified VEKDYN entry point is now the source of truth for login.
-    # If the coach deliberately logged out, do not revive an older token.
-    if st.session_state.get("just_logged_out"):
-        return
-
-    if st.session_state.get("logged_in"):
-        return
-
-    login_token = st.query_params.get("session")
-    restored = validate_login_token(login_token)
-
-    if restored:
-        username, team_id = restored
-        st.session_state["logged_in"] = True
-        st.session_state["logged_in_user"] = username
-        st.session_state["active_team"] = team_id
-        st.session_state["page"] = "dashboard"
-
-
-def log_out():
-    """Completely end both the Coach Hub and unified VEKDYN session."""
-
-    # Mark this as an intentional logout before the rerun.
-    st.session_state["just_logged_out"] = True
-
-    # Clear authentication and routing state from both layers.
-    for key in [
-        "logged_in_user",
-        "active_team",
-        "pending_team",
-        "vekdyn_authenticated_user",
-        "vekdyn_role",
-        "athlete_id",
-        "password_change_required",
-    ]:
-        st.session_state.pop(key, None)
-
-    st.session_state["logged_in"] = False
-    st.session_state["page"] = "home"
-
-    # Remove the old Coach Hub token and the new unified token, then tell
-    # vekdyn_unified.py that this rerun is a deliberate logout.
-    st.query_params.clear()
-    st.query_params["logout"] = "1"
-
-    st.rerun()
-
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-
-if "page" not in st.session_state:
-    st.session_state.page = "home"
-
-if "pending_team" not in st.session_state:
-    st.session_state.pending_team = None
-
-restore_login_session()
-
-
-# =========================================================
-# NEON DATABASE
-# =========================================================
-
-def get_database_connection():
-    """Open a connection to the VEKDYN Neon PostgreSQL database."""
-    return psycopg2.connect(st.secrets["DATABASE_URL"])
-
-
-def test_neon_connection():
-    """Test whether VEKDYN can reach Neon."""
-    try:
-        conn = get_database_connection()
-        conn.close()
-        return True
-
-    except Exception as e:
-        st.error(f"Neon connection failed: {e}")
-        return False
-
-
-# =========================================================
-# ATHLETE LOGIN ACCOUNTS — COACH MANAGEMENT
-# =========================================================
-# Schema setup functions below are cached with st.cache_resource so normal
-# navigation does not repeatedly open Neon connections and execute CREATE/ALTER
-# statements on every Streamlit rerun. Data reads/writes remain live.
-
-@st.cache_resource(show_spinner=False)
-def initialize_athlete_login_database():
-    """
-    Create/upgrade the ONE shared athlete-login table used by both
-    VEKDYN Coach and VEKDYN Athlete.
-
-    Canonical columns:
-        athlete_id
-        athlete_key
-        team_id
-        display_name
-        event_group
-        password_hash
-        active
-        password_updated_at
-
-    Older columns such as athlete_name / updated_at are preserved if they
-    already exist, but their values are copied into the canonical columns.
-    """
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-
-            # ---------------------------------------------------------
-            # BASE TABLE
-            # ---------------------------------------------------------
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS athlete_logins (
-                    athlete_id TEXT PRIMARY KEY,
-                    password_hash TEXT NOT NULL,
-                    active BOOLEAN NOT NULL DEFAULT TRUE
-                )
-                """
-            )
-
-            # ---------------------------------------------------------
-            # CANONICAL SHARED COLUMNS
-            # ---------------------------------------------------------
-            cursor.execute(
-                """
-                ALTER TABLE athlete_logins
-                ADD COLUMN IF NOT EXISTS athlete_key TEXT
-                """
-            )
-
-            cursor.execute(
-                """
-                ALTER TABLE athlete_logins
-                ADD COLUMN IF NOT EXISTS team_id TEXT
-                """
-            )
-
-            cursor.execute(
-                """
-                ALTER TABLE athlete_logins
-                ADD COLUMN IF NOT EXISTS display_name TEXT
-                """
-            )
-
-            cursor.execute(
-                """
-                ALTER TABLE athlete_logins
-                ADD COLUMN IF NOT EXISTS event_group TEXT
-                DEFAULT 'Distance'
-                """
-            )
-
-            cursor.execute(
-                """
-                ALTER TABLE athlete_logins
-                ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ
-                """
-            )
-
-            cursor.execute(
-                """
-                ALTER TABLE athlete_logins
-                ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN
-                DEFAULT FALSE
-                """
-            )
-
-            # ---------------------------------------------------------
-            # MIGRATE VALUES FROM OLDER ATHLETE-APP COLUMN NAMES
-            # ---------------------------------------------------------
-            cursor.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                  AND table_name = 'athlete_logins'
-                """
-            )
-            existing_columns = {row[0] for row in cursor.fetchall()}
-
-            if "athlete_name" in existing_columns:
-                cursor.execute(
-                    """
-                    UPDATE athlete_logins
-                    SET display_name = athlete_name
-                    WHERE (display_name IS NULL OR BTRIM(display_name) = '')
-                      AND athlete_name IS NOT NULL
-                      AND BTRIM(athlete_name) <> ''
-                    """
-                )
-
-            if "updated_at" in existing_columns:
-                cursor.execute(
-                    """
-                    UPDATE athlete_logins
-                    SET password_updated_at = updated_at
-                    WHERE password_updated_at IS NULL
-                      AND updated_at IS NOT NULL
-                    """
-                )
-
-            # Every existing account needs a permanent athlete_key.
-            cursor.execute(
-                """
-                UPDATE athlete_logins
-                SET athlete_key = athlete_id
-                WHERE athlete_key IS NULL
-                   OR BTRIM(athlete_key) = ''
-                """
-            )
-
-            cursor.execute(
-                """
-                UPDATE athlete_logins
-                SET event_group = 'Distance'
-                WHERE event_group IS NULL
-                   OR BTRIM(event_group) = ''
-                """
-            )
-
-        database.commit()
-
-
-def get_athlete_login_account(athlete_key):
-    """Return the current VEKDYN Athlete account for one athlete."""
-
-    initialize_athlete_login_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    athlete_id,
-                    athlete_key,
-                    team_id,
-                    display_name,
-                    event_group,
-                    active,
-                    password_updated_at,
-                    COALESCE(must_change_password, FALSE)
-                FROM athlete_logins
-                WHERE athlete_key = %s
-                   OR athlete_id = %s
-                LIMIT 1
-                """,
-                (athlete_key, athlete_key),
-            )
-            row = cursor.fetchone()
-
-    if not row:
-        return None
-
-    return {
-        "athlete_id": row[0],
-        "athlete_key": row[1] or row[0],
-        "team_id": row[2],
-        "display_name": row[3],
-        "event_group": row[4] or "Distance",
-        "active": bool(row[5]),
-        "password_updated_at": row[6],
-        "must_change_password": bool(row[7]),
-    }
-
-
-def generate_temporary_password():
-    """Generate a short, readable one-time athlete password for onboarding."""
-
-    # Six random alphanumeric characters keeps the temporary credential
-    # easy for a coach to share/type while remaining unpredictable.
-    # The athlete is still required to change it after first login.
-    alphabet = string.ascii_letters + string.digits
-    random_part = "".join(secrets.choice(alphabet) for _ in range(6))
-    return f"Vkd-{random_part}"
-
-
-def create_or_reset_athlete_login(
-        athlete_key,
-        team_id,
-        display_name,
-        event_group="Distance",
-):
-    """
-    Create an athlete account or reset its password.
-
-    Only the bcrypt hash is persisted to Neon. The readable
-    temporary password is returned to the coach for delivery
-    to the athlete.
-    """
-
-    initialize_athlete_login_database()
-
-    athlete_id = str(athlete_key).strip().lower()
-    clean_key = str(athlete_key).strip()
-    clean_name = str(display_name).strip() or clean_key
-    clean_team = str(team_id).strip()
-    clean_event_group = str(event_group).strip() or "Distance"
-
-    if not athlete_id or not clean_key or not clean_team:
-        raise ValueError("Athlete ID, athlete key, and team are required.")
-
-    temporary_password = generate_temporary_password()
-    password_hash = bcrypt.hashpw(
-        temporary_password.encode("utf-8"),
-        bcrypt.gensalt(),
-    ).decode("utf-8")
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO athlete_logins (
-                    athlete_id,
-                    athlete_key,
-                    team_id,
-                    display_name,
-                    event_group,
-                    password_hash,
-                    active,
-                    password_updated_at,
-                    must_change_password
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW(), TRUE)
-
-                ON CONFLICT (athlete_id)
-                DO UPDATE SET
-                    athlete_key = EXCLUDED.athlete_key,
-                    team_id = EXCLUDED.team_id,
-                    display_name = EXCLUDED.display_name,
-                    event_group = EXCLUDED.event_group,
-                    password_hash = EXCLUDED.password_hash,
-                    active = TRUE,
-                    password_updated_at = NOW(),
-                    must_change_password = TRUE
-                """,
-                (
-                    athlete_id,
-                    clean_key,
-                    clean_team,
-                    clean_name,
-                    clean_event_group,
-                    password_hash,
-                ),
-            )
-
-        database.commit()
-
-    return athlete_id, temporary_password
-
-
-def set_athlete_login_active(athlete_key, active):
-    """Enable or disable an athlete login without deleting its history."""
-
-    initialize_athlete_login_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE athlete_logins
-                SET active = %s
-                WHERE athlete_key = %s OR athlete_id = %s
-                """,
-                (bool(active), athlete_key, athlete_key),
-            )
-        database.commit()
-
-
-def render_athlete_account_manager(athlete_key, profile, team_id):
-    """Coach-facing controls for one athlete's VEKDYN Athlete login."""
-
-    athlete_name = profile.get("name", athlete_key)
-    event_group = profile.get("team", "Distance") or "Distance"
-
-    try:
-        account = get_athlete_login_account(athlete_key)
-    except psycopg2.Error as error:
-        st.error(f"VEKDYN could not load this athlete account: {error}")
-        return
-
-    st.subheader("Athlete Account")
-    st.caption(
-        "Create the private login this athlete will use in VEKDYN Athlete. "
-        "The temporary password is never stored in readable form."
-    )
-
-    with st.container(border=True):
-        status_col, id_col = st.columns([1, 2])
-
-        with status_col:
-            if account and account.get("active"):
-                st.success("Login active")
-            elif account:
-                st.warning("Login disabled")
-            else:
-                st.info("No login created")
-
-        with id_col:
-            login_id = account.get("athlete_id") if account else str(athlete_key).lower()
-            st.markdown(f"**Athlete ID:** `{login_id}`")
-            st.caption(f"Linked to {athlete_name} · {team_config(team_id)['short_name']}")
-
-        button_label = (
-            "Reset Temporary Password"
-            if account
-            else "Create Athlete Login"
-        )
-
-        if st.button(
-                button_label,
-                type="primary",
-                use_container_width=True,
-                key=f"athlete_login_create_reset_{team_id}_{athlete_key}",
-        ):
-            try:
-                new_athlete_id, temporary_password = create_or_reset_athlete_login(
-                    athlete_key=athlete_key,
-                    team_id=team_id,
-                    display_name=athlete_name,
-                    event_group=event_group,
-                )
-
-                st.session_state[f"temp_login_id_{athlete_key}"] = new_athlete_id
-                st.session_state[f"temp_password_{athlete_key}"] = temporary_password
-                st.session_state[f"temp_password_notice_{athlete_key}"] = True
-
-                st.rerun()
-
-            except (ValueError, psycopg2.Error) as error:
-                st.error(f"VEKDYN could not create the athlete login: {error}")
-
-        temp_password = st.session_state.get(f"temp_password_{athlete_key}")
-        temp_login_id = st.session_state.get(f"temp_login_id_{athlete_key}")
-
-        if temp_password and temp_login_id:
-            st.success("Temporary athlete credentials generated.")
-            st.code(
-                f"Athlete ID: {temp_login_id}\n"
-                f"Temporary password: {temp_password}",
-                language=None,
-            )
-            st.caption(
-                "Give these credentials directly to the athlete. "
-                "The readable password is only being kept in this coach session."
-            )
-
-            if st.button(
-                    "Clear Temporary Password",
-                    use_container_width=True,
-                    key=f"clear_temp_password_{team_id}_{athlete_key}",
-            ):
-                st.session_state.pop(f"temp_login_id_{athlete_key}", None)
-                st.session_state.pop(f"temp_password_{athlete_key}", None)
-                st.session_state.pop(f"temp_password_notice_{athlete_key}", None)
-                st.rerun()
-
-        if account:
-            st.divider()
-            active_now = bool(account.get("active"))
-            toggle_label = "Disable Athlete Login" if active_now else "Enable Athlete Login"
-
-            if st.button(
-                    toggle_label,
-                    use_container_width=True,
-                    key=f"toggle_athlete_login_{team_id}_{athlete_key}_{active_now}",
-            ):
-                try:
-                    set_athlete_login_active(athlete_key, not active_now)
-                    st.rerun()
-                except psycopg2.Error as error:
-                    st.error(f"VEKDYN could not update login status: {error}")
-
-
-# =========================================================
-# COROS MCP — COACH-SIDE OAUTH + SLEEP / HRV
-# =========================================================
-# Each athlete authorizes their own COROS account. VEKDYN stores that OAuth
-# connection against the athlete_key selected by the coach.
-
-COROS_MCP_URL = "https://mcpus.coros.com/mcp"
-COROS_REDIRECT_URI = "https://vekdyn.streamlit.app"
-COROS_TIMEZONE = "America/Chicago"
-COROS_PROTOCOL_VERSION = "2025-06-18"
-
-
-@st.cache_resource(show_spinner=False)
-def initialize_coros_database():
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("""CREATE TABLE IF NOT EXISTS coros_oauth_client (
-                id SMALLINT PRIMARY KEY DEFAULT 1, client_id TEXT NOT NULL,
-                client_secret TEXT, registration_json JSONB, updated_at TIMESTAMPTZ DEFAULT NOW())""")
-            c.execute("""CREATE TABLE IF NOT EXISTS coros_oauth_pending (
-                state TEXT PRIMARY KEY, athlete_key TEXT NOT NULL, code_verifier TEXT NOT NULL,
-                token_endpoint TEXT NOT NULL, client_id TEXT NOT NULL, client_secret TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW())""")
-            c.execute("""CREATE TABLE IF NOT EXISTS coros_connections (
-                athlete_key TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT,
-                token_type TEXT, scope TEXT, expires_at BIGINT, updated_at TIMESTAMPTZ DEFAULT NOW())""")
-            c.execute("""CREATE TABLE IF NOT EXISTS coros_recovery_daily (
-                athlete_key TEXT NOT NULL, recovery_date DATE NOT NULL, sleep_minutes INTEGER,
-                sleep_score INTEGER, hrv_avg INTEGER, hrv_baseline INTEGER,
-                hrv_normal_low INTEGER, hrv_normal_high INTEGER, hrv_status TEXT,
-                recovery_score INTEGER,
-                updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (athlete_key, recovery_date))""")
-            c.execute("""ALTER TABLE coros_recovery_daily
-                ADD COLUMN IF NOT EXISTS recovery_score INTEGER""")
-            c.execute("""ALTER TABLE coros_recovery_daily
-                ADD COLUMN IF NOT EXISTS sleep_hr_avg INTEGER""")
-            c.execute("""ALTER TABLE coros_recovery_daily
-                ADD COLUMN IF NOT EXISTS sleep_hr_baseline INTEGER""")
-            c.execute("""ALTER TABLE coros_recovery_daily
-                ADD COLUMN IF NOT EXISTS resting_hr INTEGER""")
-            c.execute("""ALTER TABLE coros_recovery_daily
-                ADD COLUMN IF NOT EXISTS vekdyn_recovery_score INTEGER""")
-        db.commit()
-
-
-def _coros_auth_metadata():
-    origin = COROS_MCP_URL.split('/mcp', 1)[0]
-    resource = None
-    for url in (f"{origin}/.well-known/oauth-protected-resource/mcp",
-                f"{origin}/.well-known/oauth-protected-resource"):
-        r = requests.get(url, timeout=15)
-        if r.ok:
-            resource = r.json(); break
-    if not resource or not resource.get("authorization_servers"):
-        raise RuntimeError("COROS OAuth discovery failed.")
-    issuer = str(resource["authorization_servers"][0]).rstrip('/')
-    for url in (f"{issuer}/.well-known/oauth-authorization-server",
-                f"{issuer}/.well-known/openid-configuration"):
-        r = requests.get(url, timeout=15)
-        if r.ok:
-            return r.json()
-    raise RuntimeError("COROS authorization metadata could not be loaded.")
-
-
-def _coros_client():
-    initialize_coros_database()
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("SELECT client_id, client_secret FROM coros_oauth_client WHERE id=1")
-            row = c.fetchone()
-    if row:
-        return {"client_id": row[0], "client_secret": row[1]}
-
-    meta = _coros_auth_metadata()
-    endpoint = meta.get("registration_endpoint")
-    if not endpoint:
-        raise RuntimeError("COROS did not advertise dynamic client registration for this server.")
-    r = requests.post(endpoint, json={
-        "client_name": "VEKDYN",
-        "redirect_uris": [COROS_REDIRECT_URI],
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "none",
-    }, timeout=15)
-    r.raise_for_status(); data = r.json()
-    if not data.get("client_id"):
-        raise RuntimeError("COROS registration did not return a client ID.")
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("""INSERT INTO coros_oauth_client(id,client_id,client_secret,registration_json)
-                VALUES(1,%s,%s,%s::jsonb) ON CONFLICT(id) DO UPDATE SET
-                client_id=EXCLUDED.client_id, client_secret=EXCLUDED.client_secret,
-                registration_json=EXCLUDED.registration_json, updated_at=NOW()""",
-                (data["client_id"], data.get("client_secret"), r.text))
-        db.commit()
-    return {"client_id": data["client_id"], "client_secret": data.get("client_secret")}
-
-
-def create_coros_login_url(athlete_key):
-    meta, client = _coros_auth_metadata(), _coros_client()
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
-    payload = f"coros.{athlete_key}.{secrets.token_urlsafe(18)}"
-    sig = hmac.new(get_login_signing_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
-    state = f"{payload}.{sig}"
-    token_endpoint = meta.get("token_endpoint")
-    if not meta.get("authorization_endpoint") or not token_endpoint:
-        raise RuntimeError("COROS OAuth endpoints are incomplete.")
-    initialize_coros_database()
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("DELETE FROM coros_oauth_pending WHERE created_at < NOW()-INTERVAL '30 minutes'")
-            c.execute("""INSERT INTO coros_oauth_pending
-                (state,athlete_key,code_verifier,token_endpoint,client_id,client_secret)
-                VALUES(%s,%s,%s,%s,%s,%s)""",
-                (state, athlete_key, verifier, token_endpoint, client["client_id"], client.get("client_secret")))
-        db.commit()
-    params = {"response_type":"code", "client_id":client["client_id"],
-              "redirect_uri":COROS_REDIRECT_URI, "state":state,
-              "code_challenge":challenge, "code_challenge_method":"S256", "resource":COROS_MCP_URL}
-    scopes = meta.get("scopes_supported") or []
-    if scopes: params["scope"] = " ".join(scopes)
-    return f"{meta['authorization_endpoint']}?{urlencode(params)}"
-
-
-def coros_state_athlete_key(state):
-    if not state or not str(state).startswith("coros."): return None
-    parts = str(state).split('.')
-    if len(parts) < 4: return None
-    payload, returned = '.'.join(parts[:-1]), parts[-1]
-    expected = hmac.new(get_login_signing_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return parts[1] if hmac.compare_digest(returned, expected) else None
-
-
-def exchange_coros_authorization_code(code, state):
-    athlete_key = coros_state_athlete_key(state)
-    if athlete_key not in all_athletes: raise RuntimeError("COROS callback did not match a VEKDYN athlete.")
-    initialize_coros_database()
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("SELECT code_verifier,token_endpoint,client_id,client_secret FROM coros_oauth_pending WHERE state=%s",(state,))
-            row = c.fetchone()
-    if not row: raise RuntimeError("COROS authorization expired. Select Connect COROS again.")
-    verifier, endpoint, client_id, secret = row
-    form = {"grant_type":"authorization_code","code":code,"redirect_uri":COROS_REDIRECT_URI,
-            "client_id":client_id,"code_verifier":verifier,"resource":COROS_MCP_URL}
-    if secret: form["client_secret"] = secret
-    r = requests.post(endpoint, data=form, timeout=20); r.raise_for_status(); token = r.json()
-    if not token.get("access_token"): raise RuntimeError("COROS returned no access token.")
-    expires_at = int(time.time()) + int(token.get("expires_in") or 0) if token.get("expires_in") else None
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("""INSERT INTO coros_connections(athlete_key,access_token,refresh_token,token_type,scope,expires_at)
-                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(athlete_key) DO UPDATE SET
-                access_token=EXCLUDED.access_token,refresh_token=EXCLUDED.refresh_token,
-                token_type=EXCLUDED.token_type,scope=EXCLUDED.scope,expires_at=EXCLUDED.expires_at,updated_at=NOW()""",
-                (athlete_key,token["access_token"],token.get("refresh_token"),token.get("token_type"),token.get("scope"),expires_at))
-            c.execute("DELETE FROM coros_oauth_pending WHERE state=%s",(state,))
-        db.commit()
-    return athlete_key
-
-
-def load_coros_connection(athlete_key):
-    initialize_coros_database()
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("SELECT access_token,refresh_token,expires_at FROM coros_connections WHERE athlete_key=%s",(athlete_key,)); row=c.fetchone()
-    return {"access_token":row[0],"refresh_token":row[1],"expires_at":row[2]} if row else {}
-
-
-def coros_is_connected(athlete_key): return bool(load_coros_connection(athlete_key).get("access_token"))
-
-
-def get_valid_coros_token(athlete_key):
-    con = load_coros_connection(athlete_key)
-    if not con: raise RuntimeError("This athlete has not connected COROS.")
-    if not con.get("expires_at") or int(con["expires_at"]) > int(time.time())+120: return con["access_token"]
-    if not con.get("refresh_token"): raise RuntimeError("COROS session expired. Reconnect COROS.")
-    meta, client = _coros_auth_metadata(), _coros_client()
-    form={"grant_type":"refresh_token","refresh_token":con["refresh_token"],"client_id":client["client_id"],"resource":COROS_MCP_URL}
-    if client.get("client_secret"): form["client_secret"]=client["client_secret"]
-    r=requests.post(meta["token_endpoint"],data=form,timeout=20); r.raise_for_status(); t=r.json()
-    expires=int(time.time())+int(t.get("expires_in") or 0) if t.get("expires_in") else None
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute("UPDATE coros_connections SET access_token=%s,refresh_token=COALESCE(%s,refresh_token),expires_at=%s,updated_at=NOW() WHERE athlete_key=%s",
-                      (t["access_token"],t.get("refresh_token"),expires,athlete_key))
-        db.commit()
-    return t["access_token"]
-
-
-def _mcp_json(r):
-    r.raise_for_status()
-    if "application/json" in r.headers.get("content-type", ""):
-        return r.json()
-    for line in r.text.splitlines():
-        if line.startswith("data:"):
-            try:
-                return json.loads(line[5:].strip())
-            except Exception:
-                pass
-    raise RuntimeError("COROS MCP returned an unreadable response.")
-
-
-def _normalize_coros_text(value):
-    """Turn MCP text content into real newlines before parsing COROS summaries."""
-    if value is None:
-        return ""
-    text_value = str(value).strip()
-
-    # COROS MCP can return the tool text as a JSON-encoded string, e.g.
-    # "Sleep Data\\n...". Decode that wrapper first.
-    if len(text_value) >= 2 and text_value[0] == '"' and text_value[-1] == '"':
         try:
-            decoded = json.loads(text_value)
-            if isinstance(decoded, str):
-                text_value = decoded
-        except Exception:
-            pass
+            token_parts = str(token).rsplit(":", 3)
+            if len(token_parts) != 4:
+                return None
 
-    # Defensive fallback for literal escape sequences left by an MCP transport.
-    text_value = text_value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
-    return text_value.strip()
+            team_id, username, expires_at, returned_signature = token_parts
+            expires_at = int(expires_at)
+        except (ValueError, TypeError, AttributeError):
+            return None
 
+        if team_id not in TEAM_CONFIG or time.time() > expires_at:
+            return None
 
-def coros_mcp_tool_call(token, name, arguments):
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        "MCP-Protocol-Version": COROS_PROTOCOL_VERSION,
-    }
-    init = {
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": COROS_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "VEKDYN", "version": "1.1"},
-        },
-    }
-    r = requests.post(COROS_MCP_URL, headers=headers, json=init, timeout=25)
-    data = _mcp_json(r)
-    if data.get("error"):
-        raise RuntimeError(str(data["error"]))
+        payload = f"{team_id}:{username}:{expires_at}"
+        expected_signature = hmac.new(
+            get_login_signing_secret().encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
-    session_id = r.headers.get("Mcp-Session-Id")
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
+        if not hmac.compare_digest(returned_signature, expected_signature):
+            return None
 
-    # Complete the MCP handshake before tools/call.
-    initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
-    ready = requests.post(COROS_MCP_URL, headers=headers, json=initialized, timeout=15)
-    ready.raise_for_status()
-
-    call = {
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": name, "arguments": arguments},
-    }
-    response = requests.post(COROS_MCP_URL, headers=headers, json=call, timeout=30)
-    data = _mcp_json(response)
-    if data.get("error"):
-        raise RuntimeError(str(data["error"]))
-
-    text_parts = [
-        _normalize_coros_text(item.get("text", ""))
-        for item in data.get("result", {}).get("content", [])
-        if isinstance(item, dict) and item.get("text") is not None
-    ]
-    return "\n".join(part for part in text_parts if part)
+        return username, team_id
 
 
-def _parse_coros_sleep(text):
-    """Parse COROS sleep summaries keyed by wake-up date."""
-    text = _normalize_coros_text(text)
-    records = {}
-    date_pattern = re.compile(r"(?m)^(\d{4}-\d{2}-\d{2}):?\s*$")
-    matches = list(date_pattern.finditer(text))
-    for i, match in enumerate(matches):
-        day = match.group(1)
-        block = text[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text)]
-        score_match = re.search(r"Sleep Score:\s*(\d+)", block, re.I)
-        sleep_match = re.search(r"Main Sleep:\s*(?:(\d+)h\s*)?(\d+)min", block, re.I)
-        if score_match or sleep_match:
-            records[day] = {
-                "sleep_score": int(score_match.group(1)) if score_match else None,
-                "sleep_minutes": (
-                    int(sleep_match.group(1) or 0) * 60 + int(sleep_match.group(2))
-                    if sleep_match else None
-                ),
-            }
-    return records
+    def restore_login_session():
+        """Restore the correct team workspace after a browser refresh."""
+
+        # The unified VEKDYN entry point is now the source of truth for login.
+        # If the coach deliberately logged out, do not revive an older token.
+        if st.session_state.get("just_logged_out"):
+            return
+
+        if st.session_state.get("logged_in"):
+            return
+
+        login_token = st.query_params.get("session")
+        restored = validate_login_token(login_token)
+
+        if restored:
+            username, team_id = restored
+            st.session_state["logged_in"] = True
+            st.session_state["logged_in_user"] = username
+            st.session_state["active_team"] = team_id
+            st.session_state["page"] = "dashboard"
 
 
-def _parse_coros_hrv(text):
-    """Parse the official COROS HRV assessment, not raw HRV samples."""
-    text = _normalize_coros_text(text)
-    assessment = text.split("Sleep HRV Time Series", 1)[0]
-    pattern = re.compile(
-        r"(?m)^(\d{4}-\d{2}-\d{2}):\s*\n"
-        r"\s*HRV Avg:\s*(\d+)\s*ms\s*[—-]\s*([^\n]+)\n"
-        r"\s*Normal Range:\s*(\d+)\s*-\s*(\d+)\s*ms\s*\n"
-        r"\s*Baseline:\s*(\d+)\s*ms",
-        re.I,
-    )
-    records = {}
-    for m in pattern.finditer(assessment):
-        records[m.group(1)] = {
-            "hrv_avg": int(m.group(2)),
-            "hrv_status": m.group(3).strip(),
-            "hrv_normal_low": int(m.group(4)),
-            "hrv_normal_high": int(m.group(5)),
-            "hrv_baseline": int(m.group(6)),
-        }
-    return records
+    def log_out():
+        """Completely end both the Coach Hub and unified VEKDYN session."""
+
+        # Mark this as an intentional logout before the rerun.
+        st.session_state["just_logged_out"] = True
+
+        # Clear authentication and routing state from both layers.
+        for key in [
+            "logged_in_user",
+            "active_team",
+            "pending_team",
+            "vekdyn_authenticated_user",
+            "vekdyn_role",
+            "athlete_id",
+            "password_change_required",
+        ]:
+            st.session_state.pop(key, None)
+
+        st.session_state["logged_in"] = False
+        st.session_state["page"] = "home"
+
+        # Remove the old Coach Hub token and the new unified token, then tell
+        # vekdyn_unified.py that this rerun is a deliberate logout.
+        st.query_params.clear()
+        st.query_params["logout"] = "1"
+
+        st.rerun()
 
 
-def _parse_coros_daily_health(text):
-    """Parse COROS average sleeping heart rate from daily health summaries."""
-    text = _normalize_coros_text(text)
-    records = {}
-    # Daily Health dates are usually rendered as --- 20260904 ---.
-    date_pattern = re.compile(r"(?m)^---\s*(\d{8})\s*---\s*$")
-    matches = list(date_pattern.finditer(text))
-    for i, match in enumerate(matches):
-        raw_day = match.group(1)
-        day = f"{raw_day[:4]}-{raw_day[4:6]}-{raw_day[6:]}"
-        block = text[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text)]
-        sleep_hr = re.search(r"Sleep HR:\s*Avg\s*(\d+)\s*bpm", block, re.I)
-        if sleep_hr:
-            records[day] = {"sleep_hr_avg": int(sleep_hr.group(1))}
-    return records
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if "page" not in st.session_state:
+        st.session_state.page = "home"
+
+    if "pending_team" not in st.session_state:
+        st.session_state.pending_team = None
+
+    restore_login_session()
 
 
-def _median_int(values):
-    clean = sorted(int(v) for v in values if v is not None)
-    if not clean:
-        return None
-    n = len(clean)
-    if n % 2:
-        return clean[n // 2]
-    return int(round((clean[n // 2 - 1] + clean[n // 2]) / 2))
+    # =========================================================
+    # NEON DATABASE
+    # =========================================================
+
+    def get_database_connection():
+        """Open a connection to the VEKDYN Neon PostgreSQL database."""
+        return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 
-def vekdyn_recovery_score(
-    sleep_score,
-    hrv_avg,
-    hrv_baseline,
-    hrv_low=None,
-    hrv_high=None,
-    sleep_hr_avg=None,
-    sleep_hr_baseline=None,
-):
-    """VEKDYN Recovery v2 using the athlete's own sleep, HRV and sleeping-HR norms.
+    def test_neon_connection():
+        """Test whether VEKDYN can reach Neon."""
+        try:
+            conn = get_database_connection()
+            conn.close()
+            return True
 
-    Target weights: sleep 45%, HRV 40%, average sleeping HR 15%.
-    If one input is unavailable, available components are reweighted instead of
-    inventing missing physiological data.
-    """
-    components = []
-
-    if sleep_score is not None:
-        components.append((0.45, max(0.0, min(100.0, float(sleep_score)))))
-
-    if hrv_avg is not None and hrv_baseline not in (None, 0):
-        if hrv_low is not None and hrv_high is not None and hrv_low <= hrv_avg <= hrv_high:
-            hrv_component = 100.0
-        elif hrv_low not in (None, 0) and hrv_avg < hrv_low:
-            hrv_component = max(0.0, min(100.0, 100.0 * float(hrv_avg) / float(hrv_low)))
-        else:
-            reference = float(hrv_baseline)
-            deviation = abs(float(hrv_avg) - reference) / max(reference, 1.0)
-            hrv_component = max(60.0, 100.0 - deviation * 100.0)
-        components.append((0.40, hrv_component))
-
-    if sleep_hr_avg is not None and sleep_hr_baseline not in (None, 0):
-        # A modestly lower sleeping HR is not penalized; elevations above personal
-        # baseline progressively reduce the HR component.
-        ratio = float(sleep_hr_avg) / float(sleep_hr_baseline)
-        if ratio <= 1.02:
-            hr_component = 100.0
-        else:
-            hr_component = max(40.0, 100.0 - (ratio - 1.02) * 250.0)
-        components.append((0.15, hr_component))
-
-    if not components:
-        return None
-
-    weight_total = sum(weight for weight, _ in components)
-    return int(round(sum(weight * score for weight, score in components) / weight_total))
+        except Exception as e:
+            st.error(f"Neon connection failed: {e}")
+            return False
 
 
-def sync_coros_recovery(athlete_key):
-    """Sync seven recent COROS recovery days for one athlete."""
-    token = get_valid_coros_token(athlete_key)
-    args = {"startDate": "", "endDate": "", "days": 7, "timezone": COROS_TIMEZONE}
+    # =========================================================
+    # ATHLETE LOGIN ACCOUNTS — COACH MANAGEMENT
+    # =========================================================
+    # Schema setup functions below are cached with st.cache_resource so normal
+    # navigation does not repeatedly open Neon connections and execute CREATE/ALTER
+    # statements on every Streamlit rerun. Data reads/writes remain live.
 
-    sleep_text = coros_mcp_tool_call(token, "querySleepData", args)
-    hrv_text = coros_mcp_tool_call(token, "querySleepHrv", args)
-    health_text = coros_mcp_tool_call(
-        token,
-        "queryDailyHealthData",
-        {"days": 7, "timezone": COROS_TIMEZONE},
-    )
+    @st.cache_resource(show_spinner=False)
+    def initialize_athlete_login_database():
+        """
+        Create/upgrade the ONE shared athlete-login table used by both
+        VEKDYN Coach and VEKDYN Athlete.
 
-    sleep_days = _parse_coros_sleep(sleep_text)
-    hrv_days = _parse_coros_hrv(hrv_text)
-    health_days = _parse_coros_daily_health(health_text)
-    all_days = sorted(set(sleep_days) | set(hrv_days) | set(health_days))
+        Canonical columns:
+            athlete_id
+            athlete_key
+            team_id
+            display_name
+            event_group
+            password_hash
+            active
+            password_updated_at
 
-    if not all_days:
-        raise RuntimeError(
-            "COROS returned data, but VEKDYN could not parse the recent recovery records."
-        )
+        Older columns such as athlete_name / updated_at are preserved if they
+        already exist, but their values are copied into the canonical columns.
+        """
 
-    sleep_hr_baseline = _median_int(
-        record.get("sleep_hr_avg") for record in health_days.values()
-    )
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
 
-    initialize_coros_database()
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            for day in all_days:
-                sv = sleep_days.get(day, {})
-                hv = hrv_days.get(day, {})
-                dv = health_days.get(day, {})
-                score = vekdyn_recovery_score(
-                    sv.get("sleep_score"),
-                    hv.get("hrv_avg"),
-                    hv.get("hrv_baseline"),
-                    hv.get("hrv_normal_low"),
-                    hv.get("hrv_normal_high"),
-                    dv.get("sleep_hr_avg"),
-                    sleep_hr_baseline,
+                # ---------------------------------------------------------
+                # BASE TABLE
+                # ---------------------------------------------------------
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_logins (
+                        athlete_id TEXT PRIMARY KEY,
+                        password_hash TEXT NOT NULL,
+                        active BOOLEAN NOT NULL DEFAULT TRUE
+                    )
+                    """
                 )
-                c.execute(
-                    """INSERT INTO coros_recovery_daily(
-                            athlete_key,recovery_date,sleep_minutes,sleep_score,
-                            hrv_avg,hrv_baseline,hrv_normal_low,hrv_normal_high,
-                            hrv_status,recovery_score,sleep_hr_avg,sleep_hr_baseline)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
-                            sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),
-                            sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
-                            hrv_avg=COALESCE(EXCLUDED.hrv_avg,coros_recovery_daily.hrv_avg),
-                            hrv_baseline=COALESCE(EXCLUDED.hrv_baseline,coros_recovery_daily.hrv_baseline),
-                            hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),
-                            hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
-                            hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),
-                            recovery_score=COALESCE(EXCLUDED.recovery_score,coros_recovery_daily.recovery_score),
-                            sleep_hr_avg=COALESCE(EXCLUDED.sleep_hr_avg,coros_recovery_daily.sleep_hr_avg),
-                            sleep_hr_baseline=COALESCE(EXCLUDED.sleep_hr_baseline,coros_recovery_daily.sleep_hr_baseline),
-                            updated_at=NOW()""",
+
+                # ---------------------------------------------------------
+                # CANONICAL SHARED COLUMNS
+                # ---------------------------------------------------------
+                cursor.execute(
+                    """
+                    ALTER TABLE athlete_logins
+                    ADD COLUMN IF NOT EXISTS athlete_key TEXT
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE athlete_logins
+                    ADD COLUMN IF NOT EXISTS team_id TEXT
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE athlete_logins
+                    ADD COLUMN IF NOT EXISTS display_name TEXT
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE athlete_logins
+                    ADD COLUMN IF NOT EXISTS event_group TEXT
+                    DEFAULT 'Distance'
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE athlete_logins
+                    ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE athlete_logins
+                    ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN
+                    DEFAULT FALSE
+                    """
+                )
+
+                # Email is a login alias, never the permanent athlete identifier.
+                cursor.execute("ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS login_email TEXT")
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS athlete_logins_login_email_unique ON athlete_logins (LOWER(login_email)) WHERE login_email IS NOT NULL")
+
+                # ---------------------------------------------------------
+                # MIGRATE VALUES FROM OLDER ATHLETE-APP COLUMN NAMES
+                # ---------------------------------------------------------
+                cursor.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'athlete_logins'
+                    """
+                )
+                existing_columns = {row[0] for row in cursor.fetchall()}
+
+                if "athlete_name" in existing_columns:
+                    cursor.execute(
+                        """
+                        UPDATE athlete_logins
+                        SET display_name = athlete_name
+                        WHERE (display_name IS NULL OR BTRIM(display_name) = '')
+                          AND athlete_name IS NOT NULL
+                          AND BTRIM(athlete_name) <> ''
+                        """
+                    )
+
+                if "updated_at" in existing_columns:
+                    cursor.execute(
+                        """
+                        UPDATE athlete_logins
+                        SET password_updated_at = updated_at
+                        WHERE password_updated_at IS NULL
+                          AND updated_at IS NOT NULL
+                        """
+                    )
+
+                # Every existing account needs a permanent athlete_key.
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET athlete_key = athlete_id
+                    WHERE athlete_key IS NULL
+                       OR BTRIM(athlete_key) = ''
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET event_group = 'Distance'
+                    WHERE event_group IS NULL
+                       OR BTRIM(event_group) = ''
+                    """
+                )
+
+            database.commit()
+
+
+    def get_athlete_login_account(athlete_key):
+        """Return the current VEKDYN Athlete account for one athlete."""
+
+        initialize_athlete_login_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        athlete_id,
+                        athlete_key,
+                        team_id,
+                        display_name,
+                        event_group,
+                        active,
+                        password_updated_at,
+                        COALESCE(must_change_password, FALSE),
+                        login_email
+                    FROM athlete_logins
+                    WHERE athlete_key = %s
+                       OR athlete_id = %s
+                    LIMIT 1
+                    """,
+                    (athlete_key, athlete_key),
+                )
+                row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "athlete_id": row[0],
+            "athlete_key": row[1] or row[0],
+            "team_id": row[2],
+            "display_name": row[3],
+            "event_group": row[4] or "Distance",
+            "active": bool(row[5]),
+            "password_updated_at": row[6],
+            "must_change_password": bool(row[7]),
+            "login_email": row[8],
+        }
+
+
+    def generate_temporary_password():
+        """Generate a short, readable one-time athlete password for onboarding."""
+
+        # Six random alphanumeric characters keeps the temporary credential
+        # easy for a coach to share/type while remaining unpredictable.
+        # The athlete is still required to change it after first login.
+        alphabet = string.ascii_letters + string.digits
+        random_part = "".join(secrets.choice(alphabet) for _ in range(6))
+        return f"Vkd-{random_part}"
+
+
+    def create_or_reset_athlete_login(
+            athlete_key,
+            team_id,
+            display_name,
+            event_group="Distance",
+    ):
+        """
+        Create an athlete account or reset its password.
+
+        Only the bcrypt hash is persisted to Neon. The readable
+        temporary password is returned to the coach for delivery
+        to the athlete.
+        """
+
+        initialize_athlete_login_database()
+
+        athlete_id = str(athlete_key).strip().lower()
+        clean_key = str(athlete_key).strip()
+        clean_name = str(display_name).strip() or clean_key
+        clean_team = str(team_id).strip()
+        clean_event_group = str(event_group).strip() or "Distance"
+
+        if not athlete_id or not clean_key or not clean_team:
+            raise ValueError("Athlete ID, athlete key, and team are required.")
+
+        temporary_password = generate_temporary_password()
+        password_hash = bcrypt.hashpw(
+            temporary_password.encode("utf-8"),
+            bcrypt.gensalt(),
+        ).decode("utf-8")
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO athlete_logins (
+                        athlete_id,
+                        athlete_key,
+                        team_id,
+                        display_name,
+                        event_group,
+                        password_hash,
+                        active,
+                        password_updated_at,
+                        must_change_password
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW(), TRUE)
+
+                    ON CONFLICT (athlete_id)
+                    DO UPDATE SET
+                        athlete_key = EXCLUDED.athlete_key,
+                        team_id = EXCLUDED.team_id,
+                        display_name = EXCLUDED.display_name,
+                        event_group = EXCLUDED.event_group,
+                        password_hash = EXCLUDED.password_hash,
+                        active = TRUE,
+                        password_updated_at = NOW(),
+                        must_change_password = TRUE
+                    """,
                     (
-                        athlete_key, day, sv.get("sleep_minutes"), sv.get("sleep_score"),
-                        hv.get("hrv_avg"), hv.get("hrv_baseline"), hv.get("hrv_normal_low"),
-                        hv.get("hrv_normal_high"), hv.get("hrv_status"), score,
-                        dv.get("sleep_hr_avg"), sleep_hr_baseline,
+                        athlete_id,
+                        clean_key,
+                        clean_team,
+                        clean_name,
+                        clean_event_group,
+                        password_hash,
                     ),
                 )
-        db.commit()
-    return load_latest_coros_recovery(athlete_key)
+
+            database.commit()
+
+        return athlete_id, temporary_password
 
 
-def load_latest_coros_recovery(athlete_key):
-    """Load the newest recorded COROS value for each recovery metric.
+    def set_athlete_login_active(athlete_key, active):
+        """Enable or disable an athlete login without deleting its history."""
 
-    Athlete Hub can write sleep, HRV and resting HR on different dates, so the
-    Coach Hub must not require every metric to exist on the single newest row.
-    """
-    initialize_coros_database()
-    with get_database_connection() as db:
-        with db.cursor() as c:
-            c.execute(
-                """
-                SELECT
-                    (SELECT recovery_date FROM coros_recovery_daily WHERE athlete_key=%s AND (sleep_minutes IS NOT NULL OR hrv_avg IS NOT NULL OR resting_hr IS NOT NULL OR sleep_hr_avg IS NOT NULL) ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT sleep_minutes FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_minutes IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT sleep_score FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_score IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT hrv_avg FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT hrv_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT hrv_normal_low FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_low IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT hrv_normal_high FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_high IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT hrv_status FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_status IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT COALESCE(vekdyn_recovery_score,recovery_score) FROM coros_recovery_daily WHERE athlete_key=%s AND COALESCE(vekdyn_recovery_score,recovery_score) IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT sleep_hr_avg FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_hr_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT sleep_hr_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_hr_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
-                    (SELECT resting_hr FROM coros_recovery_daily WHERE athlete_key=%s AND resting_hr IS NOT NULL ORDER BY recovery_date DESC LIMIT 1)
-                """,
-                (athlete_key,) * 12,
-            )
-            r = c.fetchone()
-    if not r or not any(value is not None for value in r):
-        return {}
-    return {
-        "date": r[0], "sleep_minutes": r[1], "sleep_score": r[2],
-        "hrv_avg": r[3], "hrv_baseline": r[4], "hrv_normal_low": r[5],
-        "hrv_normal_high": r[6], "hrv_status": r[7], "recovery_score": r[8],
-        "sleep_hr_avg": r[9], "sleep_hr_baseline": r[10], "resting_hr": r[11],
-    }
+        initialize_athlete_login_database()
 
-
-# =========================================================
-# STRAVA SETTINGS
-# =========================================================
-
-STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
-# Direct activity polling is intentionally disabled for Strava review compliance.
-STRAVA_ACTIVITIES_URL = None
-STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
-
-STRAVA_REDIRECT_URI = "https://vekdyn.streamlit.app"
-
-
-# =========================================================
-# STRAVA DATABASE — NEON POSTGRESQL
-# =========================================================
-
-@st.cache_resource(show_spinner=False)
-def initialize_strava_database():
-    """
-    Create the Strava connection table in Neon if it does not
-    already exist.
-    """
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS strava_connections (
-                    athlete_key TEXT PRIMARY KEY,
-                    access_token TEXT NOT NULL,
-                    refresh_token TEXT NOT NULL,
-                    expires_at BIGINT NOT NULL,
-                    scope TEXT,
-                    strava_athlete_id BIGINT UNIQUE,
-                    strava_name TEXT
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET active = %s
+                    WHERE athlete_key = %s OR athlete_id = %s
+                    """,
+                    (bool(active), athlete_key, athlete_key),
                 )
-                """
-            )
+            database.commit()
 
 
-def load_saved_strava_connection(athlete_key):
-    """
-    Load one athlete's saved Strava connection from Neon.
-    """
-
-    initialize_strava_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    athlete_key,
-                    access_token,
-                    refresh_token,
-                    expires_at,
-                    scope,
-                    strava_athlete_id,
-                    strava_name
-                FROM strava_connections
-                WHERE athlete_key = %s
-                """,
-                (athlete_key,),
-            )
-
-            row = cursor.fetchone()
-
-    if not row:
-        return {}
-
-    return {
-        "athlete_key": row[0],
-        "access_token": row[1],
-        "refresh_token": row[2],
-        "expires_at": row[3],
-        "scope": row[4],
-        "strava_athlete_id": row[5],
-        "strava_name": row[6],
-    }
-
-
-
-def delete_saved_strava_connection(athlete_key):
-    """Remove a stale/revoked Strava authorization from Neon and this session."""
-    initialize_strava_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM strava_connections WHERE athlete_key = %s",
-                (athlete_key,),
-            )
-        database.commit()
-
-    strava_connections().pop(athlete_key, None)
-    st.session_state.pop(f"{athlete_key}_strava_weekly", None)
-    st.session_state.pop(f"{athlete_key}_strava_heart_rate", None)
-
-
-def saved_owner_of_strava_account(strava_athlete_id):
-    """
-    Check whether this Strava account is already connected
-    to another VEKDYN athlete.
-    """
-
-    if not strava_athlete_id:
-        return None
-
-    initialize_strava_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT athlete_key
-                FROM strava_connections
-                WHERE strava_athlete_id = %s
-                """,
-                (strava_athlete_id,),
-            )
-
-            row = cursor.fetchone()
-
-    return row[0] if row else None
-
-
-def persist_strava_connection(athlete_key, connection):
-    """
-    Save an athlete's Strava OAuth tokens to Neon.
-
-    If the athlete already exists, update their tokens instead
-    of creating another record.
-    """
-
-    initialize_strava_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO strava_connections (
-                    athlete_key,
-                    access_token,
-                    refresh_token,
-                    expires_at,
-                    scope,
-                    strava_athlete_id,
-                    strava_name
+    def set_athlete_login_email(athlete_key, email):
+        """Set a unique email alias without changing the permanent athlete ID."""
+        import re
+        normalized = str(email or "").strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized):
+            raise ValueError("Enter a valid athlete email address.")
+        initialize_athlete_login_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE athlete_logins SET login_email = %s WHERE athlete_key = %s OR athlete_id = %s RETURNING athlete_id",
+                    (normalized, athlete_key, athlete_key),
                 )
-
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-
-                ON CONFLICT (athlete_key)
-
-                DO UPDATE SET
-                    access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token,
-                    expires_at = EXCLUDED.expires_at,
-                    scope = EXCLUDED.scope,
-                    strava_athlete_id = EXCLUDED.strava_athlete_id,
-                    strava_name = EXCLUDED.strava_name
-                """,
-
-                (
-                    athlete_key,
-                    connection["access_token"],
-                    connection["refresh_token"],
-                    int(connection["expires_at"]),
-                    connection.get("scope", ""),
-                    connection.get("strava_athlete_id"),
-                    connection.get("strava_name", ""),
-                ),
-            )
+                if not cursor.fetchone():
+                    raise ValueError("Create the athlete account before assigning an email.")
+            database.commit()
+        return normalized
 
 
-# =========================================================
-# ATHLETE + COACH NOTES — NEON POSTGRESQL
-# =========================================================
 
-TEAM_TIMEZONE = ZoneInfo("America/Chicago")
+    # =========================================================
+    # SECURE ATHLETE INVITATIONS (shared Neon database)
+    # =========================================================
 
-
-@st.cache_resource(show_spinner=False)
-def initialize_notes_database():
-    """Create a shared athlete/coach notes feed in Neon."""
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS athlete_notes (
-                    id BIGSERIAL PRIMARY KEY,
-                    athlete_key TEXT NOT NULL,
-                    author_name TEXT NOT NULL,
-                    author_role TEXT NOT NULL,
-                    note_text TEXT NOT NULL,
+    def initialize_athlete_invitations():
+        with get_database_connection() as db:
+            with db.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS athlete_invitations (
+                    token_hash TEXT PRIMARY KEY,
+                    athlete_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    CONSTRAINT athlete_notes_role_check
-                        CHECK (author_role IN ('COACH', 'ATHLETE'))
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS athlete_notes_athlete_created_idx
-                ON athlete_notes (athlete_key, created_at DESC)
-                """
-            )
-
-
-def save_athlete_note(athlete_key, author_name, author_role, note_text):
-    """Save one coach or athlete note to the selected athlete's Neon feed."""
-    clean_note = str(note_text).strip()
-    clean_author = str(author_name).strip()
-    clean_role = str(author_role).strip().upper()
-
-    if not clean_note:
-        raise ValueError("Write a note before saving.")
-    if clean_role not in {"COACH", "ATHLETE"}:
-        raise ValueError("Note role must be COACH or ATHLETE.")
-    if not clean_author:
-        raise ValueError("The note needs an author name.")
-
-    initialize_notes_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO athlete_notes (
-                    athlete_key,
-                    author_name,
-                    author_role,
-                    note_text
-                )
-                VALUES (%s, %s, %s, %s)
-                """,
-                (athlete_key, clean_author, clean_role, clean_note),
-            )
-
-
-def load_athlete_notes(athlete_key, limit=40, role_filter=None):
-    """Load the newest shared notes for one athlete from Neon."""
-    initialize_notes_database()
-
-    query = """
-        SELECT id, author_name, author_role, note_text, created_at
-        FROM athlete_notes
-        WHERE athlete_key = %s
-    """
-    params = [athlete_key]
-
-    if role_filter in {"COACH", "ATHLETE"}:
-        query += " AND author_role = %s"
-        params.append(role_filter)
-
-    query += " ORDER BY created_at DESC LIMIT %s"
-    params.append(int(limit))
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(query, tuple(params))
-            rows = cursor.fetchall()
-
-    return [
-        {
-            "id": row[0],
-            "author_name": row[1],
-            "author_role": row[2],
-            "note_text": row[3],
-            "created_at": row[4],
-        }
-        for row in rows
-    ]
-
-
-def format_note_timestamp(created_at):
-    """Format a Neon timestamp in the OLLU/San Antonio timezone."""
-    if not created_at:
-        return ""
-    try:
-        local_time = created_at.astimezone(TEAM_TIMEZONE)
-        return local_time.strftime("%b %d, %Y · %-I:%M %p")
-    except (AttributeError, ValueError):
-        return str(created_at)
-
-
-# =========================================================
-# STRAVA SECRET HELPERS
-# =========================================================
-
-def strava_secret(name, default=None):
-    """Read a Strava setting without crashing if it has not been added yet."""
-
-    try:
-        return st.secrets[name]
-
-    except (KeyError, FileNotFoundError):
-        return default
-
-
-def strava_connections():
-    """
-    Return the in-session Strava connection store,
-    keyed by VEKDYN athlete key.
-    """
-
-    return st.session_state.setdefault(
-        "strava_connections",
-        {}
-    )
-
-
-def athlete_strava_connection(athlete_key):
-    """
-    First look for the athlete's Strava connection in the
-    current Streamlit session.
-
-    If it isn't there, load it from Neon.
-    """
-
-    connection = strava_connections().get(athlete_key)
-
-    if connection:
-        return connection
-
-    connection = load_saved_strava_connection(athlete_key)
-
-    if connection:
-        strava_connections()[athlete_key] = connection
-
-    return connection
-
-
-def configured_refresh_token(athlete_key):
-    """Read an optional saved refresh token for one athlete from secrets.toml."""
-    try:
-        token = st.secrets["strava_athletes"][athlete_key]["refresh_token"]
-        if token:
-            return token
-    except (KeyError, TypeError, FileNotFoundError):
-        pass
-
-    # Preserve the original single-athlete setup while Diego transitions to
-    # the new per-athlete format.
-    if athlete_key.strip().lower() == "diego":
-        return strava_secret("STRAVA_REFRESH_TOKEN")
-
-    return None
-
-
-def strava_is_connected(athlete_key):
-    connection = athlete_strava_connection(athlete_key)
-    return bool(
-        connection.get("refresh_token")
-        or configured_refresh_token(athlete_key)
-    )
-
-
-def create_strava_login_url(athlete_key):
-    client_id = strava_secret("STRAVA_CLIENT_ID")
-    client_secret = strava_secret("STRAVA_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        return None
-
-    nonce = secrets.token_urlsafe(12)
-    state_payload = f"{athlete_key}:{nonce}"
-    state_signature = hmac.new(
-        str(client_secret).encode("utf-8"),
-        state_payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    oauth_state = f"{state_payload}:{state_signature}"
-
-    parameters = {
-        "client_id": client_id,
-        "redirect_uri": STRAVA_REDIRECT_URI,
-        "response_type": "code",
-        "approval_prompt": "force",
-        "scope": "read,activity:read_all",
-        "state": oauth_state,
-    }
-    return f"{STRAVA_AUTHORIZE_URL}?{urlencode(parameters)}"
-
-
-def athlete_key_from_oauth_state(oauth_state):
-    """Validate Strava's returned state and recover the VEKDYN athlete key."""
-    client_secret = strava_secret("STRAVA_CLIENT_SECRET")
-    if not oauth_state or not client_secret:
-        return None
-
-    try:
-        athlete_key, nonce, returned_signature = oauth_state.split(":", 2)
-    except ValueError:
-        return None
-
-    state_payload = f"{athlete_key}:{nonce}"
-    expected_signature = hmac.new(
-        str(client_secret).encode("utf-8"),
-        state_payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(returned_signature, expected_signature):
-        return None
-
-    return athlete_key
-
-
-def save_token_data(athlete_key, token_data):
-    """Keep one athlete's newest Strava tokens isolated from every other athlete."""
-    athlete_details = token_data.get("athlete", {})
-    connection = {
-        "access_token": token_data["access_token"],
-        "refresh_token": token_data["refresh_token"],
-        "expires_at": token_data["expires_at"],
-        "scope": token_data.get("scope", ""),
-        "strava_athlete_id": athlete_details.get("id"),
-        "strava_name": " ".join(
-            part
-            for part in [
-                athlete_details.get("firstname", ""),
-                athlete_details.get("lastname", ""),
-            ]
-            if part
-        ).strip(),
-    }
-    existing_owner = saved_owner_of_strava_account(
-        connection.get("strava_athlete_id")
-    )
-    if existing_owner and existing_owner != athlete_key:
-        owner_name = all_athletes.get(existing_owner, {}).get("profile", {}).get(
-            "name", existing_owner
-        )
-        raise RuntimeError(
-            f"This Strava account is already connected to {owner_name}."
-        )
-
-    persist_strava_connection(athlete_key, connection)
-    strava_connections()[athlete_key] = connection
-    # Never leave results from an older/wrong account attached to this profile.
-    st.session_state.pop(f"{athlete_key}_strava_weekly", None)
-    st.session_state.pop(f"{athlete_key}_strava_heart_rate", None)
-    st.session_state.pop(f"strava_error_{athlete_key}", None)
-    return connection
-
-
-def normalized_person_name(name):
-    """Normalize names so capitalization and punctuation do not cause a mismatch."""
-    return re.sub(r"[^a-z0-9]", "", str(name).casefold())
-
-
-def verify_strava_identity(athlete_key, token_data):
-    """Prevent one athlete's Strava account from being assigned to another."""
-    expected_name = all_athletes[athlete_key]["profile"].get("name", "")
-    strava_athlete = token_data.get("athlete", {})
-    returned_name = " ".join(
-        part
-        for part in [
-            strava_athlete.get("firstname", ""),
-            strava_athlete.get("lastname", ""),
-        ]
-        if part
-    ).strip()
-
-    if not returned_name:
-        raise RuntimeError("Strava did not return the athlete's name.")
-
-    expected_first_name = expected_name.split()[0] if expected_name.split() else ""
-    returned_first_name = strava_athlete.get("firstname", "")
-    full_name_matches = (
-            normalized_person_name(returned_name)
-            == normalized_person_name(expected_name)
-    )
-    first_name_matches = (
-            bool(expected_first_name)
-            and normalized_person_name(returned_first_name)
-            == normalized_person_name(expected_first_name)
-    )
-
-    # Some VEKDYN profiles currently contain only a first name ("Diego"),
-    # while Strava returns the full name ("Diego Moran").
-    if not (full_name_matches or first_name_matches):
-        raise RuntimeError(
-            f"You selected {expected_name}, but Strava authorized {returned_name}. "
-            f"Log out of {returned_name}'s Strava account, then connect {expected_name}."
-        )
-
-
-def exchange_authorization_code(code, athlete_key):
-    response = requests.post(
-        STRAVA_TOKEN_URL,
-        data={
-            "client_id": strava_secret("STRAVA_CLIENT_ID"),
-            "client_secret": strava_secret("STRAVA_CLIENT_SECRET"),
-            "code": code,
-            "grant_type": "authorization_code",
-        },
-        timeout=15,
-    )
-    response.raise_for_status()
-    token_data = response.json()
-    verify_strava_identity(athlete_key, token_data)
-    save_token_data(athlete_key, token_data)
-    return token_data["access_token"]
-
-
-def refresh_strava_token(athlete_key):
-    connection = athlete_strava_connection(athlete_key)
-    refresh_token = (
-            connection.get("refresh_token")
-            or configured_refresh_token(athlete_key)
-    )
-
-    if not refresh_token:
-        delete_saved_strava_connection(athlete_key)
-        raise RuntimeError(
-            f"Strava authorization is no longer valid for {athlete_key}. Reconnect Strava."
-        )
-
-    response = requests.post(
-        STRAVA_TOKEN_URL,
-        data={
-            "client_id": strava_secret("STRAVA_CLIENT_ID"),
-            "client_secret": strava_secret("STRAVA_CLIENT_SECRET"),
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        },
-        timeout=15,
-    )
-
-    # Strava rejected this stored authorization. Remove it instead of
-    # continuing to count the athlete as connected.
-    if response.status_code in (400, 401, 403):
-        delete_saved_strava_connection(athlete_key)
-        raise RuntimeError(
-            "Strava authorization expired or was revoked. Reconnect Strava."
-        )
-
-    response.raise_for_status()
-    token_data = response.json()
-
-    if not token_data.get("access_token") or not token_data.get("refresh_token"):
-        delete_saved_strava_connection(athlete_key)
-        raise RuntimeError(
-            "Strava returned an invalid authorization. Reconnect Strava."
-        )
-
-    # Refresh responses do not include the athlete profile, so preserve the
-    # identity returned during the original authorization.
-    token_data["athlete"] = {
-        "id": connection.get("strava_athlete_id"),
-        "firstname": connection.get("strava_name", ""),
-        "lastname": "",
-    }
-    save_token_data(athlete_key, token_data)
-    return token_data["access_token"]
-
-
-def get_valid_strava_token(athlete_key):
-    connection = athlete_strava_connection(athlete_key)
-    access_token = connection.get("access_token")
-    expires_at = connection.get("expires_at", 0)
-
-    if access_token and expires_at > time.time() + 60:
-        return access_token
-
-    return refresh_strava_token(athlete_key)
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_strava_training_data(access_token, number_of_weeks=8):
-    """Load recent run activities for the authenticated Strava athlete.
-
-    Results are cached for 15 minutes so Streamlit reruns do not repeatedly
-    consume Strava read requests. Returns an 8-week mileage frame plus a small
-    heart-rate summary used by the coach dashboard.
-    """
-    number_of_weeks = max(1, min(int(number_of_weeks), 12))
-    today = datetime.now(ZoneInfo("America/Chicago")).date()
-    current_monday = today - timedelta(days=today.weekday())
-    first_monday = current_monday - timedelta(weeks=number_of_weeks - 1)
-    after_ts = int(datetime.combine(first_monday, datetime.min.time(), tzinfo=ZoneInfo("America/Chicago")).timestamp())
-
-    activities = []
-    page = 1
-    while page <= 4:
-        response = requests.get(
-            "https://www.strava.com/api/v3/athlete/activities",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params={"after": after_ts, "page": page, "per_page": 100},
-            timeout=20,
-        )
-        response.raise_for_status()
-        batch = response.json()
-        if not isinstance(batch, list):
-            raise RuntimeError("Strava returned an unexpected activities response.")
-        activities.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-
-    weekly = {first_monday + timedelta(weeks=i): 0.0 for i in range(number_of_weeks)}
-    max_hr = None
-    max_hr_date = None
-
-    for activity in activities:
-        if str(activity.get("type", "")).lower() not in {"run", "trailrun", "virtualrun"}:
-            continue
-        raw_date = activity.get("start_date_local") or activity.get("start_date")
-        if not raw_date:
-            continue
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ
+                )""")
+                cur.execute("CREATE INDEX IF NOT EXISTS athlete_invitations_athlete_idx ON athlete_invitations (athlete_id)")
+            db.commit()
+
+
+    def send_athlete_invitation(athlete_key, athlete_email):
+        """Issue a single-use, 24-hour invitation and send it using configured SMTP."""
+        import secrets, hashlib, smtplib, ssl
+        from email.message import EmailMessage
+        from urllib.parse import urlencode
+        email = str(athlete_email or "").strip().lower()
+        smtp_host = str(st.secrets.get("INVITE_SMTP_HOST", "")).strip()
+        smtp_user = str(st.secrets.get("INVITE_SMTP_USER", "")).strip()
+        smtp_password = str(st.secrets.get("INVITE_SMTP_PASSWORD", ""))
+        sender = str(st.secrets.get("INVITE_FROM_EMAIL", "")).strip()
+        athlete_url = str(st.secrets.get("VEKDYN_ATHLETE_URL", "")).strip().rstrip("/")
+        smtp_port = int(st.secrets.get("INVITE_SMTP_PORT", 587))
+        if not all([smtp_host, smtp_user, smtp_password, sender, athlete_url]):
+            raise RuntimeError("Configure INVITE_SMTP_HOST, INVITE_SMTP_USER, INVITE_SMTP_PASSWORD, INVITE_FROM_EMAIL and VEKDYN_ATHLETE_URL in Coach Streamlit Secrets.")
+        if not athlete_url.startswith("https://"):
+            raise ValueError("VEKDYN_ATHLETE_URL must be HTTPS.")
+        initialize_athlete_invitations()
+        raw_token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(raw_token.encode()).hexdigest()
+        with get_database_connection() as db:
+            with db.cursor() as cur:
+                cur.execute("""SELECT athlete_id, login_email, active FROM athlete_logins
+                               WHERE athlete_key=%s OR athlete_id=%s FOR UPDATE""", (athlete_key, athlete_key))
+                row = cur.fetchone()
+                if not row or not row[2] or not row[1] or row[1].strip().lower() != email:
+                    raise ValueError("An active athlete account with the saved email is required.")
+                athlete_id = row[0]
+                cur.execute("DELETE FROM athlete_invitations WHERE athlete_id=%s AND used_at IS NULL", (athlete_id,))
+                cur.execute("""INSERT INTO athlete_invitations (token_hash, athlete_id, email, expires_at)
+                               VALUES (%s,%s,%s,NOW() + INTERVAL '24 hours')""", (digest, athlete_id, email))
+            db.commit()
+        link = athlete_url + "?" + urlencode({"invite": raw_token})
+        msg = EmailMessage()
+        msg["Subject"] = "Activate your VEKDYN Athlete account"
+        msg["From"] = sender
+        msg["To"] = email
+        msg.set_content("Welcome to VEKDYN Athlete. Set your password using this one-time link (expires in 24 hours):\n\n" + link + "\n\nIf you weren't expecting this, ignore this message.")
         try:
-            activity_date = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00")).date()
-        except ValueError:
-            continue
-        week = activity_date - timedelta(days=activity_date.weekday())
-        if week in weekly:
-            weekly[week] += float(activity.get("distance") or 0.0) / 1609.344
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        except Exception:
+            # Never leave an unsent invitation valid.
+            with get_database_connection() as db:
+                with db.cursor() as cur:
+                    cur.execute("DELETE FROM athlete_invitations WHERE token_hash=%s", (digest,))
+                db.commit()
+            raise RuntimeError("Invitation email could not be sent. Check SMTP configuration and retry.")
+        return email
 
-        activity_max_hr = activity.get("max_heartrate")
-        if activity_max_hr is not None:
+    def render_athlete_account_manager(athlete_key, profile, team_id):
+        """Coach-facing email alias setup; legacy credentials remain until athlete app migrates."""
+        athlete_name = profile.get("name", athlete_key)
+        event_group = profile.get("team", "Distance") or "Distance"
+        st.subheader("Athlete Account")
+        st.caption("Athletes will use their email address to sign in once the VEKDYN Athlete login is updated. Existing account IDs and device links are preserved.")
+        try:
+            account = get_athlete_login_account(athlete_key)
+        except psycopg2.Error as error:
+            st.error(f"Could not load athlete account: {error}")
+            return
+
+        with st.container(border=True):
+            if account:
+                st.success("Account active" if account.get("active") else "Account disabled")
+                st.caption(f"{athlete_name} · {team_config(team_id)['short_name']}")
+                email = st.text_input(
+                    "Athlete email / future username",
+                    value=account.get("login_email") or "",
+                    key=f"athlete_email_{team_id}_{athlete_key}",
+                    placeholder="athlete@university.edu",
+                )
+                st.caption("Save the email and automatically send a one-time activation link (valid for 24 hours). You can also use this button to resend an invitation.")
+                if st.button(
+                    "Save email & send invitation",
+                    key=f"save_email_{team_id}_{athlete_key}",
+                    disabled=not account.get("active"),
+                ):
+                    try:
+                        saved = set_athlete_login_email(athlete_key, email)
+                    except psycopg2.errors.UniqueViolation:
+                        st.error("This email is already linked to another athlete.")
+                    except (ValueError, psycopg2.Error) as error:
+                        st.error(f"Could not save email: {error}")
+                    else:
+                        try:
+                            destination = send_athlete_invitation(athlete_key, saved)
+                        except (ValueError, RuntimeError, psycopg2.Error) as error:
+                            st.warning(f"Email saved as {saved}, but the invitation was not sent: {error}. Fix the issue and click the button again to retry.")
+                        else:
+                            st.success(f"Email saved and invitation sent to {destination}. Link expires in 24 hours.")
+            else:
+                st.info("This athlete does not have a login account yet.")
+
+            # Coach access control lives directly beneath email onboarding.
+            # Password recovery will be handled by the Athlete login page.
+            if account:
+                active = bool(account.get("active"))
+                if st.button(
+                    "Disable athlete login" if active else "Enable athlete login",
+                    key=f"toggle_athlete_login_{team_id}_{athlete_key}_{active}",
+                ):
+                    try:
+                        set_athlete_login_active(athlete_key, not active)
+                        st.rerun()
+                    except psycopg2.Error as error:
+                        st.error(f"Could not update account: {error}")
+            else:
+                # Retain initial account creation for athletes not yet provisioned.
+                if st.button("Create athlete account", key=f"athlete_login_create_reset_{team_id}_{athlete_key}"):
+                    try:
+                        create_or_reset_athlete_login(
+                            athlete_key=athlete_key,
+                            team_id=team_id,
+                            display_name=athlete_name,
+                            event_group=event_group,
+                        )
+                        st.success("Athlete account created. Add their email above to send an invitation.")
+                        st.rerun()
+                    except (ValueError, psycopg2.Error) as error:
+                        st.error(f"Could not create athlete account: {error}")
+
+
+    # =========================================================
+    # COROS MCP — COACH-SIDE OAUTH + SLEEP / HRV
+    # =========================================================
+    # Each athlete authorizes their own COROS account. VEKDYN stores that OAuth
+    # connection against the athlete_key selected by the coach.
+
+    COROS_MCP_URL = "https://mcpus.coros.com/mcp"
+    COROS_REDIRECT_URI = "https://vekdyn.streamlit.app"
+    COROS_TIMEZONE = "America/Chicago"
+    COROS_PROTOCOL_VERSION = "2025-06-18"
+
+
+    @st.cache_resource(show_spinner=False)
+    def initialize_coros_database():
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("""CREATE TABLE IF NOT EXISTS coros_oauth_client (
+                    id SMALLINT PRIMARY KEY DEFAULT 1, client_id TEXT NOT NULL,
+                    client_secret TEXT, registration_json JSONB, updated_at TIMESTAMPTZ DEFAULT NOW())""")
+                c.execute("""CREATE TABLE IF NOT EXISTS coros_oauth_pending (
+                    state TEXT PRIMARY KEY, athlete_key TEXT NOT NULL, code_verifier TEXT NOT NULL,
+                    token_endpoint TEXT NOT NULL, client_id TEXT NOT NULL, client_secret TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW())""")
+                c.execute("""CREATE TABLE IF NOT EXISTS coros_connections (
+                    athlete_key TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT,
+                    token_type TEXT, scope TEXT, expires_at BIGINT, updated_at TIMESTAMPTZ DEFAULT NOW())""")
+                c.execute("""CREATE TABLE IF NOT EXISTS coros_recovery_daily (
+                    athlete_key TEXT NOT NULL, recovery_date DATE NOT NULL, sleep_minutes INTEGER,
+                    sleep_score INTEGER, hrv_avg INTEGER, hrv_baseline INTEGER,
+                    hrv_normal_low INTEGER, hrv_normal_high INTEGER, hrv_status TEXT,
+                    recovery_score INTEGER,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (athlete_key, recovery_date))""")
+                c.execute("""ALTER TABLE coros_recovery_daily
+                    ADD COLUMN IF NOT EXISTS recovery_score INTEGER""")
+                c.execute("""ALTER TABLE coros_recovery_daily
+                    ADD COLUMN IF NOT EXISTS sleep_hr_avg INTEGER""")
+                c.execute("""ALTER TABLE coros_recovery_daily
+                    ADD COLUMN IF NOT EXISTS sleep_hr_baseline INTEGER""")
+                c.execute("""ALTER TABLE coros_recovery_daily
+                    ADD COLUMN IF NOT EXISTS resting_hr INTEGER""")
+                c.execute("""ALTER TABLE coros_recovery_daily
+                    ADD COLUMN IF NOT EXISTS vekdyn_recovery_score INTEGER""")
+            db.commit()
+
+
+    def _coros_auth_metadata():
+        origin = COROS_MCP_URL.split('/mcp', 1)[0]
+        resource = None
+        for url in (f"{origin}/.well-known/oauth-protected-resource/mcp",
+                    f"{origin}/.well-known/oauth-protected-resource"):
+            r = requests.get(url, timeout=15)
+            if r.ok:
+                resource = r.json(); break
+        if not resource or not resource.get("authorization_servers"):
+            raise RuntimeError("COROS OAuth discovery failed.")
+        issuer = str(resource["authorization_servers"][0]).rstrip('/')
+        for url in (f"{issuer}/.well-known/oauth-authorization-server",
+                    f"{issuer}/.well-known/openid-configuration"):
+            r = requests.get(url, timeout=15)
+            if r.ok:
+                return r.json()
+        raise RuntimeError("COROS authorization metadata could not be loaded.")
+
+
+    def _coros_client():
+        initialize_coros_database()
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("SELECT client_id, client_secret FROM coros_oauth_client WHERE id=1")
+                row = c.fetchone()
+        if row:
+            return {"client_id": row[0], "client_secret": row[1]}
+
+        meta = _coros_auth_metadata()
+        endpoint = meta.get("registration_endpoint")
+        if not endpoint:
+            raise RuntimeError("COROS did not advertise dynamic client registration for this server.")
+        r = requests.post(endpoint, json={
+            "client_name": "VEKDYN",
+            "redirect_uris": [COROS_REDIRECT_URI],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        }, timeout=15)
+        r.raise_for_status(); data = r.json()
+        if not data.get("client_id"):
+            raise RuntimeError("COROS registration did not return a client ID.")
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("""INSERT INTO coros_oauth_client(id,client_id,client_secret,registration_json)
+                    VALUES(1,%s,%s,%s::jsonb) ON CONFLICT(id) DO UPDATE SET
+                    client_id=EXCLUDED.client_id, client_secret=EXCLUDED.client_secret,
+                    registration_json=EXCLUDED.registration_json, updated_at=NOW()""",
+                    (data["client_id"], data.get("client_secret"), r.text))
+            db.commit()
+        return {"client_id": data["client_id"], "client_secret": data.get("client_secret")}
+
+
+    def create_coros_login_url(athlete_key):
+        meta, client = _coros_auth_metadata(), _coros_client()
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
+        payload = f"coros.{athlete_key}.{secrets.token_urlsafe(18)}"
+        sig = hmac.new(get_login_signing_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+        state = f"{payload}.{sig}"
+        token_endpoint = meta.get("token_endpoint")
+        if not meta.get("authorization_endpoint") or not token_endpoint:
+            raise RuntimeError("COROS OAuth endpoints are incomplete.")
+        initialize_coros_database()
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("DELETE FROM coros_oauth_pending WHERE created_at < NOW()-INTERVAL '30 minutes'")
+                c.execute("""INSERT INTO coros_oauth_pending
+                    (state,athlete_key,code_verifier,token_endpoint,client_id,client_secret)
+                    VALUES(%s,%s,%s,%s,%s,%s)""",
+                    (state, athlete_key, verifier, token_endpoint, client["client_id"], client.get("client_secret")))
+            db.commit()
+        params = {"response_type":"code", "client_id":client["client_id"],
+                  "redirect_uri":COROS_REDIRECT_URI, "state":state,
+                  "code_challenge":challenge, "code_challenge_method":"S256", "resource":COROS_MCP_URL}
+        scopes = meta.get("scopes_supported") or []
+        if scopes: params["scope"] = " ".join(scopes)
+        return f"{meta['authorization_endpoint']}?{urlencode(params)}"
+
+
+    def coros_state_athlete_key(state):
+        if not state or not str(state).startswith("coros."): return None
+        parts = str(state).split('.')
+        if len(parts) < 4: return None
+        payload, returned = '.'.join(parts[:-1]), parts[-1]
+        expected = hmac.new(get_login_signing_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return parts[1] if hmac.compare_digest(returned, expected) else None
+
+
+    def exchange_coros_authorization_code(code, state):
+        athlete_key = coros_state_athlete_key(state)
+        if athlete_key not in all_athletes: raise RuntimeError("COROS callback did not match a VEKDYN athlete.")
+        initialize_coros_database()
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("SELECT code_verifier,token_endpoint,client_id,client_secret FROM coros_oauth_pending WHERE state=%s",(state,))
+                row = c.fetchone()
+        if not row: raise RuntimeError("COROS authorization expired. Select Connect COROS again.")
+        verifier, endpoint, client_id, secret = row
+        form = {"grant_type":"authorization_code","code":code,"redirect_uri":COROS_REDIRECT_URI,
+                "client_id":client_id,"code_verifier":verifier,"resource":COROS_MCP_URL}
+        if secret: form["client_secret"] = secret
+        r = requests.post(endpoint, data=form, timeout=20); r.raise_for_status(); token = r.json()
+        if not token.get("access_token"): raise RuntimeError("COROS returned no access token.")
+        expires_at = int(time.time()) + int(token.get("expires_in") or 0) if token.get("expires_in") else None
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("""INSERT INTO coros_connections(athlete_key,access_token,refresh_token,token_type,scope,expires_at)
+                    VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(athlete_key) DO UPDATE SET
+                    access_token=EXCLUDED.access_token,refresh_token=EXCLUDED.refresh_token,
+                    token_type=EXCLUDED.token_type,scope=EXCLUDED.scope,expires_at=EXCLUDED.expires_at,updated_at=NOW()""",
+                    (athlete_key,token["access_token"],token.get("refresh_token"),token.get("token_type"),token.get("scope"),expires_at))
+                c.execute("DELETE FROM coros_oauth_pending WHERE state=%s",(state,))
+            db.commit()
+        return athlete_key
+
+
+    def load_coros_connection(athlete_key):
+        initialize_coros_database()
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("SELECT access_token,refresh_token,expires_at FROM coros_connections WHERE athlete_key=%s",(athlete_key,)); row=c.fetchone()
+        return {"access_token":row[0],"refresh_token":row[1],"expires_at":row[2]} if row else {}
+
+
+    def coros_is_connected(athlete_key): return bool(load_coros_connection(athlete_key).get("access_token"))
+
+
+    def get_valid_coros_token(athlete_key):
+        con = load_coros_connection(athlete_key)
+        if not con: raise RuntimeError("This athlete has not connected COROS.")
+        if not con.get("expires_at") or int(con["expires_at"]) > int(time.time())+120: return con["access_token"]
+        if not con.get("refresh_token"): raise RuntimeError("COROS session expired. Reconnect COROS.")
+        meta, client = _coros_auth_metadata(), _coros_client()
+        form={"grant_type":"refresh_token","refresh_token":con["refresh_token"],"client_id":client["client_id"],"resource":COROS_MCP_URL}
+        if client.get("client_secret"): form["client_secret"]=client["client_secret"]
+        r=requests.post(meta["token_endpoint"],data=form,timeout=20); r.raise_for_status(); t=r.json()
+        expires=int(time.time())+int(t.get("expires_in") or 0) if t.get("expires_in") else None
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute("UPDATE coros_connections SET access_token=%s,refresh_token=COALESCE(%s,refresh_token),expires_at=%s,updated_at=NOW() WHERE athlete_key=%s",
+                          (t["access_token"],t.get("refresh_token"),expires,athlete_key))
+            db.commit()
+        return t["access_token"]
+
+
+    def _mcp_json(r):
+        r.raise_for_status()
+        if "application/json" in r.headers.get("content-type", ""):
+            return r.json()
+        for line in r.text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    return json.loads(line[5:].strip())
+                except Exception:
+                    pass
+        raise RuntimeError("COROS MCP returned an unreadable response.")
+
+
+    def _normalize_coros_text(value):
+        """Turn MCP text content into real newlines before parsing COROS summaries."""
+        if value is None:
+            return ""
+        text_value = str(value).strip()
+
+        # COROS MCP can return the tool text as a JSON-encoded string, e.g.
+        # "Sleep Data\\n...". Decode that wrapper first.
+        if len(text_value) >= 2 and text_value[0] == '"' and text_value[-1] == '"':
             try:
-                activity_max_hr = float(activity_max_hr)
-                if max_hr is None or activity_max_hr > max_hr:
-                    max_hr = activity_max_hr
-                    max_hr_date = activity_date.strftime("%b %d, %Y")
-            except (TypeError, ValueError):
+                decoded = json.loads(text_value)
+                if isinstance(decoded, str):
+                    text_value = decoded
+            except Exception:
                 pass
 
-    frame = pd.DataFrame([
-        {"Week": week.strftime("%b %d"), "Mileage": round(miles, 2)}
-        for week, miles in sorted(weekly.items())
-    ])
-    heart = {
-        "max_heart_rate": int(round(max_hr)) if max_hr is not None else None,
-        "max_heart_rate_date": max_hr_date,
-        "last_updated": datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p UTC"),
-    }
-    return frame, heart
+        # Defensive fallback for literal escape sequences left by an MCP transport.
+        text_value = text_value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+        return text_value.strip()
 
-def dictionary_weekly_mileage(training):
-    return pd.DataFrame(
-        {
-            "Week": training.get("weeks", []),
-            "Mileage": training.get("weekly_volume", []),
+
+    def coros_mcp_tool_call(token, name, arguments):
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": COROS_PROTOCOL_VERSION,
         }
-    )
+        init = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": COROS_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "VEKDYN", "version": "1.1"},
+            },
+        }
+        r = requests.post(COROS_MCP_URL, headers=headers, json=init, timeout=25)
+        data = _mcp_json(r)
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+
+        session_id = r.headers.get("Mcp-Session-Id")
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+
+        # Complete the MCP handshake before tools/call.
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        ready = requests.post(COROS_MCP_URL, headers=headers, json=initialized, timeout=15)
+        ready.raise_for_status()
+
+        call = {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        response = requests.post(COROS_MCP_URL, headers=headers, json=call, timeout=30)
+        data = _mcp_json(response)
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+
+        text_parts = [
+            _normalize_coros_text(item.get("text", ""))
+            for item in data.get("result", {}).get("content", [])
+            if isinstance(item, dict) and item.get("text") is not None
+        ]
+        return "\n".join(part for part in text_parts if part)
 
 
-def get_xc_results_for_event(xc_results, event):
-    """Return XC results as a predictable list of dictionaries."""
-    event_results = xc_results.get(event, xc_results.get(event.upper(), []))
+    def _parse_coros_sleep(text):
+        """Parse COROS sleep summaries keyed by wake-up date."""
+        text = _normalize_coros_text(text)
+        records = {}
+        date_pattern = re.compile(r"(?m)^(\d{4}-\d{2}-\d{2}):?\s*$")
+        matches = list(date_pattern.finditer(text))
+        for i, match in enumerate(matches):
+            day = match.group(1)
+            block = text[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+            score_match = re.search(r"Sleep Score:\s*(\d+)", block, re.I)
+            sleep_match = re.search(r"Main Sleep:\s*(?:(\d+)h\s*)?(\d+)min", block, re.I)
+            if score_match or sleep_match:
+                records[day] = {
+                    "sleep_score": int(score_match.group(1)) if score_match else None,
+                    "sleep_minutes": (
+                        int(sleep_match.group(1) or 0) * 60 + int(sleep_match.group(2))
+                        if sleep_match else None
+                    ),
+                }
+        return records
 
-    if isinstance(event_results, str):
-        return [{"time": event_results, "meet": "", "date": ""}]
 
-    if isinstance(event_results, dict):
-        return [event_results]
+    def _parse_coros_hrv(text):
+        """Parse the official COROS HRV assessment, not raw HRV samples."""
+        text = _normalize_coros_text(text)
+        assessment = text.split("Sleep HRV Time Series", 1)[0]
+        pattern = re.compile(
+            r"(?m)^(\d{4}-\d{2}-\d{2}):\s*\n"
+            r"\s*HRV Avg:\s*(\d+)\s*ms\s*[—-]\s*([^\n]+)\n"
+            r"\s*Normal Range:\s*(\d+)\s*-\s*(\d+)\s*ms\s*\n"
+            r"\s*Baseline:\s*(\d+)\s*ms",
+            re.I,
+        )
+        records = {}
+        for m in pattern.finditer(assessment):
+            records[m.group(1)] = {
+                "hrv_avg": int(m.group(2)),
+                "hrv_status": m.group(3).strip(),
+                "hrv_normal_low": int(m.group(4)),
+                "hrv_normal_high": int(m.group(5)),
+                "hrv_baseline": int(m.group(6)),
+            }
+        return records
 
-    if isinstance(event_results, list):
+
+    def _parse_coros_daily_health(text):
+        """Parse COROS average sleeping heart rate from daily health summaries."""
+        text = _normalize_coros_text(text)
+        records = {}
+        # Daily Health dates are usually rendered as --- 20260904 ---.
+        date_pattern = re.compile(r"(?m)^---\s*(\d{8})\s*---\s*$")
+        matches = list(date_pattern.finditer(text))
+        for i, match in enumerate(matches):
+            raw_day = match.group(1)
+            day = f"{raw_day[:4]}-{raw_day[4:6]}-{raw_day[6:]}"
+            block = text[match.end(): matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+            sleep_hr = re.search(r"Sleep HR:\s*Avg\s*(\d+)\s*bpm", block, re.I)
+            if sleep_hr:
+                records[day] = {"sleep_hr_avg": int(sleep_hr.group(1))}
+        return records
+
+
+    def _median_int(values):
+        clean = sorted(int(v) for v in values if v is not None)
+        if not clean:
+            return None
+        n = len(clean)
+        if n % 2:
+            return clean[n // 2]
+        return int(round((clean[n // 2 - 1] + clean[n // 2]) / 2))
+
+
+    def vekdyn_recovery_score(
+        sleep_score,
+        hrv_avg,
+        hrv_baseline,
+        hrv_low=None,
+        hrv_high=None,
+        sleep_hr_avg=None,
+        sleep_hr_baseline=None,
+    ):
+        """VEKDYN Recovery v2 using the athlete's own sleep, HRV and sleeping-HR norms.
+
+        Target weights: sleep 45%, HRV 40%, average sleeping HR 15%.
+        If one input is unavailable, available components are reweighted instead of
+        inventing missing physiological data.
+        """
+        components = []
+
+        if sleep_score is not None:
+            components.append((0.45, max(0.0, min(100.0, float(sleep_score)))))
+
+        if hrv_avg is not None and hrv_baseline not in (None, 0):
+            if hrv_low is not None and hrv_high is not None and hrv_low <= hrv_avg <= hrv_high:
+                hrv_component = 100.0
+            elif hrv_low not in (None, 0) and hrv_avg < hrv_low:
+                hrv_component = max(0.0, min(100.0, 100.0 * float(hrv_avg) / float(hrv_low)))
+            else:
+                reference = float(hrv_baseline)
+                deviation = abs(float(hrv_avg) - reference) / max(reference, 1.0)
+                hrv_component = max(60.0, 100.0 - deviation * 100.0)
+            components.append((0.40, hrv_component))
+
+        if sleep_hr_avg is not None and sleep_hr_baseline not in (None, 0):
+            # A modestly lower sleeping HR is not penalized; elevations above personal
+            # baseline progressively reduce the HR component.
+            ratio = float(sleep_hr_avg) / float(sleep_hr_baseline)
+            if ratio <= 1.02:
+                hr_component = 100.0
+            else:
+                hr_component = max(40.0, 100.0 - (ratio - 1.02) * 250.0)
+            components.append((0.15, hr_component))
+
+        if not components:
+            return None
+
+        weight_total = sum(weight for weight, _ in components)
+        return int(round(sum(weight * score for weight, score in components) / weight_total))
+
+
+    def sync_coros_recovery(athlete_key):
+        """Sync seven recent COROS recovery days for one athlete."""
+        token = get_valid_coros_token(athlete_key)
+        args = {"startDate": "", "endDate": "", "days": 7, "timezone": COROS_TIMEZONE}
+
+        sleep_text = coros_mcp_tool_call(token, "querySleepData", args)
+        hrv_text = coros_mcp_tool_call(token, "querySleepHrv", args)
+        health_text = coros_mcp_tool_call(
+            token,
+            "queryDailyHealthData",
+            {"days": 7, "timezone": COROS_TIMEZONE},
+        )
+
+        sleep_days = _parse_coros_sleep(sleep_text)
+        hrv_days = _parse_coros_hrv(hrv_text)
+        health_days = _parse_coros_daily_health(health_text)
+        all_days = sorted(set(sleep_days) | set(hrv_days) | set(health_days))
+
+        if not all_days:
+            raise RuntimeError(
+                "COROS returned data, but VEKDYN could not parse the recent recovery records."
+            )
+
+        sleep_hr_baseline = _median_int(
+            record.get("sleep_hr_avg") for record in health_days.values()
+        )
+
+        initialize_coros_database()
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                for day in all_days:
+                    sv = sleep_days.get(day, {})
+                    hv = hrv_days.get(day, {})
+                    dv = health_days.get(day, {})
+                    score = vekdyn_recovery_score(
+                        sv.get("sleep_score"),
+                        hv.get("hrv_avg"),
+                        hv.get("hrv_baseline"),
+                        hv.get("hrv_normal_low"),
+                        hv.get("hrv_normal_high"),
+                        dv.get("sleep_hr_avg"),
+                        sleep_hr_baseline,
+                    )
+                    c.execute(
+                        """INSERT INTO coros_recovery_daily(
+                                athlete_key,recovery_date,sleep_minutes,sleep_score,
+                                hrv_avg,hrv_baseline,hrv_normal_low,hrv_normal_high,
+                                hrv_status,recovery_score,sleep_hr_avg,sleep_hr_baseline)
+                            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT(athlete_key,recovery_date) DO UPDATE SET
+                                sleep_minutes=COALESCE(EXCLUDED.sleep_minutes,coros_recovery_daily.sleep_minutes),
+                                sleep_score=COALESCE(EXCLUDED.sleep_score,coros_recovery_daily.sleep_score),
+                                hrv_avg=COALESCE(EXCLUDED.hrv_avg,coros_recovery_daily.hrv_avg),
+                                hrv_baseline=COALESCE(EXCLUDED.hrv_baseline,coros_recovery_daily.hrv_baseline),
+                                hrv_normal_low=COALESCE(EXCLUDED.hrv_normal_low,coros_recovery_daily.hrv_normal_low),
+                                hrv_normal_high=COALESCE(EXCLUDED.hrv_normal_high,coros_recovery_daily.hrv_normal_high),
+                                hrv_status=COALESCE(EXCLUDED.hrv_status,coros_recovery_daily.hrv_status),
+                                recovery_score=COALESCE(EXCLUDED.recovery_score,coros_recovery_daily.recovery_score),
+                                sleep_hr_avg=COALESCE(EXCLUDED.sleep_hr_avg,coros_recovery_daily.sleep_hr_avg),
+                                sleep_hr_baseline=COALESCE(EXCLUDED.sleep_hr_baseline,coros_recovery_daily.sleep_hr_baseline),
+                                updated_at=NOW()""",
+                        (
+                            athlete_key, day, sv.get("sleep_minutes"), sv.get("sleep_score"),
+                            hv.get("hrv_avg"), hv.get("hrv_baseline"), hv.get("hrv_normal_low"),
+                            hv.get("hrv_normal_high"), hv.get("hrv_status"), score,
+                            dv.get("sleep_hr_avg"), sleep_hr_baseline,
+                        ),
+                    )
+            db.commit()
+        return load_latest_coros_recovery(athlete_key)
+
+
+    def load_latest_coros_recovery(athlete_key):
+        """Load the newest recorded COROS value for each recovery metric.
+
+        Athlete Hub can write sleep, HRV and resting HR on different dates, so the
+        Coach Hub must not require every metric to exist on the single newest row.
+        """
+        initialize_coros_database()
+        with get_database_connection() as db:
+            with db.cursor() as c:
+                c.execute(
+                    """
+                    SELECT
+                        (SELECT recovery_date FROM coros_recovery_daily WHERE athlete_key=%s AND (sleep_minutes IS NOT NULL OR hrv_avg IS NOT NULL OR resting_hr IS NOT NULL OR sleep_hr_avg IS NOT NULL) ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT sleep_minutes FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_minutes IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT sleep_score FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_score IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_avg FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_normal_low FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_low IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_normal_high FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_high IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_status FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_status IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT COALESCE(vekdyn_recovery_score,recovery_score) FROM coros_recovery_daily WHERE athlete_key=%s AND COALESCE(vekdyn_recovery_score,recovery_score) IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT sleep_hr_avg FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_hr_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT sleep_hr_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_hr_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT resting_hr FROM coros_recovery_daily WHERE athlete_key=%s AND resting_hr IS NOT NULL ORDER BY recovery_date DESC LIMIT 1)
+                    """,
+                    (athlete_key,) * 12,
+                )
+                r = c.fetchone()
+        if not r or not any(value is not None for value in r):
+            return {}
+        return {
+            "date": r[0], "sleep_minutes": r[1], "sleep_score": r[2],
+            "hrv_avg": r[3], "hrv_baseline": r[4], "hrv_normal_low": r[5],
+            "hrv_normal_high": r[6], "hrv_status": r[7], "recovery_score": r[8],
+            "sleep_hr_avg": r[9], "sleep_hr_baseline": r[10], "resting_hr": r[11],
+        }
+
+
+    # =========================================================
+    # STRAVA SETTINGS
+    # =========================================================
+
+    STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
+    # Direct activity polling is intentionally disabled for Strava review compliance.
+    STRAVA_ACTIVITIES_URL = None
+    STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
+
+    STRAVA_REDIRECT_URI = "https://vekdyn.streamlit.app"
+
+
+    # =========================================================
+    # STRAVA DATABASE — NEON POSTGRESQL
+    # =========================================================
+
+    @st.cache_resource(show_spinner=False)
+    def initialize_strava_database():
+        """
+        Create the Strava connection table in Neon if it does not
+        already exist.
+        """
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS strava_connections (
+                        athlete_key TEXT PRIMARY KEY,
+                        access_token TEXT NOT NULL,
+                        refresh_token TEXT NOT NULL,
+                        expires_at BIGINT NOT NULL,
+                        scope TEXT,
+                        strava_athlete_id BIGINT UNIQUE,
+                        strava_name TEXT
+                    )
+                    """
+                )
+
+
+    def load_saved_strava_connection(athlete_key):
+        """
+        Load one athlete's saved Strava connection from Neon.
+        """
+
+        initialize_strava_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        athlete_key,
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                        scope,
+                        strava_athlete_id,
+                        strava_name
+                    FROM strava_connections
+                    WHERE athlete_key = %s
+                    """,
+                    (athlete_key,),
+                )
+
+                row = cursor.fetchone()
+
+        if not row:
+            return {}
+
+        return {
+            "athlete_key": row[0],
+            "access_token": row[1],
+            "refresh_token": row[2],
+            "expires_at": row[3],
+            "scope": row[4],
+            "strava_athlete_id": row[5],
+            "strava_name": row[6],
+        }
+
+
+
+    def delete_saved_strava_connection(athlete_key):
+        """Remove a stale/revoked Strava authorization from Neon and this session."""
+        initialize_strava_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM strava_connections WHERE athlete_key = %s",
+                    (athlete_key,),
+                )
+            database.commit()
+
+        strava_connections().pop(athlete_key, None)
+        st.session_state.pop(f"{athlete_key}_strava_weekly", None)
+        st.session_state.pop(f"{athlete_key}_strava_heart_rate", None)
+
+
+    def saved_owner_of_strava_account(strava_athlete_id):
+        """
+        Check whether this Strava account is already connected
+        to another VEKDYN athlete.
+        """
+
+        if not strava_athlete_id:
+            return None
+
+        initialize_strava_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT athlete_key
+                    FROM strava_connections
+                    WHERE strava_athlete_id = %s
+                    """,
+                    (strava_athlete_id,),
+                )
+
+                row = cursor.fetchone()
+
+        return row[0] if row else None
+
+
+    def persist_strava_connection(athlete_key, connection):
+        """
+        Save an athlete's Strava OAuth tokens to Neon.
+
+        If the athlete already exists, update their tokens instead
+        of creating another record.
+        """
+
+        initialize_strava_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO strava_connections (
+                        athlete_key,
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                        scope,
+                        strava_athlete_id,
+                        strava_name
+                    )
+
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+
+                    ON CONFLICT (athlete_key)
+
+                    DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        refresh_token = EXCLUDED.refresh_token,
+                        expires_at = EXCLUDED.expires_at,
+                        scope = EXCLUDED.scope,
+                        strava_athlete_id = EXCLUDED.strava_athlete_id,
+                        strava_name = EXCLUDED.strava_name
+                    """,
+
+                    (
+                        athlete_key,
+                        connection["access_token"],
+                        connection["refresh_token"],
+                        int(connection["expires_at"]),
+                        connection.get("scope", ""),
+                        connection.get("strava_athlete_id"),
+                        connection.get("strava_name", ""),
+                    ),
+                )
+
+
+    # =========================================================
+    # ATHLETE + COACH NOTES — NEON POSTGRESQL
+    # =========================================================
+
+    TEAM_TIMEZONE = ZoneInfo("America/Chicago")
+
+
+    @st.cache_resource(show_spinner=False)
+    def initialize_notes_database():
+        """Create a shared athlete/coach notes feed in Neon."""
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_notes (
+                        id BIGSERIAL PRIMARY KEY,
+                        athlete_key TEXT NOT NULL,
+                        author_name TEXT NOT NULL,
+                        author_role TEXT NOT NULL,
+                        note_text TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        CONSTRAINT athlete_notes_role_check
+                            CHECK (author_role IN ('COACH', 'ATHLETE'))
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS athlete_notes_athlete_created_idx
+                    ON athlete_notes (athlete_key, created_at DESC)
+                    """
+                )
+
+
+    def save_athlete_note(athlete_key, author_name, author_role, note_text):
+        """Save one coach or athlete note to the selected athlete's Neon feed."""
+        clean_note = str(note_text).strip()
+        clean_author = str(author_name).strip()
+        clean_role = str(author_role).strip().upper()
+
+        if not clean_note:
+            raise ValueError("Write a note before saving.")
+        if clean_role not in {"COACH", "ATHLETE"}:
+            raise ValueError("Note role must be COACH or ATHLETE.")
+        if not clean_author:
+            raise ValueError("The note needs an author name.")
+
+        initialize_notes_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO athlete_notes (
+                        athlete_key,
+                        author_name,
+                        author_role,
+                        note_text
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (athlete_key, clean_author, clean_role, clean_note),
+                )
+
+
+    def load_athlete_notes(athlete_key, limit=40, role_filter=None):
+        """Load the newest shared notes for one athlete from Neon."""
+        initialize_notes_database()
+
+        query = """
+            SELECT id, author_name, author_role, note_text, created_at
+            FROM athlete_notes
+            WHERE athlete_key = %s
+        """
+        params = [athlete_key]
+
+        if role_filter in {"COACH", "ATHLETE"}:
+            query += " AND author_role = %s"
+            params.append(role_filter)
+
+        query += " ORDER BY created_at DESC LIMIT %s"
+        params.append(int(limit))
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(query, tuple(params))
+                rows = cursor.fetchall()
+
         return [
-            result
-            for result in event_results
-            if isinstance(result, dict)
+            {
+                "id": row[0],
+                "author_name": row[1],
+                "author_role": row[2],
+                "note_text": row[3],
+                "created_at": row[4],
+            }
+            for row in rows
         ]
 
-    return []
+
+    def format_note_timestamp(created_at):
+        """Format a Neon timestamp in the OLLU/San Antonio timezone."""
+        if not created_at:
+            return ""
+        try:
+            local_time = created_at.astimezone(TEAM_TIMEZONE)
+            return local_time.strftime("%b %d, %Y · %-I:%M %p")
+        except (AttributeError, ValueError):
+            return str(created_at)
 
 
-def primary_xc_result(xc_results, event):
-    """Use the first entered result as the result shown on the XC card."""
-    results = get_xc_results_for_event(xc_results, event)
-    if not results:
-        return {"time": "--", "meet": "No result entered", "date": ""}
+    # =========================================================
+    # STRAVA SECRET HELPERS
+    # =========================================================
 
-    return {
-        "time": results[0].get("time", "--"),
-        "meet": results[0].get("meet", "Meet not entered"),
-        "date": results[0].get("date", ""),
-    }
+    def strava_secret(name, default=None):
+        """Read a Strava setting without crashing if it has not been added yet."""
 
+        try:
+            return st.secrets[name]
 
-def lactate_value(threshold_lactate, key):
-    """Format a lactate reading while allowing blank dictionary values."""
-    value = threshold_lactate.get(key)
-    if value in (None, "", "--"):
-        return "--"
-
-    try:
-        return f"{float(value):.1f}"
-    except (TypeError, ValueError):
-        return str(value)
+        except (KeyError, FileNotFoundError):
+            return default
 
 
-def remember_recent_team(team_id):
-    """Keep the three most recently opened teams at the top of the landing page."""
-    recent = list(st.session_state.get("recent_team_ids", []))
-    recent = [saved_id for saved_id in recent if saved_id != team_id]
-    recent.insert(0, team_id)
-    st.session_state["recent_team_ids"] = recent[:3]
-
-
-def open_team_workspace(team_id):
-    """Send a visitor to the selected team's protected VEKDYN workspace."""
-    if team_id not in TEAM_CONFIG:
-        st.error("That VEKDYN team workspace is not configured.")
-        return
-
-    remember_recent_team(team_id)
-
-    # The Oregon workspace is a read-only public sales demo: no coach password,
-    # no real athlete account, and no live integrations are exposed.
-    if team_id == DEMO_TEAM_ID:
-        st.session_state.update({
-            "logged_in": True,
-            "logged_in_user": "demo",
-            "active_team": DEMO_TEAM_ID,
-            "pending_team": None,
-            "page": "dashboard",
-            "dashboard_view": "Dashboard",
-        })
-        if "session" in st.query_params:
-            del st.query_params["session"]
-        st.rerun()
-
-    # A session authenticated for one school must not silently open another.
-    if (
-            st.session_state.get("logged_in")
-            and st.session_state.get("active_team") == team_id
-    ):
-        st.session_state["page"] = "dashboard"
-    else:
-        st.session_state["logged_in"] = False
-        st.session_state.pop("logged_in_user", None)
-        st.session_state["pending_team"] = team_id
-        st.session_state["page"] = "login"
-
-        if "session" in st.query_params:
-            del st.query_params["session"]
-
-    st.rerun()
-
-
-def render_login_page():
-    """Show a fast, form-based login for the selected VEKDYN team."""
-    pending_team = (
-            st.session_state.get("pending_team")
-            or st.session_state.get("active_team")
-            or "ollu_distance"
-    )
-    config = team_config(pending_team)
-
-    st.markdown(
+    def strava_connections():
         """
-        <style>
-            .stApp { background: #f6f8f6; }
-            [data-testid="stSidebar"] { display: none; }
-            .block-container { max-width: 560px; padding-top: 5rem; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("# VEKDYN")
-    st.subheader(f"{config['name']} — Coach Login")
-    st.caption("Sign in to access this private team workspace.")
-
-    # A form prevents a full Streamlit rerun for every username/password
-    # keystroke. The app only processes authentication when Log In is pressed.
-    with st.form(f"coach_login_form_{pending_team}", clear_on_submit=False):
-        username = st.text_input(
-            "Username",
-            key=f"coach_username_{pending_team}",
-        )
-        password = st.text_input(
-            "Password",
-            type="password",
-            key=f"coach_password_{pending_team}",
-        )
-        submitted = st.form_submit_button(
-            "Log In",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if submitted:
-        if check_login(pending_team, username, password):
-            st.session_state.update({
-                "logged_in": True,
-                "logged_in_user": username,
-                "active_team": pending_team,
-                "pending_team": None,
-                "page": "dashboard",
-            })
-            st.session_state.pop("just_logged_out", None)
-            st.query_params["session"] = create_login_token(username, pending_team)
-            st.rerun()
-        else:
-            st.error("Incorrect username or password for this team.")
-
-    if st.button(
-            "← Back",
-            use_container_width=True,
-            key=f"back_from_{pending_team}_login",
-    ):
-        st.session_state["page"] = "home"
-        st.session_state["pending_team"] = None
-        st.rerun()
-
-
-def render_pricing_page():
-    """Public purchasing page for schools to verify VEKDYN pricing."""
-    st.markdown("""
-    <style>
-    .stApp{background:#f6f8f6}
-    [data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],
-    [data-testid="stStatusWidget"],[data-testid="stSidebar"],[data-testid="collapsedControl"],
-    [data-testid="stSidebarCollapsedControl"]{display:none!important}
-    .block-container{max-width:980px;padding-top:1.6rem;padding-bottom:3rem}
-    .price-brand{font-size:28px;font-weight:800;color:#111827;margin-bottom:1.4rem}
-    .price-brand span{color:#2f9e44}
-    .price-title{text-align:center;font-size:44px;font-weight:800;color:#111827}
-    .price-sub{text-align:center;color:#6b7280;font-size:17px;margin:.4rem 0 1.3rem}
-    .plan-card{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:24px 26px;min-height:170px;margin-top:8px}
-    .plan-name{font-size:20px;font-weight:800;color:#111827}
-    .plan-price{font-size:42px;font-weight:800;color:#0b67c2;margin-top:8px}
-    .plan-price span{font-size:17px;font-weight:500;color:#6b7280}
-    .plan-copy{color:#6b7280;margin-top:7px;line-height:1.45}
-    .purchase-box{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:22px 26px;margin-top:18px}
-    .purchase-title{font-size:21px;font-weight:800;color:#111827;margin-bottom:14px}
-    .purchase-row{display:flex;justify-content:space-between;gap:30px;border-bottom:1px solid #eef0ee;padding:10px 0;color:#374151}
-    .purchase-row:last-child{border-bottom:none}.purchase-row strong{color:#111827}
-    </style>""", unsafe_allow_html=True)
-
-    st.markdown('<div class="price-brand">VEK<span>DYN</span></div>', unsafe_allow_html=True)
-
-    if st.button("← Find your team"):
-        st.session_state["page"] = "home"
-        st.rerun()
-
-    st.markdown(
-        '<div class="price-title">VEKDYN Team Platform</div>'
-        '<div class="price-sub">Performance and training intelligence built for distance running programs.</div>',
-        unsafe_allow_html=True,
-    )
-
-    annual_col, monthly_col = st.columns(2)
-
-    with annual_col:
-        st.markdown(
-            """
-            <div class="plan-card">
-                <div class="plan-name">Annual Team License</div>
-                <div class="plan-price">$500 <span>/ year</span></div>
-                <div class="plan-copy">Best value for programs purchasing on an annual budget.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with monthly_col:
-        st.markdown(
-            """
-            <div class="plan-card">
-                <div class="plan-name">Monthly Team License</div>
-                <div class="plan-price">$50 <span>/ month</span></div>
-                <div class="plan-copy">Flexible month-to-month access for programs that prefer monthly billing.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.caption("Annual billing saves $100 compared with 12 months of monthly billing.")
-
-    left, right = st.columns(2)
-    with left:
-        st.markdown("#### Included")
-        st.markdown(
-            "✓ Team dashboard & analytics  \\n"
-            "✓ Athlete performance profiles  \\n"
-            "✓ Strava integration  \\n"
-            "✓ Team workout planning  \\n"
-            "✓ Coach & athlete notes"
-        )
-    with right:
-        st.markdown("#### Performance tools")
-        st.markdown(
-            "✓ Threshold & training analytics  \\n"
-            "✓ Race predictions  \\n"
-            "✓ Recovery tracking  \\n"
-            "✓ Secure team workspace  \\n"
-            "✓ Continuous updates"
-        )
-
-    st.markdown(
+        Return the in-session Strava connection store,
+        keyed by VEKDYN athlete key.
         """
-        <div class="purchase-box">
-          <div class="purchase-title">Purchasing Information</div>
-          <div class="purchase-row"><span>Vendor / Company Name</span><strong>VEKDYN</strong></div>
-          <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div>
-          <div class="purchase-row"><span>License Options</span><strong>Annual or Monthly Team License</strong></div>
-          <div class="purchase-row"><span>Published Pricing</span><strong>$500/year or $50/month</strong></div>
-          <div class="purchase-row"><span>Billing</span><strong>Annual invoice or monthly billing</strong></div>
-          <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
-    st.info(
-        "Founding-program or pilot pricing may be provided by written quote. "
-        "Published standard pricing is $500/year or $50/month per program."
-    )
-
-    st.markdown("### Request an Invoice")
-    st.caption(
-        "Coaches or university purchasing staff can prepare the information needed "
-        "for a VEKDYN invoice. No payment or banking information is collected here."
-    )
-
-    with st.form("invoice_request_form"):
-        invoice_school = st.text_input("School / Program")
-        invoice_contact = st.text_input("Coach or Purchasing Contact")
-        invoice_email = st.text_input("Contact Email")
-        invoice_plan = st.selectbox(
-            "License",
-            [
-                "Annual Team License — $500/year",
-                "Monthly Team License — $50/month",
-            ],
-        )
-        invoice_po = st.text_input("PO / Requisition Number (optional)")
-        invoice_notes = st.text_area("Purchasing Notes (optional)")
-        invoice_submit = st.form_submit_button(
-            "Prepare Invoice Request",
-            use_container_width=True,
+        return st.session_state.setdefault(
+            "strava_connections",
+            {}
         )
 
-    if invoice_submit:
-        if not invoice_school.strip() or not invoice_contact.strip() or not invoice_email.strip():
-            st.error("Please enter the school/program, contact name, and contact email.")
-        else:
-            st.success("Invoice request prepared.")
-            st.markdown(
-                f"""**Vendor:** VEKDYN  
-**Product:** VEKDYN Team Platform  
-**School / Program:** {invoice_school}  
-**Contact:** {invoice_contact}  
-**Email:** {invoice_email}  
-**License:** {invoice_plan}  
-**PO / Requisition:** {invoice_po or "Not provided"}  
-**Notes:** {invoice_notes or "None"}"""
+
+    def athlete_strava_connection(athlete_key):
+        """
+        First look for the athlete's Strava connection in the
+        current Streamlit session.
+
+        If it isn't there, load it from Neon.
+        """
+
+        connection = strava_connections().get(athlete_key)
+
+        if connection:
+            return connection
+
+        connection = load_saved_strava_connection(athlete_key)
+
+        if connection:
+            strava_connections()[athlete_key] = connection
+
+        return connection
+
+
+    def configured_refresh_token(athlete_key):
+        """Read an optional saved refresh token for one athlete from secrets.toml."""
+        try:
+            token = st.secrets["strava_athletes"][athlete_key]["refresh_token"]
+            if token:
+                return token
+        except (KeyError, TypeError, FileNotFoundError):
+            pass
+
+        # Preserve the original single-athlete setup while Diego transitions to
+        # the new per-athlete format.
+        if athlete_key.strip().lower() == "diego":
+            return strava_secret("STRAVA_REFRESH_TOKEN")
+
+        return None
+
+
+    def strava_is_connected(athlete_key):
+        connection = athlete_strava_connection(athlete_key)
+        return bool(
+            connection.get("refresh_token")
+            or configured_refresh_token(athlete_key)
+        )
+
+
+    def create_strava_login_url(athlete_key):
+        client_id = strava_secret("STRAVA_CLIENT_ID")
+        client_secret = strava_secret("STRAVA_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            return None
+
+        nonce = secrets.token_urlsafe(12)
+        state_payload = f"{athlete_key}:{nonce}"
+        state_signature = hmac.new(
+            str(client_secret).encode("utf-8"),
+            state_payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        oauth_state = f"{state_payload}:{state_signature}"
+
+        parameters = {
+            "client_id": client_id,
+            "redirect_uri": STRAVA_REDIRECT_URI,
+            "response_type": "code",
+            "approval_prompt": "force",
+            "scope": "read,activity:read_all",
+            "state": oauth_state,
+        }
+        return f"{STRAVA_AUTHORIZE_URL}?{urlencode(parameters)}"
+
+
+    def athlete_key_from_oauth_state(oauth_state):
+        """Validate Strava's returned state and recover the VEKDYN athlete key."""
+        client_secret = strava_secret("STRAVA_CLIENT_SECRET")
+        if not oauth_state or not client_secret:
+            return None
+
+        try:
+            athlete_key, nonce, returned_signature = oauth_state.split(":", 2)
+        except ValueError:
+            return None
+
+        state_payload = f"{athlete_key}:{nonce}"
+        expected_signature = hmac.new(
+            str(client_secret).encode("utf-8"),
+            state_payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(returned_signature, expected_signature):
+            return None
+
+        return athlete_key
+
+
+    def save_token_data(athlete_key, token_data):
+        """Keep one athlete's newest Strava tokens isolated from every other athlete."""
+        athlete_details = token_data.get("athlete", {})
+        connection = {
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data["refresh_token"],
+            "expires_at": token_data["expires_at"],
+            "scope": token_data.get("scope", ""),
+            "strava_athlete_id": athlete_details.get("id"),
+            "strava_name": " ".join(
+                part
+                for part in [
+                    athlete_details.get("firstname", ""),
+                    athlete_details.get("lastname", ""),
+                ]
+                if part
+            ).strip(),
+        }
+        existing_owner = saved_owner_of_strava_account(
+            connection.get("strava_athlete_id")
+        )
+        if existing_owner and existing_owner != athlete_key:
+            owner_name = all_athletes.get(existing_owner, {}).get("profile", {}).get(
+                "name", existing_owner
+            )
+            raise RuntimeError(
+                f"This Strava account is already connected to {owner_name}."
+            )
+
+        persist_strava_connection(athlete_key, connection)
+        strava_connections()[athlete_key] = connection
+        # Never leave results from an older/wrong account attached to this profile.
+        st.session_state.pop(f"{athlete_key}_strava_weekly", None)
+        st.session_state.pop(f"{athlete_key}_strava_heart_rate", None)
+        st.session_state.pop(f"strava_error_{athlete_key}", None)
+        return connection
+
+
+    def normalized_person_name(name):
+        """Normalize names so capitalization and punctuation do not cause a mismatch."""
+        return re.sub(r"[^a-z0-9]", "", str(name).casefold())
+
+
+    def verify_strava_identity(athlete_key, token_data):
+        """Prevent one athlete's Strava account from being assigned to another."""
+        expected_name = all_athletes[athlete_key]["profile"].get("name", "")
+        strava_athlete = token_data.get("athlete", {})
+        returned_name = " ".join(
+            part
+            for part in [
+                strava_athlete.get("firstname", ""),
+                strava_athlete.get("lastname", ""),
+            ]
+            if part
+        ).strip()
+
+        if not returned_name:
+            raise RuntimeError("Strava did not return the athlete's name.")
+
+        expected_first_name = expected_name.split()[0] if expected_name.split() else ""
+        returned_first_name = strava_athlete.get("firstname", "")
+        full_name_matches = (
+                normalized_person_name(returned_name)
+                == normalized_person_name(expected_name)
+        )
+        first_name_matches = (
+                bool(expected_first_name)
+                and normalized_person_name(returned_first_name)
+                == normalized_person_name(expected_first_name)
+        )
+
+        # Some VEKDYN profiles currently contain only a first name ("Diego"),
+        # while Strava returns the full name ("Diego Moran").
+        if not (full_name_matches or first_name_matches):
+            raise RuntimeError(
+                f"You selected {expected_name}, but Strava authorized {returned_name}. "
+                f"Log out of {returned_name}'s Strava account, then connect {expected_name}."
             )
 
 
-def render_starter_page():
-    """Show the clean public team-search landing page."""
+    def exchange_authorization_code(code, athlete_key):
+        response = requests.post(
+            STRAVA_TOKEN_URL,
+            data={
+                "client_id": strava_secret("STRAVA_CLIENT_ID"),
+                "client_secret": strava_secret("STRAVA_CLIENT_SECRET"),
+                "code": code,
+                "grant_type": "authorization_code",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        verify_strava_identity(athlete_key, token_data)
+        save_token_data(athlete_key, token_data)
+        return token_data["access_token"]
 
-    st.markdown(
-        """
-        <style>
-            .stApp {
-                background: #f6f8f6;
-            }
 
-            /* PUBLIC LANDING PAGE ONLY:
-               remove Streamlit's white top/share bar and keep the sidebar hidden.
-               These rules disappear after st.stop() and the private dashboard
-               renders, so the normal sidebar/collapse control remains inside VEKDYN. */
-            [data-testid="stHeader"],
-            [data-testid="stToolbar"],
-            [data-testid="stDecoration"],
-            [data-testid="stStatusWidget"],
-            [data-testid="stSidebar"],
-            [data-testid="collapsedControl"],
-            [data-testid="stSidebarCollapsedControl"] {
-                display: none !important;
-            }
-
-            [data-testid="stAppViewContainer"] > .main {
-                margin-left: 0 !important;
-                padding-top: 0 !important;
-            }
-
-            .block-container {
-                max-width: 1120px;
-                padding-top: 1.4rem;
-                padding-bottom: 3rem;
-            }
-
-            .starter-brand {
-                font-size: 28px;
-                font-weight: 800;
-                color: #111827;
-                letter-spacing: -0.8px;
-                margin-bottom: 2.4rem;
-            }
-
-            .starter-brand span {
-                color: #2f9e44;
-            }
-
-            .starter-heading {
-                text-align: center;
-                font-size: 52px;
-                line-height: 1.05;
-                font-weight: 800;
-                letter-spacing: -1.7px;
-                color: #111827;
-                margin-top: 0.6rem;
-            }
-
-            .starter-subheading {
-                text-align: center;
-                color: #6b7280;
-                font-size: 18px;
-                margin: 0.7rem 0 1.8rem;
-            }
-
-            .recent-heading {
-                color: #111827;
-                font-size: 24px;
-                font-weight: 750;
-                margin-top: 1.8rem;
-                margin-bottom: 0.6rem;
-            }
-
-            .recent-team-name {
-                color: #111827;
-                font-size: 20px;
-                font-weight: 750;
-                margin-top: 0.2rem;
-            }
-
-            .recent-team-meta {
-                color: #6b7280;
-                font-size: 14px;
-                margin-top: 0.2rem;
-            }
-
-            .landing-image-label {
-                color: #111827;
-                font-size: 20px;
-                font-weight: 700;
-                margin-top: 1.4rem;
-                margin-bottom: 0.35rem;
-            }
-
-            .landing-image-help {
-                color: #6b7280;
-                font-size: 14px;
-                margin-bottom: 0.65rem;
-            }
-
-            .landing-footer {
-                text-align: center;
-                color: #111827;
-                font-size: 22px;
-                font-weight: 750;
-                margin-top: 1.1rem;
-            }
-
-            .landing-footer-subtext {
-                text-align: center;
-                color: #6b7280;
-                font-size: 15px;
-                margin-top: 0.15rem;
-            }
-
-            .landing-banner img {
-                width: 100%;
-                height: 330px;
-                border-radius: 14px;
-                object-fit: cover;
-                border: 1px solid #e5e7eb;
-                display: block;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # -----------------------------------------------------
-    # BRAND
-    # -----------------------------------------------------
-
-    brand_col, pricing_col = st.columns([5, 1.25])
-    with brand_col:
-        st.markdown('<div class="starter-brand">VEK<span>DYN</span></div>', unsafe_allow_html=True)
-    with pricing_col:
-        if st.button("For Programs / Pricing", use_container_width=True, key="public_pricing"):
-            st.session_state["page"] = "pricing"
-            st.rerun()
-
-    # -----------------------------------------------------
-    # FIND YOUR TEAM
-    # -----------------------------------------------------
-
-    st.markdown(
-        '<div class="starter-heading">Find your team</div>'
-        '<div class="starter-subheading">Search for your school to access '
-        'your VEKDYN workspace.</div>',
-        unsafe_allow_html=True,
-    )
-
-    left_pad, search_col, right_pad = st.columns([0.25, 5.5, 0.25])
-
-    with search_col:
-        school_search = st.text_input(
-            "Search school or team name",
-            placeholder="Search school or team name",
-            label_visibility="collapsed",
-            key="landing_school_search",
+    def refresh_strava_token(athlete_key):
+        connection = athlete_strava_connection(athlete_key)
+        refresh_token = (
+                connection.get("refresh_token")
+                or configured_refresh_token(athlete_key)
         )
 
-        normalized_search = school_search.strip().casefold()
+        if not refresh_token:
+            delete_saved_strava_connection(athlete_key)
+            raise RuntimeError(
+                f"Strava authorization is no longer valid for {athlete_key}. Reconnect Strava."
+            )
 
-        # -------------------------------------------------
-        # RECENT TEAMS + SEARCH RESULTS
-        # -------------------------------------------------
-        # The landing page shows at most three recent teams. Any other configured
-        # school stays hidden until the coach searches for it.
-        default_recent = [
-            team_id for team_id in (DEMO_TEAM_ID, "ollu_distance", "sam_houston", "dark_horse_endurance")
-            if team_id in TEAM_CONFIG
-        ][:3]
-        recent_team_ids = [
-            team_id for team_id in st.session_state.get("recent_team_ids", default_recent)
-            if team_id in TEAM_CONFIG
-        ][:3]
+        response = requests.post(
+            STRAVA_TOKEN_URL,
+            data={
+                "client_id": strava_secret("STRAVA_CLIENT_ID"),
+                "client_secret": strava_secret("STRAVA_CLIENT_SECRET"),
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=15,
+        )
 
-        def team_search_text(team_id):
-            config = team_config(team_id)
-            return " ".join([
-                team_id.replace("_", " "),
-                str(config.get("name", "")),
-                str(config.get("short_name", "")),
-            ]).casefold()
+        # Strava rejected this stored authorization. Remove it instead of
+        # continuing to count the athlete as connected.
+        if response.status_code in (400, 401, 403):
+            delete_saved_strava_connection(athlete_key)
+            raise RuntimeError(
+                "Strava authorization expired or was revoked. Reconnect Strava."
+            )
 
-        def team_meta(team_id):
-            roster_for_team = get_team_athletes(team_id)
-            if roster_for_team:
-                return f"{len(roster_for_team)} athletes connected"
-            return "Team workspace"
+        response.raise_for_status()
+        token_data = response.json()
 
-        if normalized_search:
-            display_team_ids = [
-                team_id for team_id in TEAM_CONFIG
-                if all(
-                    word in team_search_text(team_id)
-                    for word in normalized_search.split()
-                )
+        if not token_data.get("access_token") or not token_data.get("refresh_token"):
+            delete_saved_strava_connection(athlete_key)
+            raise RuntimeError(
+                "Strava returned an invalid authorization. Reconnect Strava."
+            )
+
+        # Refresh responses do not include the athlete profile, so preserve the
+        # identity returned during the original authorization.
+        token_data["athlete"] = {
+            "id": connection.get("strava_athlete_id"),
+            "firstname": connection.get("strava_name", ""),
+            "lastname": "",
+        }
+        save_token_data(athlete_key, token_data)
+        return token_data["access_token"]
+
+
+    def get_valid_strava_token(athlete_key):
+        connection = athlete_strava_connection(athlete_key)
+        access_token = connection.get("access_token")
+        expires_at = connection.get("expires_at", 0)
+
+        if access_token and expires_at > time.time() + 60:
+            return access_token
+
+        return refresh_strava_token(athlete_key)
+
+
+    @st.cache_data(ttl=900, show_spinner=False)
+    def get_strava_training_data(access_token, number_of_weeks=8):
+        """Load recent run activities for the authenticated Strava athlete.
+
+        Results are cached for 15 minutes so Streamlit reruns do not repeatedly
+        consume Strava read requests. Returns an 8-week mileage frame plus a small
+        heart-rate summary used by the coach dashboard.
+        """
+        number_of_weeks = max(1, min(int(number_of_weeks), 12))
+        today = datetime.now(ZoneInfo("America/Chicago")).date()
+        current_monday = today - timedelta(days=today.weekday())
+        first_monday = current_monday - timedelta(weeks=number_of_weeks - 1)
+        after_ts = int(datetime.combine(first_monday, datetime.min.time(), tzinfo=ZoneInfo("America/Chicago")).timestamp())
+
+        activities = []
+        page = 1
+        while page <= 4:
+            response = requests.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"after": after_ts, "page": page, "per_page": 100},
+                timeout=20,
+            )
+            response.raise_for_status()
+            batch = response.json()
+            if not isinstance(batch, list):
+                raise RuntimeError("Strava returned an unexpected activities response.")
+            activities.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+
+        weekly = {first_monday + timedelta(weeks=i): 0.0 for i in range(number_of_weeks)}
+        max_hr = None
+        max_hr_date = None
+
+        for activity in activities:
+            if str(activity.get("type", "")).lower() not in {"run", "trailrun", "virtualrun"}:
+                continue
+            raw_date = activity.get("start_date_local") or activity.get("start_date")
+            if not raw_date:
+                continue
+            try:
+                activity_date = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00")).date()
+            except ValueError:
+                continue
+            week = activity_date - timedelta(days=activity_date.weekday())
+            if week in weekly:
+                weekly[week] += float(activity.get("distance") or 0.0) / 1609.344
+
+            activity_max_hr = activity.get("max_heartrate")
+            if activity_max_hr is not None:
+                try:
+                    activity_max_hr = float(activity_max_hr)
+                    if max_hr is None or activity_max_hr > max_hr:
+                        max_hr = activity_max_hr
+                        max_hr_date = activity_date.strftime("%b %d, %Y")
+                except (TypeError, ValueError):
+                    pass
+
+        frame = pd.DataFrame([
+            {"Week": week.strftime("%b %d"), "Mileage": round(miles, 2)}
+            for week, miles in sorted(weekly.items())
+        ])
+        heart = {
+            "max_heart_rate": int(round(max_hr)) if max_hr is not None else None,
+            "max_heart_rate_date": max_hr_date,
+            "last_updated": datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p UTC"),
+        }
+        return frame, heart
+
+    def dictionary_weekly_mileage(training):
+        return pd.DataFrame(
+            {
+                "Week": training.get("weeks", []),
+                "Mileage": training.get("weekly_volume", []),
+            }
+        )
+
+
+    def get_xc_results_for_event(xc_results, event):
+        """Return XC results as a predictable list of dictionaries."""
+        event_results = xc_results.get(event, xc_results.get(event.upper(), []))
+
+        if isinstance(event_results, str):
+            return [{"time": event_results, "meet": "", "date": ""}]
+
+        if isinstance(event_results, dict):
+            return [event_results]
+
+        if isinstance(event_results, list):
+            return [
+                result
+                for result in event_results
+                if isinstance(result, dict)
             ]
-            section_title = "Search results"
+
+        return []
+
+
+    def primary_xc_result(xc_results, event):
+        """Use the first entered result as the result shown on the XC card."""
+        results = get_xc_results_for_event(xc_results, event)
+        if not results:
+            return {"time": "--", "meet": "No result entered", "date": ""}
+
+        return {
+            "time": results[0].get("time", "--"),
+            "meet": results[0].get("meet", "Meet not entered"),
+            "date": results[0].get("date", ""),
+        }
+
+
+    def lactate_value(threshold_lactate, key):
+        """Format a lactate reading while allowing blank dictionary values."""
+        value = threshold_lactate.get(key)
+        if value in (None, "", "--"):
+            return "--"
+
+        try:
+            return f"{float(value):.1f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+
+    def remember_recent_team(team_id):
+        """Keep the three most recently opened teams at the top of the landing page."""
+        recent = list(st.session_state.get("recent_team_ids", []))
+        recent = [saved_id for saved_id in recent if saved_id != team_id]
+        recent.insert(0, team_id)
+        st.session_state["recent_team_ids"] = recent[:3]
+
+
+    def open_team_workspace(team_id):
+        """Send a visitor to the selected team's protected VEKDYN workspace."""
+        if team_id not in TEAM_CONFIG:
+            st.error("That VEKDYN team workspace is not configured.")
+            return
+
+        remember_recent_team(team_id)
+
+        # The Oregon workspace is a read-only public sales demo: no coach password,
+        # no real athlete account, and no live integrations are exposed.
+        if team_id == DEMO_TEAM_ID:
+            st.session_state.update({
+                "logged_in": True,
+                "logged_in_user": "demo",
+                "active_team": DEMO_TEAM_ID,
+                "pending_team": None,
+                "page": "dashboard",
+                "dashboard_view": "Dashboard",
+            })
+            if "session" in st.query_params:
+                del st.query_params["session"]
+            st.rerun()
+
+        # A session authenticated for one school must not silently open another.
+        if (
+                st.session_state.get("logged_in")
+                and st.session_state.get("active_team") == team_id
+        ):
+            st.session_state["page"] = "dashboard"
         else:
-            display_team_ids = recent_team_ids
-            section_title = "Recently accessed"
+            st.session_state["logged_in"] = False
+            st.session_state.pop("logged_in_user", None)
+            st.session_state["pending_team"] = team_id
+            st.session_state["page"] = "login"
+
+            if "session" in st.query_params:
+                del st.query_params["session"]
+
+        st.rerun()
+
+
+    def render_login_page():
+        if st.button("Athlete sign in →", key="open_athlete_from_render_login_page"):
+            st.session_state["vekdyn_app_mode"] = "athlete"
+            st.query_params.clear()
+            st.query_params["role"] = "athlete"
+            st.rerun()
+
+        """Show a fast, form-based login for the selected VEKDYN team."""
+        pending_team = (
+                st.session_state.get("pending_team")
+                or st.session_state.get("active_team")
+                or "ollu_distance"
+        )
+        config = team_config(pending_team)
 
         st.markdown(
-            f'<div class="recent-heading">{section_title}</div>',
+            """
+            <style>
+                .stApp { background: #f6f8f6; }
+                [data-testid="stSidebar"] { display: none; }
+                .block-container { max-width: 560px; padding-top: 5rem; }
+            </style>
+            """,
             unsafe_allow_html=True,
         )
 
-        if not display_team_ids:
-            st.info("No team account matches that search yet.")
+        st.markdown("# VEKDYN")
+        st.subheader(f"{config['name']} — Coach Login")
+        st.caption("Sign in to access this private team workspace.")
 
-        for team_id in display_team_ids:
-            config = team_config(team_id)
-            team_image = get_team_image(team_id)
-            meta_text = team_meta(team_id)
+        # A form prevents a full Streamlit rerun for every username/password
+        # keystroke. The app only processes authentication when Log In is pressed.
+        with st.form(f"coach_login_form_{pending_team}", clear_on_submit=False):
+            username = st.text_input(
+                "Username",
+                key=f"coach_username_{pending_team}",
+            )
+            password = st.text_input(
+                "Password",
+                type="password",
+                key=f"coach_password_{pending_team}",
+            )
+            submitted = st.form_submit_button(
+                "Log In",
+                type="primary",
+                use_container_width=True,
+            )
 
-            with st.container(border=True):
-                image_col, text_col, button_col = st.columns(
-                    [1.35, 3.8, 1.25],
-                    vertical_alignment="center",
+        if submitted:
+            if check_login(pending_team, username, password):
+                st.session_state.update({
+                    "logged_in": True,
+                    "logged_in_user": username,
+                    "active_team": pending_team,
+                    "pending_team": None,
+                    "page": "dashboard",
+                })
+                st.session_state.pop("just_logged_out", None)
+                st.query_params["session"] = create_login_token(username, pending_team)
+                st.rerun()
+            else:
+                st.error("Incorrect username or password for this team.")
+
+        if st.button(
+                "← Back",
+                use_container_width=True,
+                key=f"back_from_{pending_team}_login",
+        ):
+            st.session_state["page"] = "home"
+            st.session_state["pending_team"] = None
+            st.rerun()
+
+
+    def render_pricing_page():
+        """Public purchasing page for schools to verify VEKDYN pricing."""
+        st.markdown("""
+        <style>
+        .stApp{background:#f6f8f6}
+        [data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],[data-testid="stSidebar"],[data-testid="collapsedControl"],
+        [data-testid="stSidebarCollapsedControl"]{display:none!important}
+        .block-container{max-width:980px;padding-top:1.6rem;padding-bottom:3rem}
+        .price-brand{font-size:28px;font-weight:800;color:#111827;margin-bottom:1.4rem}
+        .price-brand span{color:#2f9e44}
+        .price-title{text-align:center;font-size:44px;font-weight:800;color:#111827}
+        .price-sub{text-align:center;color:#6b7280;font-size:17px;margin:.4rem 0 1.3rem}
+        .plan-card{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:24px 26px;min-height:170px;margin-top:8px}
+        .plan-name{font-size:20px;font-weight:800;color:#111827}
+        .plan-price{font-size:42px;font-weight:800;color:#0b67c2;margin-top:8px}
+        .plan-price span{font-size:17px;font-weight:500;color:#6b7280}
+        .plan-copy{color:#6b7280;margin-top:7px;line-height:1.45}
+        .purchase-box{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:22px 26px;margin-top:18px}
+        .purchase-title{font-size:21px;font-weight:800;color:#111827;margin-bottom:14px}
+        .purchase-row{display:flex;justify-content:space-between;gap:30px;border-bottom:1px solid #eef0ee;padding:10px 0;color:#374151}
+        .purchase-row:last-child{border-bottom:none}.purchase-row strong{color:#111827}
+        </style>""", unsafe_allow_html=True)
+
+        st.markdown('<div class="price-brand">VEK<span>DYN</span></div>', unsafe_allow_html=True)
+
+        if st.button("← Find your team"):
+            st.session_state["page"] = "home"
+            st.rerun()
+
+        st.markdown(
+            '<div class="price-title">VEKDYN Team Platform</div>'
+            '<div class="price-sub">Performance and training intelligence built for distance running programs.</div>',
+            unsafe_allow_html=True,
+        )
+
+        annual_col, monthly_col = st.columns(2)
+
+        with annual_col:
+            st.markdown(
+                """
+                <div class="plan-card">
+                    <div class="plan-name">Annual Team License</div>
+                    <div class="plan-price">$500 <span>/ year</span></div>
+                    <div class="plan-copy">Best value for programs purchasing on an annual budget.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with monthly_col:
+            st.markdown(
+                """
+                <div class="plan-card">
+                    <div class="plan-name">Monthly Team License</div>
+                    <div class="plan-price">$50 <span>/ month</span></div>
+                    <div class="plan-copy">Flexible month-to-month access for programs that prefer monthly billing.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.caption("Annual billing saves $100 compared with 12 months of monthly billing.")
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### Included")
+            st.markdown(
+                "✓ Team dashboard & analytics  \\n"
+                "✓ Athlete performance profiles  \\n"
+                "✓ Strava integration  \\n"
+                "✓ Team workout planning  \\n"
+                "✓ Coach & athlete notes"
+            )
+        with right:
+            st.markdown("#### Performance tools")
+            st.markdown(
+                "✓ Threshold & training analytics  \\n"
+                "✓ Race predictions  \\n"
+                "✓ Recovery tracking  \\n"
+                "✓ Secure team workspace  \\n"
+                "✓ Continuous updates"
+            )
+
+        st.markdown(
+            """
+            <div class="purchase-box">
+              <div class="purchase-title">Purchasing Information</div>
+              <div class="purchase-row"><span>Vendor / Company Name</span><strong>VEKDYN</strong></div>
+              <div class="purchase-row"><span>Product</span><strong>VEKDYN Team Platform</strong></div>
+              <div class="purchase-row"><span>License Options</span><strong>Annual or Monthly Team License</strong></div>
+              <div class="purchase-row"><span>Published Pricing</span><strong>$500/year or $50/month</strong></div>
+              <div class="purchase-row"><span>Billing</span><strong>Annual invoice or monthly billing</strong></div>
+              <div class="purchase-row"><span>Payment</span><strong>Invoice / ACH / Check</strong></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.info(
+            "Founding-program or pilot pricing may be provided by written quote. "
+            "Published standard pricing is $500/year or $50/month per program."
+        )
+
+        st.markdown("### Request an Invoice")
+        st.caption(
+            "Coaches or university purchasing staff can prepare the information needed "
+            "for a VEKDYN invoice. No payment or banking information is collected here."
+        )
+
+        with st.form("invoice_request_form"):
+            invoice_school = st.text_input("School / Program")
+            invoice_contact = st.text_input("Coach or Purchasing Contact")
+            invoice_email = st.text_input("Contact Email")
+            invoice_plan = st.selectbox(
+                "License",
+                [
+                    "Annual Team License — $500/year",
+                    "Monthly Team License — $50/month",
+                ],
+            )
+            invoice_po = st.text_input("PO / Requisition Number (optional)")
+            invoice_notes = st.text_area("Purchasing Notes (optional)")
+            invoice_submit = st.form_submit_button(
+                "Prepare Invoice Request",
+                use_container_width=True,
+            )
+
+        if invoice_submit:
+            if not invoice_school.strip() or not invoice_contact.strip() or not invoice_email.strip():
+                st.error("Please enter the school/program, contact name, and contact email.")
+            else:
+                st.success("Invoice request prepared.")
+                st.markdown(
+                    f"""**Vendor:** VEKDYN  
+    **Product:** VEKDYN Team Platform  
+    **School / Program:** {invoice_school}  
+    **Contact:** {invoice_contact}  
+    **Email:** {invoice_email}  
+    **License:** {invoice_plan}  
+    **PO / Requisition:** {invoice_po or "Not provided"}  
+    **Notes:** {invoice_notes or "None"}"""
                 )
 
-                with image_col:
-                    if team_image:
-                        st.image(str(team_image), use_container_width=True)
-                    else:
+
+    def render_starter_page():
+        if st.button("Athlete sign in →", key="open_athlete_from_render_starter_page"):
+            st.session_state["vekdyn_app_mode"] = "athlete"
+            st.query_params.clear()
+            st.query_params["role"] = "athlete"
+            st.rerun()
+
+        """Show the clean public team-search landing page."""
+
+        st.markdown(
+            """
+            <style>
+                .stApp {
+                    background: #f6f8f6;
+                }
+
+                /* PUBLIC LANDING PAGE ONLY:
+                   remove Streamlit's white top/share bar and keep the sidebar hidden.
+                   These rules disappear after st.stop() and the private dashboard
+                   renders, so the normal sidebar/collapse control remains inside VEKDYN. */
+                [data-testid="stHeader"],
+                [data-testid="stToolbar"],
+                [data-testid="stDecoration"],
+                [data-testid="stStatusWidget"],
+                [data-testid="stSidebar"],
+                [data-testid="collapsedControl"],
+                [data-testid="stSidebarCollapsedControl"] {
+                    display: none !important;
+                }
+
+                [data-testid="stAppViewContainer"] > .main {
+                    margin-left: 0 !important;
+                    padding-top: 0 !important;
+                }
+
+                .block-container {
+                    max-width: 1120px;
+                    padding-top: 1.4rem;
+                    padding-bottom: 3rem;
+                }
+
+                .starter-brand {
+                    font-size: 28px;
+                    font-weight: 800;
+                    color: #111827;
+                    letter-spacing: -0.8px;
+                    margin-bottom: 2.4rem;
+                }
+
+                .starter-brand span {
+                    color: #2f9e44;
+                }
+
+                .starter-heading {
+                    text-align: center;
+                    font-size: 52px;
+                    line-height: 1.05;
+                    font-weight: 800;
+                    letter-spacing: -1.7px;
+                    color: #111827;
+                    margin-top: 0.6rem;
+                }
+
+                .starter-subheading {
+                    text-align: center;
+                    color: #6b7280;
+                    font-size: 18px;
+                    margin: 0.7rem 0 1.8rem;
+                }
+
+                .recent-heading {
+                    color: #111827;
+                    font-size: 24px;
+                    font-weight: 750;
+                    margin-top: 1.8rem;
+                    margin-bottom: 0.6rem;
+                }
+
+                .recent-team-name {
+                    color: #111827;
+                    font-size: 20px;
+                    font-weight: 750;
+                    margin-top: 0.2rem;
+                }
+
+                .recent-team-meta {
+                    color: #6b7280;
+                    font-size: 14px;
+                    margin-top: 0.2rem;
+                }
+
+                .landing-image-label {
+                    color: #111827;
+                    font-size: 20px;
+                    font-weight: 700;
+                    margin-top: 1.4rem;
+                    margin-bottom: 0.35rem;
+                }
+
+                .landing-image-help {
+                    color: #6b7280;
+                    font-size: 14px;
+                    margin-bottom: 0.65rem;
+                }
+
+                .landing-footer {
+                    text-align: center;
+                    color: #111827;
+                    font-size: 22px;
+                    font-weight: 750;
+                    margin-top: 1.1rem;
+                }
+
+                .landing-footer-subtext {
+                    text-align: center;
+                    color: #6b7280;
+                    font-size: 15px;
+                    margin-top: 0.15rem;
+                }
+
+                .landing-banner img {
+                    width: 100%;
+                    height: 330px;
+                    border-radius: 14px;
+                    object-fit: cover;
+                    border: 1px solid #e5e7eb;
+                    display: block;
+                }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # -----------------------------------------------------
+        # BRAND
+        # -----------------------------------------------------
+
+        brand_col, pricing_col = st.columns([5, 1.25])
+        with brand_col:
+            st.markdown('<div class="starter-brand">VEK<span>DYN</span></div>', unsafe_allow_html=True)
+        with pricing_col:
+            if st.button("For Programs / Pricing", use_container_width=True, key="public_pricing"):
+                st.session_state["page"] = "pricing"
+                st.rerun()
+
+        # -----------------------------------------------------
+        # FIND YOUR TEAM
+        # -----------------------------------------------------
+
+        st.markdown(
+            '<div class="starter-heading">Find your team</div>'
+            '<div class="starter-subheading">Search for your school to access '
+            'your VEKDYN workspace.</div>',
+            unsafe_allow_html=True,
+        )
+
+        left_pad, search_col, right_pad = st.columns([0.25, 5.5, 0.25])
+
+        with search_col:
+            school_search = st.text_input(
+                "Search school or team name",
+                placeholder="Search school or team name",
+                label_visibility="collapsed",
+                key="landing_school_search",
+            )
+
+            normalized_search = school_search.strip().casefold()
+
+            # -------------------------------------------------
+            # RECENT TEAMS + SEARCH RESULTS
+            # -------------------------------------------------
+            # The landing page shows at most three recent teams. Any other configured
+            # school stays hidden until the coach searches for it.
+            default_recent = [
+                team_id for team_id in (DEMO_TEAM_ID, "ollu_distance", "sam_houston", "dark_horse_endurance")
+                if team_id in TEAM_CONFIG
+            ][:3]
+            recent_team_ids = [
+                team_id for team_id in st.session_state.get("recent_team_ids", default_recent)
+                if team_id in TEAM_CONFIG
+            ][:3]
+
+            def team_search_text(team_id):
+                config = team_config(team_id)
+                return " ".join([
+                    team_id.replace("_", " "),
+                    str(config.get("name", "")),
+                    str(config.get("short_name", "")),
+                ]).casefold()
+
+            def team_meta(team_id):
+                roster_for_team = get_team_athletes(team_id)
+                if roster_for_team:
+                    return f"{len(roster_for_team)} athletes connected"
+                return "Team workspace"
+
+            if normalized_search:
+                display_team_ids = [
+                    team_id for team_id in TEAM_CONFIG
+                    if all(
+                        word in team_search_text(team_id)
+                        for word in normalized_search.split()
+                    )
+                ]
+                section_title = "Search results"
+            else:
+                display_team_ids = recent_team_ids
+                section_title = "Recently accessed"
+
+            st.markdown(
+                f'<div class="recent-heading">{section_title}</div>',
+                unsafe_allow_html=True,
+            )
+
+            if not display_team_ids:
+                st.info("No team account matches that search yet.")
+
+            for team_id in display_team_ids:
+                config = team_config(team_id)
+                team_image = get_team_image(team_id)
+                meta_text = team_meta(team_id)
+
+                with st.container(border=True):
+                    image_col, text_col, button_col = st.columns(
+                        [1.35, 3.8, 1.25],
+                        vertical_alignment="center",
+                    )
+
+                    with image_col:
+                        if team_image:
+                            st.image(str(team_image), use_container_width=True)
+                        else:
+                            st.markdown(
+                                '<div style="height:90px;display:flex;align-items:center;'
+                                'justify-content:center;font-size:32px;">🏃</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    with text_col:
                         st.markdown(
-                            '<div style="height:90px;display:flex;align-items:center;'
-                            'justify-content:center;font-size:32px;">🏃</div>',
+                            f'<div class="recent-team-name">{html.escape(config["name"])}</div>'
+                            f'<div class="recent-team-meta">{html.escape(meta_text)}</div>',
                             unsafe_allow_html=True,
                         )
 
-                with text_col:
-                    st.markdown(
-                        f'<div class="recent-team-name">{html.escape(config["name"])}</div>'
-                        f'<div class="recent-team-meta">{html.escape(meta_text)}</div>',
-                        unsafe_allow_html=True,
-                    )
+                    with button_col:
+                        if st.button(
+                                "Open Team →",
+                                key=f"open_{team_id}",
+                                type="primary",
+                                use_container_width=True,
+                        ):
+                            open_team_workspace(team_id)
 
-                with button_col:
-                    if st.button(
-                            "Open Team →",
-                            key=f"open_{team_id}",
-                            type="primary",
-                            use_container_width=True,
-                    ):
-                        open_team_workspace(team_id)
+            # -------------------------------------------------
+            # PUBLIC LANDING-PAGE IMAGE
+            # -------------------------------------------------
 
-        # -------------------------------------------------
-        # PUBLIC LANDING-PAGE IMAGE
-        # -------------------------------------------------
+            # This is deliberately separate from every school's card image.
+            # Save the general running photo as team_images/running_banner.jpg.
+            landing_image = get_team_image("running_banner")
+            if landing_image:
+                st.markdown('<div class="landing-banner">', unsafe_allow_html=True)
+                st.image(str(landing_image), use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
-        # This is deliberately separate from every school's card image.
-        # Save the general running photo as team_images/running_banner.jpg.
-        landing_image = get_team_image("running_banner")
-        if landing_image:
-            st.markdown('<div class="landing-banner">', unsafe_allow_html=True)
-            st.image(str(landing_image), use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+            # -------------------------------------------------
+            # FOOTER
+            # -------------------------------------------------
 
-        # -------------------------------------------------
-        # FOOTER
-        # -------------------------------------------------
+            st.divider()
 
-        st.divider()
-
-        st.markdown(
-            '<div class="landing-footer">🏃 Built for the next generation of runners</div>'
-            '<div class="landing-footer-subtext">Data. Insight. Performance.</div>',
-            unsafe_allow_html=True,
-        )
+            st.markdown(
+                '<div class="landing-footer">🏃 Built for the next generation of runners</div>'
+                '<div class="landing-footer-subtext">Data. Insight. Performance.</div>',
+                unsafe_allow_html=True,
+            )
 
 
-# =========================================================
-# PUBLIC HOME / PRIVATE LOGIN ROUTING
-# =========================================================
+    # =========================================================
+    # PUBLIC HOME / PRIVATE LOGIN ROUTING
+    # =========================================================
 
-# Handle a Strava OAuth return BEFORE the public landing page can stop execution.
-# This is essential on the deployed Streamlit URL because the OAuth return starts
-# a fresh app run with ?code=...&state=... in the URL.
-# Complete an OAuth return before drawing the dashboard.
-authorization_code = st.query_params.get("code")
-authorization_error = st.query_params.get("error")
-returned_oauth_state = st.query_params.get("state")
+    # Handle a Strava OAuth return BEFORE the public landing page can stop execution.
+    # This is essential on the deployed Streamlit URL because the OAuth return starts
+    # a fresh app run with ?code=...&state=... in the URL.
+    # Complete an OAuth return before drawing the dashboard.
+    authorization_code = st.query_params.get("code")
+    authorization_error = st.query_params.get("error")
+    returned_oauth_state = st.query_params.get("state")
 
-if authorization_error:
-    provider_name = "COROS" if str(returned_oauth_state or "").startswith("coros.") else "Strava"
-    st.error(f"{provider_name} authorization was cancelled or denied.")
-    st.query_params.clear()
-
-if authorization_code and str(returned_oauth_state or "").startswith("coros."):
-    try:
-        connected_athlete_key = exchange_coros_authorization_code(authorization_code, returned_oauth_state)
-        connected_team = athlete_team_lookup.get(connected_athlete_key)
-        connected_name = all_athletes[connected_athlete_key]["profile"]["name"]
-        st.session_state[f"coros_message_{connected_athlete_key}"] = f"{connected_name}'s COROS connected successfully."
-        st.session_state["selected_athlete_key"] = connected_athlete_key
-        st.session_state["active_team"] = connected_team
-        st.session_state["page"] = "dashboard"
+    if authorization_error:
+        provider_name = "COROS" if str(returned_oauth_state or "").startswith("coros.") else "Strava"
+        st.error(f"{provider_name} authorization was cancelled or denied.")
         st.query_params.clear()
-        st.rerun()
-    except Exception as error:
-        st.error(f"COROS authorization failed: {error}")
-        st.stop()
 
-if authorization_code and not str(returned_oauth_state or "").startswith("coros."):
-    try:
-        connected_athlete_key = athlete_key_from_oauth_state(
-            returned_oauth_state
-        )
-
-        if connected_athlete_key not in all_athletes:
-            raise RuntimeError(
-                "The Strava connection could not be matched to a VEKDYN profile. "
-                "Return to the dashboard and select Connect Strava again."
-            )
-
-        connected_team = athlete_team_lookup.get(connected_athlete_key)
-        if not connected_team:
-            raise RuntimeError(
-                "VEKDYN found the athlete but could not determine which team owns "
-                "the profile."
-            )
-
-        exchange_authorization_code(
-            authorization_code,
-            connected_athlete_key,
-        )
-
-        connected_name = all_athletes[connected_athlete_key]["profile"]["name"]
-
-        st.session_state[
-            f"strava_message_{connected_athlete_key}"
-        ] = f"{connected_name}'s Strava connected successfully."
-
-        # Return the coach to the same school/athlete that initiated OAuth.
-        st.session_state["selected_athlete_key"] = connected_athlete_key
-        st.session_state["active_team"] = connected_team
-        st.session_state["page"] = "dashboard"
-
-        st.query_params.clear()
-        st.rerun()
-    except (
-            requests.RequestException,
-            sqlite3.DatabaseError,
-            KeyError,
-            RuntimeError,
-    ) as error:
-        # If this athlete already has a valid saved Strava connection,
-        # an old/reused OAuth callback code should not create a red
-        # dashboard-wide error banner. The existing Neon connection
-        # remains the source of truth.
-        oauth_athlete_key = athlete_key_from_oauth_state(returned_oauth_state)
-
-        if (
-                oauth_athlete_key in all_athletes
-                and strava_is_connected(oauth_athlete_key)
-        ):
-            st.session_state.pop(
-                f"strava_error_{oauth_athlete_key}",
-                None,
-            )
-
-            # Remove the stale one-time OAuth parameters so Streamlit
-            # cannot try to exchange the same authorization code again.
+    if authorization_code and str(returned_oauth_state or "").startswith("coros."):
+        try:
+            connected_athlete_key = exchange_coros_authorization_code(authorization_code, returned_oauth_state)
+            connected_team = athlete_team_lookup.get(connected_athlete_key)
+            connected_name = all_athletes[connected_athlete_key]["profile"]["name"]
+            st.session_state[f"coros_message_{connected_athlete_key}"] = f"{connected_name}'s COROS connected successfully."
+            st.session_state["selected_athlete_key"] = connected_athlete_key
+            st.session_state["active_team"] = connected_team
+            st.session_state["page"] = "dashboard"
             st.query_params.clear()
             st.rerun()
-        else:
-            st.error(f"Strava authorization failed: {error}")
+        except Exception as error:
+            st.error(f"COROS authorization failed: {error}")
+            st.stop()
 
-# =========================================================
-# ATHLETE INVITATION ACTIVATION — BEFORE NORMAL PAGE ROUTING
-# =========================================================
-def _vekdyn_invitation_details(raw_token):
-    """Validate a coach-issued, one-use invitation against the shared Neon DB."""
-    if not isinstance(raw_token, str) or len(raw_token) > 256 or not raw_token:
-        return None
-    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-    with get_database_connection() as db:
-        with db.cursor() as cur:
-            cur.execute("""
-                SELECT i.athlete_id, i.email
-                FROM athlete_invitations AS i
-                JOIN athlete_logins AS a ON a.athlete_id = i.athlete_id
-                WHERE i.token_hash = %s
-                  AND i.used_at IS NULL AND i.expires_at > NOW()
-                  AND a.active = TRUE
-                  AND LOWER(BTRIM(a.login_email)) = LOWER(BTRIM(i.email))
-            """, (token_hash,))
-            return cur.fetchone()
+    if authorization_code and not str(returned_oauth_state or "").startswith("coros."):
+        try:
+            connected_athlete_key = athlete_key_from_oauth_state(
+                returned_oauth_state
+            )
 
+            if connected_athlete_key not in all_athletes:
+                raise RuntimeError(
+                    "The Strava connection could not be matched to a VEKDYN profile. "
+                    "Return to the dashboard and select Connect Strava again."
+                )
 
-def _vekdyn_activate_invitation(raw_token, password):
-    """Change only account credentials; consume token in the same transaction."""
-    password_bytes = password.encode("utf-8")
-    if len(password) < 12 or len(password_bytes) > 72:
-        raise ValueError("Use a password of at least 12 characters and at most 72 UTF-8 bytes.")
-    digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-    password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode("utf-8")
-    with get_database_connection() as db:
-        with db.cursor() as cur:
-            cur.execute("""
-                SELECT athlete_id, email FROM athlete_invitations
-                WHERE token_hash = %s AND used_at IS NULL AND expires_at > NOW()
-                FOR UPDATE
-            """, (digest,))
-            invitation = cur.fetchone()
-            if not invitation:
-                raise ValueError("This invitation has expired or has already been used.")
-            cur.execute("""
-                UPDATE athlete_logins
-                SET password_hash = %s, password_updated_at = NOW(),
-                    must_change_password = FALSE
-                WHERE athlete_id = %s AND active = TRUE
-                  AND LOWER(BTRIM(login_email)) = LOWER(BTRIM(%s))
-            """, (password_hash, invitation[0], invitation[1]))
-            if cur.rowcount != 1:
-                raise ValueError("This invitation no longer matches an active athlete account.")
-            cur.execute("UPDATE athlete_invitations SET used_at = NOW() WHERE token_hash = %s", (digest,))
-            # If the Athlete Hub has issued older persistent sessions, revoke them.
-            cur.execute("""
-                SELECT to_regclass('public.athlete_sessions')
-            """)
-            if cur.fetchone()[0] is not None:
-                cur.execute("""
-                    UPDATE athlete_sessions SET revoked = TRUE WHERE athlete_id = %s
-                """, (invitation[0],))
-        db.commit()
-    return invitation[0]
+            connected_team = athlete_team_lookup.get(connected_athlete_key)
+            if not connected_team:
+                raise RuntimeError(
+                    "VEKDYN found the athlete but could not determine which team owns "
+                    "the profile."
+                )
 
+            exchange_authorization_code(
+                authorization_code,
+                connected_athlete_key,
+            )
 
-def _vekdyn_render_invitation():
-    """The invite URL takes priority over Coach Hub routing and saved sessions."""
-    raw_token = st.query_params.get("invite")
-    if isinstance(raw_token, list):
-        raw_token = raw_token[0] if raw_token else None
-    if not raw_token:
-        return False
+            connected_name = all_athletes[connected_athlete_key]["profile"]["name"]
 
-    st.markdown("""<style>
-        [data-testid="stSidebar"] {display:none;}
-        .block-container {max-width:560px;padding-top:3rem;}
-    </style>""", unsafe_allow_html=True)
-    st.title("Activate VEKDYN Athlete")
-    try:
-        invitation = _vekdyn_invitation_details(str(raw_token))
-    except psycopg2.Error:
-        st.error("Unable to verify this invitation right now. Please try again later.")
-        return True
-    if not invitation:
-        st.warning("This invitation is invalid, expired, or already used. Ask your coach for a new invitation.")
-        return True
+            st.session_state[
+                f"strava_message_{connected_athlete_key}"
+            ] = f"{connected_name}'s Strava connected successfully."
 
-    st.caption(f"Create your password for {invitation[1]}.")
-    with st.form("vekdyn_invitation_activation"):
-        password = st.text_input("New password (12 characters minimum)", type="password")
-        confirm = st.text_input("Confirm password", type="password")
-        submitted = st.form_submit_button("Activate my account", type="primary")
-    if submitted:
-        if password != confirm:
-            st.error("Passwords do not match.")
-        else:
-            try:
-                _vekdyn_activate_invitation(str(raw_token), password)
-            except ValueError as error:
-                st.error(str(error))
-            except psycopg2.Error:
-                st.error("Activation could not be completed. Please try again.")
-            else:
+            # Return the coach to the same school/athlete that initiated OAuth.
+            st.session_state["selected_athlete_key"] = connected_athlete_key
+            st.session_state["active_team"] = connected_team
+            st.session_state["page"] = "dashboard"
+
+            st.query_params.clear()
+            st.rerun()
+        except (
+                requests.RequestException,
+                sqlite3.DatabaseError,
+                KeyError,
+                RuntimeError,
+        ) as error:
+            # If this athlete already has a valid saved Strava connection,
+            # an old/reused OAuth callback code should not create a red
+            # dashboard-wide error banner. The existing Neon connection
+            # remains the source of truth.
+            oauth_athlete_key = athlete_key_from_oauth_state(returned_oauth_state)
+
+            if (
+                    oauth_athlete_key in all_athletes
+                    and strava_is_connected(oauth_athlete_key)
+            ):
+                st.session_state.pop(
+                    f"strava_error_{oauth_athlete_key}",
+                    None,
+                )
+
+                # Remove the stale one-time OAuth parameters so Streamlit
+                # cannot try to exchange the same authorization code again.
                 st.query_params.clear()
-                st.session_state["vekdyn_invitation_activated"] = True
                 st.rerun()
-    return True
+            else:
+                st.error(f"Strava authorization failed: {error}")
 
+    # The landing page stays public. Opening OLLU sends visitors to login.
+    if st.session_state.get("page") == "login" and not st.session_state.get("logged_in"):
+        render_login_page()
+        st.stop()
 
-if st.session_state.pop("vekdyn_invitation_activated", False):
-    st.success("Your athlete account is activated. Sign in using your email and new password.")
+    if st.session_state.get("page") == "pricing":
+        render_pricing_page()
+        st.stop()
 
-if _vekdyn_render_invitation():
-    st.stop()
+    if st.session_state.get("page") == "home":
+        render_starter_page()
+        st.stop()
 
-# The landing page stays public. Opening OLLU sends visitors to login.
-if st.session_state.get("page") == "login" and not st.session_state.get("logged_in"):
-    render_login_page()
-    st.stop()
+    # Never expose any team dashboard without authentication for that workspace.
+    if (
+            not st.session_state.get("logged_in")
+            or st.session_state.get("active_team") not in TEAM_CONFIG
+    ):
+        st.session_state["page"] = "login"
+        render_login_page()
+        st.stop()
 
-if st.session_state.get("page") == "pricing":
-    render_pricing_page()
-    st.stop()
+    active_team = st.session_state["active_team"]
+    active_team_config = team_config(active_team)
 
-if st.session_state.get("page") == "home":
-    render_starter_page()
-    st.stop()
+    # The existing dashboard remains shared. Only its data source changes.
+    athletes = get_team_athletes(active_team)
 
-# Never expose any team dashboard without authentication for that workspace.
-if (
-        not st.session_state.get("logged_in")
-        or st.session_state.get("active_team") not in TEAM_CONFIG
-):
-    st.session_state["page"] = "login"
-    render_login_page()
-    st.stop()
+    # =========================================================
+    # APP STYLING
+    # =========================================================
 
-active_team = st.session_state["active_team"]
-active_team_config = team_config(active_team)
-
-# The existing dashboard remains shared. Only its data source changes.
-athletes = get_team_athletes(active_team)
-
-# =========================================================
-# APP STYLING
-# =========================================================
-
-st.markdown(
-    """
-    <style>
-
-
-        .stApp { background-color: #f6f8f6; }
-        [data-testid="stSidebar"] {
-            background-color: #ffffff;
-            border-right: 1px solid #e5e7eb;
-        }
-        [data-testid="stMetric"] { background-color: transparent; }
-        [data-testid="stMetricValue"] {
-            font-size: 30px;
-            font-weight: 700;
-            color: #111827;
-        }
-        [data-testid="stMetricLabel"] { color: #6b7280; }
-
-        /* Keep recovery/metric text fully visible on narrower dashboard cards. */
-        [data-testid="stMetricValue"],
-        [data-testid="stMetricValue"] > div,
-        [data-testid="stMetricValue"] p {
-            overflow: visible !important;
-            text-overflow: clip !important;
-            white-space: nowrap !important;
-            max-width: none !important;
-        }
-
-        [data-testid="stMetricLabel"],
-        [data-testid="stMetricLabel"] > div,
-        [data-testid="stMetricLabel"] p {
-            overflow: visible !important;
-            text-overflow: clip !important;
-            white-space: normal !important;
-            max-width: none !important;
-            line-height: 1.2 !important;
-        }
-        div[data-testid="stVerticalBlockBorderWrapper"] {
-            background-color: #ffffff;
-            border: 1px solid #e5e7eb;
-            border-radius: 14px;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
-        }
-        h1, h2, h3 { color: #111827; }
-        .green-text { color: #2f9e44; font-weight: 600; }
-        .small-text { color: #6b7280; font-size: 14px; }
-        .athlete-name {
-            font-size: 34px;
-            font-weight: 750;
-            color: #111827;
-            margin-bottom: 4px;
-        }
-        .active-badge {
-            background-color: #e8f7ea;
-            color: #2f9e44;
-            border-radius: 12px;
-            padding: 4px 10px;
-            font-size: 13px;
-            font-weight: 600;
-        }
-                .athlete-photo-circle {
-            width: 110px !important;
-            height: 110px !important;
-            border-radius: 50% !important;
-            object-fit: cover !important;
-            object-position: center !important;
-
-            /* Clean circle — no gray/white frame */
-            border: none !important;
-            outline: none !important;
-            box-shadow: none !important;
-            background: transparent !important;
-
-            display: block !important;
-            padding: 0 !important;
-            margin: 0 !important;
-        }
-        .pb-event { color: #6b7280; font-size: 14px; margin-bottom: 4px; }
-        .pb-time { color: #111827; font-size: 27px; font-weight: 750; margin-bottom: 5px; }
-        .status-dot { color: #2f9e44; font-size: 12px; }
-        .notes-title {
-            font-size: 28px;
-            font-weight: 760;
-            color: #111827;
-            margin-bottom: 2px;
-        }
-        .notes-subtitle {
-            color: #6b7280;
-            font-size: 14px;
-            margin-bottom: 12px;
-        }
-        .note-card {
-            border: 1px solid #e5e7eb;
-            border-radius: 14px;
-            padding: 15px 16px;
-            margin-bottom: 12px;
-        }
-        .note-card-athlete {
-            background: #f5f9ff;
-            border-color: #dbeafe;
-        }
-        .note-card-coach {
-            background: #f3fbf4;
-            border-color: #d7efd9;
-        }
-        .note-
-.note-author-wrap {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .note-author {
-            color: #111827;
-            font-size: 14px;
-            font-weight: 700;
-        }
-        .note-role {
-            display: inline-block;
-            border-radius: 999px;
-            padding: 2px 8px;
-            font-size: 10px;
-            font-weight: 800;
-            letter-spacing: .25px;
-        }
-        .note-role-athlete {
-            color: #2563eb;
-            background: #e8f1ff;
-        }
-        .note-role-coach {
-            color: #24833b;
-            background: #e4f6e7;
-        }
-        .note-time {
-            color: #6b7280;
-            font-size: 12px;
-            white-space: nowrap;
-        }
-        .note-body {
-            color: #1f2937;
-            font-size: 15px;
-            line-height: 1.55;
-            white-space: pre-wrap;
-        }
-
-        .team-workout-title {
-            font-size: 28px;
-            font-weight: 760;
-            color: #111827;
-            margin-top: 10px;
-            margin-bottom: 2px;
-        }
-
-        .team-workout-subtitle {
-            color: #6b7280;
-            font-size: 14px;
-            margin-bottom: 12px;
-        }
-
-        .team-workout-card {
-            background: #ffffff;
-            border: 1px solid #e5e7eb;
-            border-radius: 14px;
-            padding: 16px;
-            min-height: 245px;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
-        }
-
-        .team-workout-date {
-            color: #6b7280;
-            font-size: 12px;
-            font-weight: 650;
-            margin-bottom: 6px;
-        }
-
-        .team-workout-type {
-            color: #111827;
-            font-size: 18px;
-            font-weight: 760;
-            margin-bottom: 13px;
-        }
-
-        .team-workout-detail {
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-            color: #374151;
-            font-size: 13px;
-            line-height: 1.4;
-            margin-bottom: 10px;
-        }
-
-        .team-workout-label {
-            color: #2f9e44;
-            font-size: 11px;
-            font-weight: 800;
-            text-transform: uppercase;
-            letter-spacing: .3px;
-        }
-
-        .team-workout-notes {
-            border-top: 1px solid #eef0ee;
-            margin-top: 12px;
-            padding-top: 10px;
-            color: #6b7280;
-            font-size: 12px;
-            line-height: 1.45;
-        }
-
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =========================================================
-# DARK HORSE ENDURANCE — TEAM-SPECIFIC CONCEPT THEME
-# =========================================================
-# Keep OLLU and Sam Houston on the normal VEKDYN light theme.
-# Only the authenticated Dark Horse workspace receives this skin.
-if active_team == "dark_horse_endurance":
     st.markdown(
         """
         <style>
-        :root {
-            --dh-bg: #050506;
-            --dh-surface: #09090b;
-            --dh-card: #0d0d10;
-            --dh-card-soft: #111116;
-            --dh-border: #343038;
-            --dh-border-soft: #252329;
-            --dh-text: #f7f7f8;
-            --dh-muted: #aaa6b0;
-            --dh-purple: #9b4de4;
-            --dh-purple-bright: #b45cff;
-            --dh-purple-soft: #21112f;
-        }
 
 
-    /* Dark Horse top header */
-    [data-testid="stHeader"],
-    [data-testid="stToolbar"],
-    [data-testid="stDecoration"],
-    [data-testid="stStatusWidget"] {
-        background: var(--dh-bg) !important;
-        color: var(--dh-text) !important;
-    }
+            .stApp { background-color: #f6f8f6; }
+            [data-testid="stSidebar"] {
+                background-color: #ffffff;
+                border-right: 1px solid #e5e7eb;
+            }
+            [data-testid="stMetric"] { background-color: transparent; }
+            [data-testid="stMetricValue"] {
+                font-size: 30px;
+                font-weight: 700;
+                color: #111827;
+            }
+            [data-testid="stMetricLabel"] { color: #6b7280; }
 
-    header[data-testid="stHeader"] {
-        background: var(--dh-bg) !important;
-    }
+            /* Keep recovery/metric text fully visible on narrower dashboard cards. */
+            [data-testid="stMetricValue"],
+            [data-testid="stMetricValue"] > div,
+            [data-testid="stMetricValue"] p {
+                overflow: visible !important;
+                text-overflow: clip !important;
+                white-space: nowrap !important;
+                max-width: none !important;
+            }
+
+            [data-testid="stMetricLabel"],
+            [data-testid="stMetricLabel"] > div,
+            [data-testid="stMetricLabel"] p {
+                overflow: visible !important;
+                text-overflow: clip !important;
+                white-space: normal !important;
+                max-width: none !important;
+                line-height: 1.2 !important;
+            }
+            div[data-testid="stVerticalBlockBorderWrapper"] {
+                background-color: #ffffff;
+                border: 1px solid #e5e7eb;
+                border-radius: 14px;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
+            }
+            h1, h2, h3 { color: #111827; }
+            .green-text { color: #2f9e44; font-weight: 600; }
+            .small-text { color: #6b7280; font-size: 14px; }
+            .athlete-name {
+                font-size: 34px;
+                font-weight: 750;
+                color: #111827;
+                margin-bottom: 4px;
+            }
+            .active-badge {
+                background-color: #e8f7ea;
+                color: #2f9e44;
+                border-radius: 12px;
+                padding: 4px 10px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+                    .athlete-photo-circle {
+                width: 110px !important;
+                height: 110px !important;
+                border-radius: 50% !important;
+                object-fit: cover !important;
+                object-position: center !important;
+
+                /* Clean circle — no gray/white frame */
+                border: none !important;
+                outline: none !important;
+                box-shadow: none !important;
+                background: transparent !important;
+
+                display: block !important;
+                padding: 0 !important;
+                margin: 0 !important;
+            }
+            .pb-event { color: #6b7280; font-size: 14px; margin-bottom: 4px; }
+            .pb-time { color: #111827; font-size: 27px; font-weight: 750; margin-bottom: 5px; }
+            .status-dot { color: #2f9e44; font-size: 12px; }
+            .notes-title {
+                font-size: 28px;
+                font-weight: 760;
+                color: #111827;
+                margin-bottom: 2px;
+            }
+            .notes-subtitle {
+                color: #6b7280;
+                font-size: 14px;
+                margin-bottom: 12px;
+            }
+            .note-card {
+                border: 1px solid #e5e7eb;
+                border-radius: 14px;
+                padding: 15px 16px;
+                margin-bottom: 12px;
+            }
+            .note-card-athlete {
+                background: #f5f9ff;
+                border-color: #dbeafe;
+            }
+            .note-card-coach {
+                background: #f3fbf4;
+                border-color: #d7efd9;
+            }
+            .note-
+    .note-author-wrap {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .note-author {
+                color: #111827;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            .note-role {
+                display: inline-block;
+                border-radius: 999px;
+                padding: 2px 8px;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: .25px;
+            }
+            .note-role-athlete {
+                color: #2563eb;
+                background: #e8f1ff;
+            }
+            .note-role-coach {
+                color: #24833b;
+                background: #e4f6e7;
+            }
+            .note-time {
+                color: #6b7280;
+                font-size: 12px;
+                white-space: nowrap;
+            }
+            .note-body {
+                color: #1f2937;
+                font-size: 15px;
+                line-height: 1.55;
+                white-space: pre-wrap;
+            }
+
+            .team-workout-title {
+                font-size: 28px;
+                font-weight: 760;
+                color: #111827;
+                margin-top: 10px;
+                margin-bottom: 2px;
+            }
+
+            .team-workout-subtitle {
+                color: #6b7280;
+                font-size: 14px;
+                margin-bottom: 12px;
+            }
+
+            .team-workout-card {
+                background: #ffffff;
+                border: 1px solid #e5e7eb;
+                border-radius: 14px;
+                padding: 16px;
+                min-height: 245px;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
+            }
+
+            .team-workout-date {
+                color: #6b7280;
+                font-size: 12px;
+                font-weight: 650;
+                margin-bottom: 6px;
+            }
+
+            .team-workout-type {
+                color: #111827;
+                font-size: 18px;
+                font-weight: 760;
+                margin-bottom: 13px;
+            }
+
+            .team-workout-detail {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                color: #374151;
+                font-size: 13px;
+                line-height: 1.4;
+                margin-bottom: 10px;
+            }
+
+            .team-workout-label {
+                color: #2f9e44;
+                font-size: 11px;
+                font-weight: 800;
+                text-transform: uppercase;
+                letter-spacing: .3px;
+            }
+
+            .team-workout-notes {
+                border-top: 1px solid #eef0ee;
+                margin-top: 12px;
+                padding-top: 10px;
+                color: #6b7280;
+                font-size: 12px;
+                line-height: 1.45;
+            }
+
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # =========================================================
+    # DARK HORSE ENDURANCE — TEAM-SPECIFIC CONCEPT THEME
+    # =========================================================
+    # Keep OLLU and Sam Houston on the normal VEKDYN light theme.
+    # Only the authenticated Dark Horse workspace receives this skin.
+    if active_team == "dark_horse_endurance":
+        st.markdown(
+            """
+            <style>
+            :root {
+                --dh-bg: #050506;
+                --dh-surface: #09090b;
+                --dh-card: #0d0d10;
+                --dh-card-soft: #111116;
+                --dh-border: #343038;
+                --dh-border-soft: #252329;
+                --dh-text: #f7f7f8;
+                --dh-muted: #aaa6b0;
+                --dh-purple: #9b4de4;
+                --dh-purple-bright: #b45cff;
+                --dh-purple-soft: #21112f;
+            }
 
 
-
-        /* App canvas */
-        .stApp,
-        [data-testid="stAppViewContainer"],
-        [data-testid="stMain"],
-        section.main {
+        /* Dark Horse top header */
+        [data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"] {
             background: var(--dh-bg) !important;
             color: var(--dh-text) !important;
         }
 
-        /* Sidebar from the approved concept */
-        [data-testid="stSidebar"] {
-            background: #050506 !important;
-            border-right: 1px solid var(--dh-border) !important;
-        }
-        [data-testid="stSidebar"] * {
-            color: var(--dh-text);
-        }
-        [data-testid="stSidebar"] hr {
-            border-color: var(--dh-border) !important;
-        }
-        [data-testid="stSidebar"] .stCaptionContainer,
-        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
-            color: var(--dh-muted) !important;
-        }
-        [data-testid="stSidebar"] div.stButton > button {
-            background: transparent !important;
-            color: var(--dh-text) !important;
-            border: 1px solid #48434d !important;
-            box-shadow: none !important;
-        }
-        [data-testid="stSidebar"] div.stButton > button:hover {
-            border-color: var(--dh-purple) !important;
-            color: #ffffff !important;
-        }
-        [data-testid="stSidebar"] div.stButton > button[kind="primary"],
-        [data-testid="stSidebar"] div.stButton > button[data-testid="baseButton-primary"] {
-            background: linear-gradient(135deg, #7131ad, #9b4de4) !important;
-            border-color: #8e45cf !important;
-            color: #ffffff !important;
-        }
-        /* Dark Horse athlete selector — robust across Streamlit/BaseWeb versions */
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] > div,
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"],
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
-        [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"],
-        [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
-            background: #ffffff !important;
-            background-color: #ffffff !important;
-            color: #111111 !important;
-            border-color: #9b4de4 !important;
+        header[data-testid="stHeader"] {
+            background: var(--dh-bg) !important;
         }
 
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
-        [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
-            border: 1px solid #9b4de4 !important;
-            border-radius: 10px !important;
-            box-shadow: none !important;
-        }
 
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] span,
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] input,
-        [data-testid="stSidebar"] .stSelectbox span,
-        [data-testid="stSidebar"] .stSelectbox input {
-            color: #111111 !important;
-            -webkit-text-fill-color: #111111 !important;
-            font-weight: 700 !important;
-        }
 
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] svg,
-        [data-testid="stSidebar"] .stSelectbox svg {
-            fill: #b45cff !important;
-            color: #b45cff !important;
-        }
+            /* App canvas */
+            .stApp,
+            [data-testid="stAppViewContainer"],
+            [data-testid="stMain"],
+            section.main {
+                background: var(--dh-bg) !important;
+                color: var(--dh-text) !important;
+            }
 
-        /* BaseWeb dropdown is mounted outside the sidebar DOM */
-        div[data-baseweb="popover"] > div,
-        div[data-baseweb="popover"] ul,
-        div[data-baseweb="menu"],
-        div[role="listbox"] {
-            background: #111116 !important;
-            background-color: #111116 !important;
-            color: #f7f7f8 !important;
-        }
+            /* Sidebar from the approved concept */
+            [data-testid="stSidebar"] {
+                background: #050506 !important;
+                border-right: 1px solid var(--dh-border) !important;
+            }
+            [data-testid="stSidebar"] * {
+                color: var(--dh-text);
+            }
+            [data-testid="stSidebar"] hr {
+                border-color: var(--dh-border) !important;
+            }
+            [data-testid="stSidebar"] .stCaptionContainer,
+            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+                color: var(--dh-muted) !important;
+            }
+            [data-testid="stSidebar"] div.stButton > button {
+                background: transparent !important;
+                color: var(--dh-text) !important;
+                border: 1px solid #48434d !important;
+                box-shadow: none !important;
+            }
+            [data-testid="stSidebar"] div.stButton > button:hover {
+                border-color: var(--dh-purple) !important;
+                color: #ffffff !important;
+            }
+            [data-testid="stSidebar"] div.stButton > button[kind="primary"],
+            [data-testid="stSidebar"] div.stButton > button[data-testid="baseButton-primary"] {
+                background: linear-gradient(135deg, #7131ad, #9b4de4) !important;
+                border-color: #8e45cf !important;
+                color: #ffffff !important;
+            }
+            /* Dark Horse athlete selector — robust across Streamlit/BaseWeb versions */
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] > div,
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"],
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+            [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"],
+            [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
+                background: #ffffff !important;
+                background-color: #ffffff !important;
+                color: #111111 !important;
+                border-color: #9b4de4 !important;
+            }
 
-        div[data-baseweb="popover"] li,
-        div[data-baseweb="menu"] li,
-        div[role="option"] {
-            background-color: #111116 !important;
-            color: #f7f7f8 !important;
-        }
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+            [data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
+                border: 1px solid #9b4de4 !important;
+                border-radius: 10px !important;
+                box-shadow: none !important;
+            }
 
-        div[data-baseweb="popover"] li:hover,
-        div[data-baseweb="menu"] li:hover,
-        div[role="option"]:hover {
-            background-color: #21112f !important;
-            color: #ffffff !important;
-        }
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] span,
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] input,
+            [data-testid="stSidebar"] .stSelectbox span,
+            [data-testid="stSidebar"] .stSelectbox input {
+                color: #111111 !important;
+                -webkit-text-fill-color: #111111 !important;
+                font-weight: 700 !important;
+            }
 
-        /* Strava link button under athlete selector */
-        [data-testid="stSidebar"] [data-testid="stLinkButton"] a,
-        [data-testid="stSidebar"] .stLinkButton a,
-        [data-testid="stSidebar"] a[data-testid="stBaseButton-secondary"] {
-            background: #111116 !important;
-            background-color: #111116 !important;
-            color: #f7f7f8 !important;
-            border: 1px solid #9b4de4 !important;
-            border-radius: 10px !important;
-            box-shadow: none !important;
-        }
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] svg,
+            [data-testid="stSidebar"] .stSelectbox svg {
+                fill: #b45cff !important;
+                color: #b45cff !important;
+            }
 
-        [data-testid="stSidebar"] [data-testid="stLinkButton"] a:hover,
-        [data-testid="stSidebar"] .stLinkButton a:hover,
-        [data-testid="stSidebar"] a[data-testid="stBaseButton-secondary"]:hover {
-            background: #21112f !important;
-            border-color: #b45cff !important;
-            color: #ffffff !important;
-        }
+            /* BaseWeb dropdown is mounted outside the sidebar DOM */
+            div[data-baseweb="popover"] > div,
+            div[data-baseweb="popover"] ul,
+            div[data-baseweb="menu"],
+            div[role="listbox"] {
+                background: #111116 !important;
+                background-color: #111116 !important;
+                color: #f7f7f8 !important;
+            }
 
-        /* Main content typography */
-        .main h1, .main h2, .main h3, .main h4,
-        [data-testid="stMain"] h1, [data-testid="stMain"] h2,
-        [data-testid="stMain"] h3, [data-testid="stMain"] h4,
-        .athlete-name, .notes-title, .team-workout-title,
-        .pb-time, .team-workout-type, .note-author {
-            color: var(--dh-text) !important;
-        }
-        [data-testid="stMain"] p,
-        [data-testid="stMain"] label,
-        [data-testid="stMain"] span,
-        [data-testid="stMain"] div {
-            border-color: inherit;
-        }
-        [data-testid="stMain"] .stCaptionContainer,
-        [data-testid="stMain"] .small-text,
-        [data-testid="stMain"] .pb-event,
-        [data-testid="stMain"] .notes-subtitle,
-        [data-testid="stMain"] .team-workout-subtitle,
-        [data-testid="stMain"] .team-workout-date,
-        [data-testid="stMain"] .note-time {
-            color: var(--dh-muted) !important;
-        }
+            div[data-baseweb="popover"] li,
+            div[data-baseweb="menu"] li,
+            div[role="option"] {
+                background-color: #111116 !important;
+                color: #f7f7f8 !important;
+            }
 
-        /* Distinct cards/panels — the key difference from a plain black mode */
-        [data-testid="stMain"] div[data-testid="stVerticalBlockBorderWrapper"] {
-            background: linear-gradient(180deg, var(--dh-card) 0%, #09090b 100%) !important;
-            border: 1px solid var(--dh-border) !important;
-            border-radius: 14px !important;
-            box-shadow: 0 8px 26px rgba(0,0,0,.18) !important;
-        }
-        .team-workout-card, .note-card {
-            background: var(--dh-card) !important;
-            border-color: var(--dh-border) !important;
-            box-shadow: none !important;
-        }
-        .note-card-athlete, .note-card-coach {
-            background: var(--dh-card-soft) !important;
-            border-color: var(--dh-border) !important;
-        }
-        .note-body, .team-workout-detail {
-            color: #ddd9e1 !important;
-        }
-        .team-workout-notes {
-            border-color: var(--dh-border-soft) !important;
-            color: var(--dh-muted) !important;
-        }
+            div[data-baseweb="popover"] li:hover,
+            div[data-baseweb="menu"] li:hover,
+            div[role="option"]:hover {
+                background-color: #21112f !important;
+                color: #ffffff !important;
+            }
 
-        /* Metrics */
-        [data-testid="stMetricValue"] {
-            color: var(--dh-text) !important;
-        }
-        [data-testid="stMetricLabel"] {
-            color: var(--dh-muted) !important;
-        }
+            /* Strava link button under athlete selector */
+            [data-testid="stSidebar"] [data-testid="stLinkButton"] a,
+            [data-testid="stSidebar"] .stLinkButton a,
+            [data-testid="stSidebar"] a[data-testid="stBaseButton-secondary"] {
+                background: #111116 !important;
+                background-color: #111116 !important;
+                color: #f7f7f8 !important;
+                border: 1px solid #9b4de4 !important;
+                border-radius: 10px !important;
+                box-shadow: none !important;
+            }
 
-        /* Dark Horse purple replaces green as the workspace accent,
-           while athlete status dots/badges can stay green. */
-        [data-testid="stMain"] a,
-        [data-testid="stMain"] .green-text,
-        .team-workout-label {
-            color: var(--dh-purple-bright) !important;
-        }
-        [data-testid="stMain"] div[role="radiogroup"] label,
-        [data-testid="stMain"] div[role="radiogroup"] label p,
-        [data-testid="stMain"] div[role="radiogroup"] label span {
-            color: #e8e5eb !important;
-        }
-        [data-testid="stMain"] div[role="radiogroup"] input:checked + div {
-            border-color: var(--dh-purple) !important;
-        }
+            [data-testid="stSidebar"] [data-testid="stLinkButton"] a:hover,
+            [data-testid="stSidebar"] .stLinkButton a:hover,
+            [data-testid="stSidebar"] a[data-testid="stBaseButton-secondary"]:hover {
+                background: #21112f !important;
+                border-color: #b45cff !important;
+                color: #ffffff !important;
+            }
 
-        /* Inputs and forms */
-        [data-testid="stMain"] input,
-        [data-testid="stMain"] textarea,
-        [data-testid="stMain"] [data-baseweb="select"] > div {
-            background: #111116 !important;
-            color: var(--dh-text) !important;
-            border-color: #49434f !important;
-        }
-        [data-testid="stMain"] input::placeholder,
-        [data-testid="stMain"] textarea::placeholder {
-            color: #77727d !important;
-        }
+            /* Main content typography */
+            .main h1, .main h2, .main h3, .main h4,
+            [data-testid="stMain"] h1, [data-testid="stMain"] h2,
+            [data-testid="stMain"] h3, [data-testid="stMain"] h4,
+            .athlete-name, .notes-title, .team-workout-title,
+            .pb-time, .team-workout-type, .note-author {
+                color: var(--dh-text) !important;
+            }
+            [data-testid="stMain"] p,
+            [data-testid="stMain"] label,
+            [data-testid="stMain"] span,
+            [data-testid="stMain"] div {
+                border-color: inherit;
+            }
+            [data-testid="stMain"] .stCaptionContainer,
+            [data-testid="stMain"] .small-text,
+            [data-testid="stMain"] .pb-event,
+            [data-testid="stMain"] .notes-subtitle,
+            [data-testid="stMain"] .team-workout-subtitle,
+            [data-testid="stMain"] .team-workout-date,
+            [data-testid="stMain"] .note-time {
+                color: var(--dh-muted) !important;
+            }
 
-        /* Main-area buttons: subtle dark by default, purple for primary actions */
-        [data-testid="stMain"] div.stButton > button,
-        [data-testid="stMain"] div.stDownloadButton > button {
-            background: #0f0f12 !important;
-            color: var(--dh-text) !important;
-            border: 1px solid #4a454f !important;
-            box-shadow: none !important;
-        }
-        [data-testid="stMain"] div.stButton > button:hover,
-        [data-testid="stMain"] div.stDownloadButton > button:hover {
-            border-color: var(--dh-purple) !important;
-        }
-        [data-testid="stMain"] div.stButton > button[kind="primary"],
-        [data-testid="stMain"] div.stButton > button[data-testid="baseButton-primary"] {
-            background: linear-gradient(135deg, #7131ad, #9b4de4) !important;
-            border-color: #9b4de4 !important;
-            color: #ffffff !important;
-        }
+            /* Distinct cards/panels — the key difference from a plain black mode */
+            [data-testid="stMain"] div[data-testid="stVerticalBlockBorderWrapper"] {
+                background: linear-gradient(180deg, var(--dh-card) 0%, #09090b 100%) !important;
+                border: 1px solid var(--dh-border) !important;
+                border-radius: 14px !important;
+                box-shadow: 0 8px 26px rgba(0,0,0,.18) !important;
+            }
+            .team-workout-card, .note-card {
+                background: var(--dh-card) !important;
+                border-color: var(--dh-border) !important;
+                box-shadow: none !important;
+            }
+            .note-card-athlete, .note-card-coach {
+                background: var(--dh-card-soft) !important;
+                border-color: var(--dh-border) !important;
+            }
+            .note-body, .team-workout-detail {
+                color: #ddd9e1 !important;
+            }
+            .team-workout-notes {
+                border-color: var(--dh-border-soft) !important;
+                color: var(--dh-muted) !important;
+            }
 
-        /* Alerts retain readability while fitting the Dark Horse palette */
-        [data-testid="stMain"] [data-testid="stAlert"] {
-            background: #15101d !important;
-            border: 1px solid #39274b !important;
-            color: #eee9f2 !important;
-        }
-        [data-testid="stMain"] [data-testid="stAlert"] * {
-            color: #eee9f2 !important;
-        }
+            /* Metrics */
+            [data-testid="stMetricValue"] {
+                color: var(--dh-text) !important;
+            }
+            [data-testid="stMetricLabel"] {
+                color: var(--dh-muted) !important;
+            }
 
-        /* Dividers and expanders */
-        [data-testid="stMain"] hr {
-            border-color: var(--dh-border-soft) !important;
-        }
-        [data-testid="stMain"] details {
-            background: var(--dh-card) !important;
-            border-color: var(--dh-border) !important;
-        }
+            /* Dark Horse purple replaces green as the workspace accent,
+               while athlete status dots/badges can stay green. */
+            [data-testid="stMain"] a,
+            [data-testid="stMain"] .green-text,
+            .team-workout-label {
+                color: var(--dh-purple-bright) !important;
+            }
+            [data-testid="stMain"] div[role="radiogroup"] label,
+            [data-testid="stMain"] div[role="radiogroup"] label p,
+            [data-testid="stMain"] div[role="radiogroup"] label span {
+                color: #e8e5eb !important;
+            }
+            [data-testid="stMain"] div[role="radiogroup"] input:checked + div {
+                border-color: var(--dh-purple) !important;
+            }
 
-        /* Keep the active badge from the original VEKDYN athlete card. */
-        .active-badge {
-            background-color: #14381d !important;
-            color: #7ee294 !important;
-        }
+            /* Inputs and forms */
+            [data-testid="stMain"] input,
+            [data-testid="stMain"] textarea,
+            [data-testid="stMain"] [data-baseweb="select"] > div {
+                background: #111116 !important;
+                color: var(--dh-text) !important;
+                border-color: #49434f !important;
+            }
+            [data-testid="stMain"] input::placeholder,
+            [data-testid="stMain"] textarea::placeholder {
+                color: #77727d !important;
+            }
+
+            /* Main-area buttons: subtle dark by default, purple for primary actions */
+            [data-testid="stMain"] div.stButton > button,
+            [data-testid="stMain"] div.stDownloadButton > button {
+                background: #0f0f12 !important;
+                color: var(--dh-text) !important;
+                border: 1px solid #4a454f !important;
+                box-shadow: none !important;
+            }
+            [data-testid="stMain"] div.stButton > button:hover,
+            [data-testid="stMain"] div.stDownloadButton > button:hover {
+                border-color: var(--dh-purple) !important;
+            }
+            [data-testid="stMain"] div.stButton > button[kind="primary"],
+            [data-testid="stMain"] div.stButton > button[data-testid="baseButton-primary"] {
+                background: linear-gradient(135deg, #7131ad, #9b4de4) !important;
+                border-color: #9b4de4 !important;
+                color: #ffffff !important;
+            }
+
+            /* Alerts retain readability while fitting the Dark Horse palette */
+            [data-testid="stMain"] [data-testid="stAlert"] {
+                background: #15101d !important;
+                border: 1px solid #39274b !important;
+                color: #eee9f2 !important;
+            }
+            [data-testid="stMain"] [data-testid="stAlert"] * {
+                color: #eee9f2 !important;
+            }
+
+            /* Dividers and expanders */
+            [data-testid="stMain"] hr {
+                border-color: var(--dh-border-soft) !important;
+            }
+            [data-testid="stMain"] details {
+                background: var(--dh-card) !important;
+                border-color: var(--dh-border) !important;
+            }
+
+            /* Keep the active badge from the original VEKDYN athlete card. */
+            .active-badge {
+                background-color: #14381d !important;
+                color: #7ee294 !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # =========================================================
+    # EMPTY TEAM ROSTER
+    # =========================================================
+
+    if not athletes:
+        with st.sidebar:
+            st.markdown(
+                "## VEK<span style='color:#2f9e44'>DYN</span>",
+                unsafe_allow_html=True,
+            )
+            st.success("▣ Dashboard")
+            st.divider()
+            st.caption(active_team_config["name"])
+            st.info("Roster pending")
+
+            if st.button(
+                    "Log Out",
+                    key=f"empty_roster_logout_{active_team}",
+                    use_container_width=True,
+            ):
+                log_out()
+
+        st.markdown(f"# {active_team_config['name']}")
+        st.markdown("## Team Dashboard")
+        st.info(
+            "No athletes have been added to this roster yet. "
+            "When the coach sends the roster, add it to the Sam Houston roster "
+            "source and this same VEKDYN dashboard will populate automatically."
+        )
+
+        status_col1, status_col2, status_col3 = st.columns(3)
+
+        with status_col1:
+            st.metric("Athletes", "0")
+
+        with status_col2:
+            st.metric("Team", active_team_config["short_name"])
+
+        with status_col3:
+            st.metric("Workspace", "Ready")
+
+        st.caption(
+            "This team's login, roster, and workspace are isolated from OLLU."
+        )
+        st.stop()
+
+    # =========================================================
+    # COMPACT COACH WORKSPACE HEADER + ATHLETE SELECTION
+    # =========================================================
+
+    # The refreshed Coach Hub uses one compact workspace instead of the old
+    # left navigation rail. Team branding is still controlled by the existing
+    # team-specific CSS; this block changes layout only.
+    st.markdown(
+        """
+        <style>
+            [data-testid="stSidebar"] { display: none !important; }
+            .block-container { max-width: 1500px; padding-top: 1.15rem; padding-bottom: 5.5rem; }
+            .coach-kicker { font-size: 13px; opacity: .72; margin-bottom: 2px; }
+            .coach-greeting { font-size: 26px; font-weight: 760; line-height: 1.1; margin-bottom: 2px; }
+            .coach-team { font-size: 13px; opacity: .72; }
+            .compact-section-title { font-size: 20px; font-weight: 760; margin: 0 0 2px 0; }
+            .compact-section-subtitle { font-size: 12px; opacity: .72; margin-bottom: 8px; }
+            .bottom-nav-spacer { height: 8px; }
+            div[data-testid="stHorizontalBlock"]:has(.bottom-nav-anchor) {
+                position: sticky; bottom: 0; z-index: 999; padding: 8px 0 6px 0;
+                backdrop-filter: blur(10px);
+            }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-# =========================================================
-# EMPTY TEAM ROSTER
-# =========================================================
+    if "dashboard_view" not in st.session_state:
+        st.session_state["dashboard_view"] = "Dashboard"
 
-if not athletes:
-    with st.sidebar:
+    # Normalize old view names from previous Coach Hub builds.
+    _view_aliases = {
+        "Notes": "Dashboard",
+        "Recovery": "Dashboard",
+        "Performance": "Predictor",
+    }
+    st.session_state["dashboard_view"] = _view_aliases.get(
+        st.session_state.get("dashboard_view", "Dashboard"),
+        st.session_state.get("dashboard_view", "Dashboard"),
+    )
+    dashboard_view = st.session_state.get("dashboard_view", "Dashboard")
+
+    # Keep the selected athlete stable across reruns/OAuth returns.
+    athlete_options = list(athletes.keys())
+    saved_athlete = st.session_state.get("selected_athlete_key")
+    if saved_athlete not in athlete_options:
+        saved_athlete = athlete_options[0]
+
+    current_hour = datetime.now(ZoneInfo("America/Chicago")).hour
+    if current_hour < 12:
+        greeting = "Good morning"
+    elif current_hour < 17:
+        greeting = "Good afternoon"
+    else:
+        greeting = "Good evening"
+
+    header_left, header_mid, header_right = st.columns([4.5, 1.5, 2.2], vertical_alignment="center")
+    with header_left:
         st.markdown(
-            "## VEK<span style='color:#2f9e44'>DYN</span>",
+            f'<div class="coach-greeting">{greeting}, Coach</div>'
+            f'<div class="coach-team">{html.escape(active_team_config["name"])}</div>'
+            + ('<div style="display:inline-block;margin-top:6px;padding:3px 8px;border-radius:999px;background:#e8f5e9;color:#187a35;font-size:11px;font-weight:800;">PUBLIC DEMO</div>' if active_team == DEMO_TEAM_ID else ''),
             unsafe_allow_html=True,
         )
-        st.success("▣ Dashboard")
-        st.divider()
-        st.caption(active_team_config["name"])
-        st.info("Roster pending")
-
-        if st.button(
-                "Log Out",
-                key=f"empty_roster_logout_{active_team}",
-                use_container_width=True,
-        ):
-            log_out()
-
-    st.markdown(f"# {active_team_config['name']}")
-    st.markdown("## Team Dashboard")
-    st.info(
-        "No athletes have been added to this roster yet. "
-        "When the coach sends the roster, add it to the Sam Houston roster "
-        "source and this same VEKDYN dashboard will populate automatically."
-    )
-
-    status_col1, status_col2, status_col3 = st.columns(3)
-
-    with status_col1:
-        st.metric("Athletes", "0")
-
-    with status_col2:
-        st.metric("Team", active_team_config["short_name"])
-
-    with status_col3:
-        st.metric("Workspace", "Ready")
-
-    st.caption(
-        "This team's login, roster, and workspace are isolated from OLLU."
-    )
-    st.stop()
-
-# =========================================================
-# COMPACT COACH WORKSPACE HEADER + ATHLETE SELECTION
-# =========================================================
-
-# The refreshed Coach Hub uses one compact workspace instead of the old
-# left navigation rail. Team branding is still controlled by the existing
-# team-specific CSS; this block changes layout only.
-st.markdown(
-    """
-    <style>
-        [data-testid="stSidebar"] { display: none !important; }
-        .block-container { max-width: 1500px; padding-top: 1.15rem; padding-bottom: 5.5rem; }
-        .coach-kicker { font-size: 13px; opacity: .72; margin-bottom: 2px; }
-        .coach-greeting { font-size: 26px; font-weight: 760; line-height: 1.1; margin-bottom: 2px; }
-        .coach-team { font-size: 13px; opacity: .72; }
-        .compact-section-title { font-size: 20px; font-weight: 760; margin: 0 0 2px 0; }
-        .compact-section-subtitle { font-size: 12px; opacity: .72; margin-bottom: 8px; }
-        .bottom-nav-spacer { height: 8px; }
-        div[data-testid="stHorizontalBlock"]:has(.bottom-nav-anchor) {
-            position: sticky; bottom: 0; z-index: 999; padding: 8px 0 6px 0;
-            backdrop-filter: blur(10px);
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-if "dashboard_view" not in st.session_state:
-    st.session_state["dashboard_view"] = "Dashboard"
-
-# Normalize old view names from previous Coach Hub builds.
-_view_aliases = {
-    "Notes": "Dashboard",
-    "Recovery": "Dashboard",
-    "Performance": "Predictor",
-}
-st.session_state["dashboard_view"] = _view_aliases.get(
-    st.session_state.get("dashboard_view", "Dashboard"),
-    st.session_state.get("dashboard_view", "Dashboard"),
-)
-dashboard_view = st.session_state.get("dashboard_view", "Dashboard")
-
-# Keep the selected athlete stable across reruns/OAuth returns.
-athlete_options = list(athletes.keys())
-saved_athlete = st.session_state.get("selected_athlete_key")
-if saved_athlete not in athlete_options:
-    saved_athlete = athlete_options[0]
-
-current_hour = datetime.now(ZoneInfo("America/Chicago")).hour
-if current_hour < 12:
-    greeting = "Good morning"
-elif current_hour < 17:
-    greeting = "Good afternoon"
-else:
-    greeting = "Good evening"
-
-header_left, header_mid, header_right = st.columns([4.5, 1.5, 2.2], vertical_alignment="center")
-with header_left:
-    st.markdown(
-        f'<div class="coach-greeting">{greeting}, Coach</div>'
-        f'<div class="coach-team">{html.escape(active_team_config["name"])}</div>'
-        + ('<div style="display:inline-block;margin-top:6px;padding:3px 8px;border-radius:999px;background:#e8f5e9;color:#187a35;font-size:11px;font-weight:800;">PUBLIC DEMO</div>' if active_team == DEMO_TEAM_ID else ''),
-        unsafe_allow_html=True,
-    )
-with header_mid:
-    st.caption(datetime.now(ZoneInfo("America/Chicago")).strftime("%a %b %-d, %Y"))
-with header_right:
-    athlete_key = st.selectbox(
-        "Viewing athlete",
-        options=athlete_options,
-        index=athlete_options.index(saved_athlete),
-        format_func=lambda key: athletes[key]["profile"]["name"],
-        key="compact_athlete_selector",
-        label_visibility="collapsed",
-    )
-    st.session_state["selected_athlete_key"] = athlete_key
-
-# Connection-status keys are preserved even though activity polling is disabled.
-selected_sidebar_athlete = athletes[athlete_key]
-selected_sidebar_profile = selected_sidebar_athlete["profile"]
-athlete_name_for_button = selected_sidebar_profile.get("name", "Athlete")
-athlete_first_name = athlete_name_for_button.split()[0]
-weekly_session_key = f"{athlete_key}_strava_weekly"
-heart_session_key = f"{athlete_key}_strava_heart_rate"
-message_session_key = f"strava_message_{athlete_key}"
-error_session_key = f"strava_error_{athlete_key}"
-coros_message_key = f"coros_message_{athlete_key}"
-coros_error_key = f"coros_error_{athlete_key}"
-
-# Never display stale Strava activity cache while VEKDYN is in webhook transition.
-st.session_state.pop(weekly_session_key, None)
-st.session_state.pop(heart_session_key, None)
-
-# =========================================================
-# FAST DASHBOARD READ CACHE
-# =========================================================
-# Streamlit reruns the script when a navigation button is clicked. Cache the
-# small COROS reads briefly so switching Dashboard / Training / Predictor /
-# Profile does not reopen Neon multiple times for unchanged data.
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_coros_is_connected(athlete_key):
-    return coros_is_connected(athlete_key)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_latest_coros_recovery(athlete_key):
-    return load_latest_coros_recovery(athlete_key)
-
-
-# =========================================================
-# SELECTED ATHLETE DATA
-# =========================================================
-
-athlete = athletes[athlete_key]
-profile = athlete["profile"]
-# Define the selected athlete name before any focused view is rendered.
-# This keeps Notes (and other focused pages) from depending on the Profile view
-# having run first.
-athlete_name = profile.get("name", "Unknown Athlete")
-personal_bests = athlete.get("pbs", {})
-xc_results = athlete.get("xc_results", {})
-training = athlete.get("training", {})
-recovery = athlete.get(
-    "recovery",
-    training.get("recovery", {}),
-)
-
-if active_team == DEMO_TEAM_ID:
-    # Polished sample recovery snapshot for the sales demo only.
-    coros_recovery = {
-        "sleep_hr_avg": 48, "sleep_minutes": 492, "sleep_score": 91,
-        "hrv_avg": 78, "hrv_baseline": 75, "recovery_score": 92,
-    }
-else:
-    try:
-        # Only the main Dashboard needs recovery cards. Other views should not
-        # pay for COROS/Neon reads just because Streamlit reran during navigation.
-        coros_recovery = (
-            cached_latest_coros_recovery(athlete_key)
-            if dashboard_view in {"Dashboard", "Training"} and cached_coros_is_connected(athlete_key)
-            else {}
+    with header_mid:
+        st.caption(datetime.now(ZoneInfo("America/Chicago")).strftime("%a %b %-d, %Y"))
+    with header_right:
+        athlete_key = st.selectbox(
+            "Viewing athlete",
+            options=athlete_options,
+            index=athlete_options.index(saved_athlete),
+            format_func=lambda key: athletes[key]["profile"]["name"],
+            key="compact_athlete_selector",
+            label_visibility="collapsed",
         )
-    except Exception:
-        coros_recovery = {}
-threshold_lactate = athlete.get(
-    "threshold_lactate",
-    training.get("threshold_lactate", {}),
-)
+        st.session_state["selected_athlete_key"] = athlete_key
 
-# =========================================================
-# CHOOSE THE TRAINING DATA SOURCE
-# =========================================================
+    # Connection-status keys are preserved even though activity polling is disabled.
+    selected_sidebar_athlete = athletes[athlete_key]
+    selected_sidebar_profile = selected_sidebar_athlete["profile"]
+    athlete_name_for_button = selected_sidebar_profile.get("name", "Athlete")
+    athlete_first_name = athlete_name_for_button.split()[0]
+    weekly_session_key = f"{athlete_key}_strava_weekly"
+    heart_session_key = f"{athlete_key}_strava_heart_rate"
+    message_session_key = f"strava_message_{athlete_key}"
+    error_session_key = f"strava_error_{athlete_key}"
+    coros_message_key = f"coros_message_{athlete_key}"
+    coros_error_key = f"coros_error_{athlete_key}"
 
-dictionary_volume = dictionary_weekly_mileage(training)
-volume_data = dictionary_volume
-volume_source = "No live data"
-
-weekly_session_key = f"{athlete_key}_strava_weekly"
-heart_session_key = f"{athlete_key}_strava_heart_rate"
-
-# Refresh the selected athlete's Strava summary on Dashboard/Training. The
-# request itself is cached for 15 minutes by get_strava_training_data().
-if active_team != DEMO_TEAM_ID and dashboard_view in {"Dashboard", "Training"}:
-    try:
-        if strava_is_connected(athlete_key):
-            strava_token = get_valid_strava_token(athlete_key)
-            if strava_token:
-                fresh_volume, fresh_heart = get_strava_training_data(strava_token, 8)
-                st.session_state[weekly_session_key] = fresh_volume
-                st.session_state[heart_session_key] = fresh_heart
-    except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
-        # Preserve the last successful cached/session data if Strava is briefly unavailable.
-        st.session_state.setdefault(f"{athlete_key}_strava_sync_error", str(error))
-
-if weekly_session_key in st.session_state:
-    strava_volume = st.session_state[weekly_session_key]
-    if not strava_volume.empty:
-        volume_data = strava_volume
-        volume_source = "Live Strava data"
-
-live_heart_rate = st.session_state.get(heart_session_key, {})
-if active_team == DEMO_TEAM_ID:
-    live_heart_rate = {"max_heart_rate": 194, "max_heart_rate_date": "Sep 2026"}
-    volume_source = "VEKDYN demo data"
-
-# =========================================================
-# ATHLETE PROFILE PHOTOS
-# =========================================================
-
-ATHLETE_PHOTO_DIR = Path(__file__).parent / "athlete_photos"
+    # Keep the most recently loaded Strava summary in this coach session.
+    # Tab navigation reruns Streamlit, so deleting these values here forced VEKDYN
+    # to rebuild the same summary and also made Athlete Profile lose Max HR.
+    # =========================================================
+    # FAST DASHBOARD READ CACHE
+    # =========================================================
+    # Streamlit reruns the script when a navigation button is clicked. Cache the
+    # small COROS reads briefly so switching Dashboard / Training / Predictor /
+    # Profile does not reopen Neon multiple times for unchanged data.
+    @st.cache_data(ttl=60, show_spinner=False)
+    def cached_coros_is_connected(athlete_key):
+        return coros_is_connected(athlete_key)
 
 
-def get_athlete_photo(athlete_key):
-    """
-    Find an athlete's profile photo inside athlete_photos.
-
-    Example:
-        athlete_photos/diego.jpeg
-        athlete_photos/isai.jpeg
-    """
-
-    clean_key = athlete_key.strip().lower()
-
-    for extension in [".jpeg", ".jpg", ".png"]:
-        photo_path = ATHLETE_PHOTO_DIR / f"{clean_key}{extension}"
-
-        if photo_path.exists():
-            return photo_path
-
-    return None
+    @st.cache_data(ttl=60, show_spinner=False)
+    def cached_latest_coros_recovery(athlete_key):
+        return load_latest_coros_recovery(athlete_key)
 
 
-def render_circular_athlete_photo(photo_path, alt_text="Athlete profile photo"):
-    """Render a local athlete image as a true circle without changing the file."""
-    mime = "image/png" if photo_path.suffix.lower() == ".png" else "image/jpeg"
-    encoded = base64.b64encode(photo_path.read_bytes()).decode("utf-8")
-    st.markdown(
-        f'<img class="athlete-photo-circle" src="data:{mime};base64,{encoded}" alt="{alt_text}">',
-        unsafe_allow_html=True,
+    # =========================================================
+    # SELECTED ATHLETE DATA
+    # =========================================================
+
+    athlete = athletes[athlete_key]
+    profile = athlete["profile"]
+    # Define the selected athlete name before any focused view is rendered.
+    # This keeps Notes (and other focused pages) from depending on the Profile view
+    # having run first.
+    athlete_name = profile.get("name", "Unknown Athlete")
+    personal_bests = athlete.get("pbs", {})
+    xc_results = athlete.get("xc_results", {})
+    training = athlete.get("training", {})
+    recovery = athlete.get(
+        "recovery",
+        training.get("recovery", {}),
     )
 
-
-if dashboard_view == "Profile":
-    # =========================================================
-    # PROFILE DATA
-    # =========================================================
-
-    athlete_name = profile.get("name", "Unknown Athlete")
-    school = profile.get("school", "School not available")
-    athlete_class = profile.get("class", "Class not available")
-
-    initials = "".join(
-        word[0] for word in athlete_name.split()[:2]
-    ).upper()
-
-    athlete_photo = get_athlete_photo(athlete_key)
-
-    with st.container(border=True):
-
-        photo_col, athlete_col, school_col = st.columns([1, 4, 1.5])
-
-        # -----------------------------------------------------
-        # ATHLETE PHOTO
-        # -----------------------------------------------------
-
-        with photo_col:
-
-            if athlete_photo is not None:
-
-                render_circular_athlete_photo(
-                    athlete_photo,
-                    alt_text=f"{athlete_name} profile photo",
-                )
-
-            else:
-
-                st.markdown(
-                    f'<div class="profile-circle">{initials}</div>',
-                    unsafe_allow_html=True
-                )
-
-        # -----------------------------------------------------
-        # ATHLETE INFORMATION
-        # -----------------------------------------------------
-
-        with athlete_col:
-
-            st.markdown(
-                f'<span class="athlete-name">{athlete_name}</span>&nbsp;&nbsp;'
-                '<span class="active-badge">Active</span>',
-                unsafe_allow_html=True,
+    if active_team == DEMO_TEAM_ID:
+        # Polished sample recovery snapshot for the sales demo only.
+        coros_recovery = {
+            "sleep_hr_avg": 48, "sleep_minutes": 492, "sleep_score": 91,
+            "hrv_avg": 78, "hrv_baseline": 75, "recovery_score": 92,
+        }
+    else:
+        try:
+            # Only the main Dashboard needs recovery cards. Other views should not
+            # pay for COROS/Neon reads just because Streamlit reran during navigation.
+            coros_recovery = (
+                cached_latest_coros_recovery(athlete_key)
+                if dashboard_view in {"Dashboard", "Training"} and cached_coros_is_connected(athlete_key)
+                else {}
             )
+        except Exception:
+            coros_recovery = {}
+    threshold_lactate = athlete.get(
+        "threshold_lactate",
+        training.get("threshold_lactate", {}),
+    )
 
-            st.write(
-                f"**{athlete_class}**  •  🟢 Distance"
-            )
-
-            st.caption(
-                "5'9\"  •  150 lbs  •  San Antonio, TX"
-            )
-
-        # -----------------------------------------------------
-        # SCHOOL LOGO
-        # -----------------------------------------------------
-
-        with school_col:
-
-            school_logo = get_team_logo(active_team)
-
-            if school_logo is not None:
-
-                # Make the school mark fill most of the athlete-header height.
-                # For a truly background-free logo, use a transparent PNG
-                # in team_images; CSS cannot remove white pixels baked into
-                # the source image.
-                st.markdown(
-                    """
-                    <style>
-                        div[data-testid="stImage"] img {
-                            max-height: 145px;
-                            width: auto;
-                            object-fit: contain;
-                        }
-                    </style>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                st.image(
-                    str(school_logo),
-                    use_container_width=True,
-                )
-
-            else:
-
-                st.markdown(
-                    f"""
-                    <div style="
-                        font-size:28px;
-                        font-weight:800;
-                        color:#111827;
-                        text-align:center;
-                    ">
-                        {school}
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-if dashboard_view == "Profile":
     # =========================================================
-    # PERFORMANCE BESTS AND DATA SOURCE
+    # CHOOSE THE TRAINING DATA SOURCE
     # =========================================================
 
-    pb_card, source_card = st.columns([2, 1])
+    dictionary_volume = dictionary_weekly_mileage(training)
+    volume_data = dictionary_volume
+    volume_source = "No live data"
 
-    with pb_card:
+    weekly_session_key = f"{athlete_key}_strava_weekly"
+    heart_session_key = f"{athlete_key}_strava_heart_rate"
+
+    # Load Strava only when the active view needs a summary that is not already
+    # present in this coach session. This keeps tab changes fast while still letting
+    # Athlete Profile populate Max HR even when Profile is opened first.
+    needs_strava_volume = (
+        dashboard_view == "Dashboard"
+        and weekly_session_key not in st.session_state
+    )
+    needs_strava_heart = (
+        dashboard_view in {"Dashboard", "Profile"}
+        and heart_session_key not in st.session_state
+    )
+
+    if active_team != DEMO_TEAM_ID and (needs_strava_volume or needs_strava_heart):
+        try:
+            if strava_is_connected(athlete_key):
+                strava_token = get_valid_strava_token(athlete_key)
+                if strava_token:
+                    fresh_volume, fresh_heart = get_strava_training_data(strava_token, 8)
+                    st.session_state[weekly_session_key] = fresh_volume
+                    st.session_state[heart_session_key] = fresh_heart
+        except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
+            # Preserve the last successful session data if Strava is briefly unavailable.
+            st.session_state.setdefault(f"{athlete_key}_strava_sync_error", str(error))
+
+    if weekly_session_key in st.session_state:
+        strava_volume = st.session_state[weekly_session_key]
+        if not strava_volume.empty:
+            volume_data = strava_volume
+            volume_source = "Live Strava data"
+
+    live_heart_rate = st.session_state.get(heart_session_key, {})
+    if active_team == DEMO_TEAM_ID:
+        live_heart_rate = {"max_heart_rate": 194, "max_heart_rate_date": "Sep 2026"}
+        volume_source = "VEKDYN demo data"
+
+    # =========================================================
+    # ATHLETE PROFILE PHOTOS
+    # =========================================================
+
+    ATHLETE_PHOTO_DIR = Path(__file__).parent / "athlete_photos"
+
+
+    def get_athlete_photo(athlete_key):
+        """
+        Find an athlete's profile photo inside athlete_photos.
+
+        Example:
+            athlete_photos/diego.jpeg
+            athlete_photos/isai.jpeg
+        """
+
+        clean_key = athlete_key.strip().lower()
+
+        for extension in [".jpeg", ".jpg", ".png"]:
+            photo_path = ATHLETE_PHOTO_DIR / f"{clean_key}{extension}"
+
+            if photo_path.exists():
+                return photo_path
+
+        return None
+
+
+    def render_circular_athlete_photo(photo_path, alt_text="Athlete profile photo"):
+        """Render a local athlete image as a true circle without changing the file."""
+        mime = "image/png" if photo_path.suffix.lower() == ".png" else "image/jpeg"
+        encoded = base64.b64encode(photo_path.read_bytes()).decode("utf-8")
+        st.markdown(
+            f'<img class="athlete-photo-circle" src="data:{mime};base64,{encoded}" alt="{alt_text}">',
+            unsafe_allow_html=True,
+        )
+
+
+    if dashboard_view == "Profile":
+        # =========================================================
+        # PROFILE DATA
+        # =========================================================
+
+        athlete_name = profile.get("name", "Unknown Athlete")
+        school = profile.get("school", "School not available")
+        athlete_class = profile.get("class", "Class not available")
+
+        initials = "".join(
+            word[0] for word in athlete_name.split()[:2]
+        ).upper()
+
+        athlete_photo = get_athlete_photo(athlete_key)
+
         with st.container(border=True):
-            st.subheader("Performance Bests")
-            performance_view = st.radio(
-                "Performance type",
-                options=["Track", "Cross Country"],
-                horizontal=True,
-                key=f"performance_view_{athlete_key}",
-                label_visibility="collapsed",
-            )
 
-            if performance_view == "Track":
-                if personal_bests:
-                    pb_columns = st.columns(len(personal_bests))
-                    for column, event in zip(pb_columns, personal_bests):
+            photo_col, athlete_col, school_col = st.columns([1, 4, 1.5])
+
+            # -----------------------------------------------------
+            # ATHLETE PHOTO
+            # -----------------------------------------------------
+
+            with photo_col:
+
+                if athlete_photo is not None:
+
+                    render_circular_athlete_photo(
+                        athlete_photo,
+                        alt_text=f"{athlete_name} profile photo",
+                    )
+
+                else:
+
+                    st.markdown(
+                        f'<div class="profile-circle">{initials}</div>',
+                        unsafe_allow_html=True
+                    )
+
+            # -----------------------------------------------------
+            # ATHLETE INFORMATION
+            # -----------------------------------------------------
+
+            with athlete_col:
+
+                st.markdown(
+                    f'<span class="athlete-name">{athlete_name}</span>&nbsp;&nbsp;'
+                    '<span class="active-badge">Active</span>',
+                    unsafe_allow_html=True,
+                )
+
+                st.write(
+                    f"**{athlete_class}**  •  🟢 Distance"
+                )
+
+                st.caption(
+                    "5'9\"  •  150 lbs  •  San Antonio, TX"
+                )
+
+            # -----------------------------------------------------
+            # SCHOOL LOGO
+            # -----------------------------------------------------
+
+            with school_col:
+
+                school_logo = get_team_logo(active_team)
+
+                if school_logo is not None:
+
+                    # Make the school mark fill most of the athlete-header height.
+                    # For a truly background-free logo, use a transparent PNG
+                    # in team_images; CSS cannot remove white pixels baked into
+                    # the source image.
+                    st.markdown(
+                        """
+                        <style>
+                            div[data-testid="stImage"] img {
+                                max-height: 145px;
+                                width: auto;
+                                object-fit: contain;
+                            }
+                        </style>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    st.image(
+                        str(school_logo),
+                        use_container_width=True,
+                    )
+
+                else:
+
+                    st.markdown(
+                        f"""
+                        <div style="
+                            font-size:28px;
+                            font-weight:800;
+                            color:#111827;
+                            text-align:center;
+                        ">
+                            {school}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+    if dashboard_view == "Profile":
+        # =========================================================
+        # PERFORMANCE BESTS AND DATA SOURCE
+        # =========================================================
+
+        if True:
+            with st.container(border=True):
+                st.subheader("Performance Bests")
+                performance_view = st.radio(
+                    "Performance type",
+                    options=["Track", "Cross Country"],
+                    horizontal=True,
+                    key=f"performance_view_{athlete_key}",
+                    label_visibility="collapsed",
+                )
+
+                if performance_view == "Track":
+                    if personal_bests:
+                        pb_columns = st.columns(len(personal_bests))
+                        for column, event in zip(pb_columns, personal_bests):
+                            with column:
+                                st.markdown(
+                                    f"""
+                                    <div class="pb-event">{event.upper()}</div>
+                                    <div class="pb-time">{personal_bests[event]}</div>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+                    else:
+                        st.info("No track performance bests have been entered.")
+
+                else:
+                    xc_columns = st.columns(2)
+                    for column, event in zip(xc_columns, ["8k", "10k"]):
+                        result = primary_xc_result(xc_results, event)
+                        result_details = result["meet"]
+                        if result["date"]:
+                            result_details = f'{result_details} • {result["date"]}'
+
                         with column:
                             st.markdown(
                                 f"""
-                                <div class="pb-event">{event.upper()}</div>
-                                <div class="pb-time">{personal_bests[event]}</div>
-                                <div class="green-text">Watch Race ↗</div>
+                                <div class="pb-event">{event.upper()} XC</div>
+                                <div class="pb-time">{result["time"]}</div>
+                                <div class="small-text">{result_details}</div>
                                 """,
                                 unsafe_allow_html=True,
                             )
+
+                    all_xc_rows = []
+                    for event in ["8k", "10k"]:
+                        for result in get_xc_results_for_event(xc_results, event):
+                            all_xc_rows.append(
+                                {
+                                    "Event": event.upper(),
+                                    "Time": result.get("time", "--"),
+                                    "Meet": result.get("meet", ""),
+                                    "Date": result.get("date", ""),
+                                }
+                            )
+
+                    if all_xc_rows:
+                        with st.expander("View all XC results"):
+                            st.dataframe(
+                                pd.DataFrame(all_xc_rows),
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+                    else:
+                        st.caption("No XC 8K or 10K PB is entered in ollu_roster_csv.")
+
+    if dashboard_view == "Training":
+        # =========================================================
+        # WEEKLY TRAINING VOLUME + HEART RATE & RECOVERY
+        # =========================================================
+
+        if True:
+            with st.container(border=True):
+                st.subheader("Weekly Training Volume")
+
+                if volume_data.empty:
+                    st.info("No weekly training data is available.")
                 else:
-                    st.info("No track performance bests have been entered.")
+                    current_volume = float(volume_data["Mileage"].iloc[-1])
+                    previous_volume = (
+                        float(volume_data["Mileage"].iloc[-2])
+                        if len(volume_data) > 1
+                        else current_volume
+                    )
+                    volume_change = current_volume - previous_volume
 
-            else:
-                xc_columns = st.columns(2)
-                for column, event in zip(xc_columns, ["8k", "10k"]):
-                    result = primary_xc_result(xc_results, event)
-                    result_details = result["meet"]
-                    if result["date"]:
-                        result_details = f'{result_details} • {result["date"]}'
+                    number_col, graph_col = st.columns([1, 3])
 
-                    with column:
-                        st.markdown(
-                            f"""
-                            <div class="pb-event">{event.upper()} XC</div>
-                            <div class="pb-time">{result["time"]}</div>
-                            <div class="small-text">{result_details}</div>
-                            """,
-                            unsafe_allow_html=True,
+                    with number_col:
+                        st.metric(
+                            label="This Week",
+                            value=f"{current_volume:.1f} mi",
+                            delta=f"{volume_change:+.1f} mi",
                         )
+                        st.caption(f"Source: {volume_source}")
 
-                all_xc_rows = []
-                for event in ["8k", "10k"]:
-                    for result in get_xc_results_for_event(xc_results, event):
-                        all_xc_rows.append(
-                            {
-                                "Event": event.upper(),
-                                "Time": result.get("time", "--"),
-                                "Meet": result.get("meet", ""),
-                                "Date": result.get("date", ""),
-                            }
+                        if volume_source == "Live Strava data":
+                            st.markdown(
+                                "<span class='green-text'>● Strava</span>",
+                                unsafe_allow_html=True,
+                            )
+
+                    with graph_col:
+                        chart_data = volume_data.copy()
+                        chart_data["Mileage"] = pd.to_numeric(chart_data["Mileage"], errors="coerce").fillna(0.0)
+                        chart_data["Order"] = range(len(chart_data))
+                        mileage_chart = (
+                            alt.Chart(chart_data)
+                            .mark_line(point=True, strokeWidth=3)
+                            .encode(
+                                x=alt.X("Week:N", sort=alt.SortField("Order"), title="Week"),
+                                y=alt.Y("Mileage:Q", title="Miles", scale=alt.Scale(zero=True)),
+                                tooltip=[alt.Tooltip("Week:N"), alt.Tooltip("Mileage:Q", format=".1f")],
+                            )
+                            .properties(height=230)
                         )
+                        st.altair_chart(mileage_chart, use_container_width=True)
 
-                if all_xc_rows:
-                    with st.expander("View all XC results"):
-                        st.dataframe(
-                            pd.DataFrame(all_xc_rows),
-                            hide_index=True,
-                            use_container_width=True,
-                        )
-                else:
-                    st.caption("No XC 8K or 10K PB is entered in ollu_roster_csv.")
-
-    with source_card:
-        with st.container(border=True):
-            st.subheader("Heart Rate Benchmark")
-            max_observed_hr = live_heart_rate.get(
-                "max_heart_rate",
-                recovery.get("max_observed_heart_rate", "--"),
-            )
-            max_hr_date = live_heart_rate.get(
-                "max_heart_rate_date",
-                recovery.get("max_heart_rate_date", "Not available"),
-            )
-            st.metric("8-Week Max Observed HR", f"{max_observed_hr} bpm")
-            st.caption(f"Recorded: {max_hr_date}")
-            st.caption(f"Training source: {volume_source}")
-            if live_heart_rate:
-                st.markdown("<span class='green-text'>● Strava</span>", unsafe_allow_html=True)
-            elif strava_is_connected(athlete_key):
-                st.caption("Sync an HR-enabled Strava run to update this benchmark.")
-
-if dashboard_view == "Training":
     # =========================================================
-    # WEEKLY TRAINING VOLUME + HEART RATE & RECOVERY
+    # VEKDYN PERFORMANCE PREDICTION ENGINE
     # =========================================================
 
-    volume_card, recovery_card = st.columns([3, 2])
+    def vekdyn_time_to_seconds(value):
+        """Convert race/pace strings such as 1:55.20, 14:55, or 5:05/mi to seconds."""
+        if value in (None, "", "--"):
+            return None
 
-    with volume_card:
-        with st.container(border=True):
-            st.subheader("Weekly Training Volume")
+        clean = str(value).strip().lower()
+        clean = clean.replace("/mile", "").replace("/mi", "").replace("per mile", "")
+        clean = re.sub(r"[^0-9:.]", "", clean)
 
-            if volume_data.empty:
-                st.info("No weekly training data is available.")
+        if not clean:
+            return None
+
+        try:
+            parts = clean.split(":")
+            if len(parts) == 3:
+                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+            if len(parts) == 2:
+                return float(parts[0]) * 60 + float(parts[1])
+            return float(parts[0])
+        except (ValueError, TypeError):
+            return None
+
+
+    def vekdyn_seconds_to_time(seconds, decimals=1):
+        if seconds is None:
+            return "--"
+
+        minutes = int(seconds // 60)
+        remaining = seconds - (minutes * 60)
+
+        if decimals == 0:
+            return f"{minutes}:{int(round(remaining)):02d}"
+
+        width = 3 + decimals
+        return f"{minutes}:{remaining:0{width}.{decimals}f}"
+
+
+    def vekdyn_linear_score(value, slow_value, fast_value, low_score, high_score):
+        """Continuous score where a lower time/pace is better."""
+        if value is None:
+            return 0
+
+        if value >= slow_value:
+            return int(round(low_score))
+        if value <= fast_value:
+            return int(round(high_score))
+
+        fraction = (slow_value - value) / (slow_value - fast_value)
+        return int(round(low_score + fraction * (high_score - low_score)))
+
+
+    def vekdyn_male_speed_reserve_score(eight_seconds):
+        """Male distance-runner speed-reserve scale discussed for VEKDYN."""
+        if eight_seconds is None:
+            return 0, "No 800m PB"
+
+        if eight_seconds >= 125:
+            return 12, "Low"
+        if eight_seconds >= 120:
+            return vekdyn_linear_score(eight_seconds, 125, 120, 15, 30), "Low"
+        if eight_seconds >= 118:
+            return vekdyn_linear_score(eight_seconds, 120, 118, 30, 45), "Developing"
+        if eight_seconds >= 115:
+            return vekdyn_linear_score(eight_seconds, 118, 115, 45, 65), "Good"
+        if eight_seconds >= 110:
+            return vekdyn_linear_score(eight_seconds, 115, 110, 65, 88), "Elite"
+        return min(100, vekdyn_linear_score(eight_seconds, 110, 105, 88, 100)), "National"
+
+
+    def vekdyn_male_aerobic_score(five_k_seconds):
+        """Continuous 5K ability score using the VEKDYN male distance framework."""
+        if five_k_seconds is None:
+            return 0, "No 5K PB"
+
+        if five_k_seconds >= 1050:  # 17:30+
+            return 12, "Low"
+        if five_k_seconds >= 990:  # 17:30-16:30
+            return vekdyn_linear_score(five_k_seconds, 1050, 990, 15, 28), "Low"
+        if five_k_seconds >= 930:  # 16:30-15:30
+            return vekdyn_linear_score(five_k_seconds, 990, 930, 28, 43), "Okay"
+        if five_k_seconds >= 880:  # 15:30-14:40
+            return vekdyn_linear_score(five_k_seconds, 930, 880, 43, 65), "Good"
+        if five_k_seconds >= 840:  # 14:40-14:00
+            return vekdyn_linear_score(five_k_seconds, 880, 840, 65, 82), "Competitive"
+        if five_k_seconds >= 810:  # 14:00-13:30
+            return vekdyn_linear_score(five_k_seconds, 840, 810, 82, 92), "Elite"
+        return min(100, vekdyn_linear_score(five_k_seconds, 810, 780, 92, 100)), "National Competitive"
+
+
+    def vekdyn_parse_lactate(value):
+        if value in (None, "", "--"):
+            return None
+        match = re.search(r"\d+(?:\.\d+)?", str(value))
+        return float(match.group()) if match else None
+
+
+    def vekdyn_threshold_profile(threshold):
+        """
+        Use the fastest entered threshold pace that remains controlled at 2.0-3.5 mmol.
+        If no controlled sample exists, fall back to the best usable entered sample
+        but lower the score/confidence.
+        """
+        samples = []
+
+        for rep_name in ("short_reps", "medium_reps", "long_reps"):
+            rep = threshold.get(rep_name, {}) or {}
+            pace_seconds = vekdyn_time_to_seconds(rep.get("pace"))
+            lactate = vekdyn_parse_lactate(rep.get("lactate"))
+
+            if pace_seconds is not None and lactate is not None:
+                samples.append({
+                    "rep": rep_name,
+                    "pace": pace_seconds,
+                    "lactate": lactate,
+                })
+
+        if not samples:
+            return 0, "No LT data", None, False
+
+        controlled = [
+            sample for sample in samples
+            if 2.0 <= sample["lactate"] <= 3.5
+        ]
+
+        if controlled:
+            best = min(controlled, key=lambda sample: sample["pace"])
+            pace = best["pace"]
+
+            if pace >= 345:
+                score, label = 20, "Low"
+            elif pace >= 325:
+                score, label = vekdyn_linear_score(pace, 345, 325, 25, 40), "Developing"
+            elif pace >= 305:
+                score, label = vekdyn_linear_score(pace, 325, 305, 40, 60), "Good"
+            elif pace >= 290:
+                score, label = vekdyn_linear_score(pace, 305, 290, 60, 76), "Very Good"
+            elif pace >= 275:
+                score, label = vekdyn_linear_score(pace, 290, 275, 76, 90), "Elite"
             else:
-                current_volume = float(volume_data["Mileage"].iloc[-1])
-                previous_volume = (
-                    float(volume_data["Mileage"].iloc[-2])
-                    if len(volume_data) > 1
-                    else current_volume
-                )
-                volume_change = current_volume - previous_volume
+                score, label = min(100, vekdyn_linear_score(pace, 275, 260, 90, 100)), "Exceptional"
 
-                number_col, graph_col = st.columns([1, 3])
+            # Reward a stable controlled profile across multiple entered rep lengths.
+            if len(controlled) >= 2:
+                score = min(100, score + 3)
+            if len(controlled) >= 3:
+                score = min(100, score + 2)
 
-                with number_col:
-                    st.metric(
-                        label="This Week",
-                        value=f"{current_volume:.1f} mi",
-                        delta=f"{volume_change:+.1f} mi",
-                    )
-                    st.caption(f"Source: {volume_source}")
+            return score, label, best, True
 
-                    if volume_source == "Live Strava data":
-                        st.markdown(
-                            "<span class='green-text'>● Strava</span>",
-                            unsafe_allow_html=True,
-                        )
-
-                with graph_col:
-                    chart_data = volume_data.copy()
-                    chart_data["Mileage"] = pd.to_numeric(chart_data["Mileage"], errors="coerce").fillna(0.0)
-                    chart_data["Order"] = range(len(chart_data))
-                    mileage_chart = (
-                        alt.Chart(chart_data)
-                        .mark_line(point=True, strokeWidth=3)
-                        .encode(
-                            x=alt.X("Week:N", sort=alt.SortField("Order"), title="Week"),
-                            y=alt.Y("Mileage:Q", title="Miles", scale=alt.Scale(zero=True)),
-                            tooltip=[alt.Tooltip("Week:N"), alt.Tooltip("Mileage:Q", format=".1f")],
-                        )
-                        .properties(height=230)
-                    )
-                    st.altair_chart(mileage_chart, use_container_width=True)
-
-    with recovery_card:
-        with st.container(border=True):
-            st.subheader("Heart Rate & Recovery")
-
-            heart_updated = live_heart_rate.get(
-                "last_updated",
-                recovery.get("last_updated", "Not available"),
-            )
-            st.caption(f"Last updated: {heart_updated}")
-
-            sleep_left, sleep_right = st.columns(2)
-
-            with sleep_left:
-                sleep_hr_value = coros_recovery.get("sleep_hr_avg")
-                if sleep_hr_value is None:
-                    sleep_hr_value = coros_recovery.get("resting_hr")
-                st.metric(
-                    "Average Sleeping HR",
-                    f"{sleep_hr_value} bpm" if sleep_hr_value is not None else "—",
-                )
-                if coros_recovery.get("sleep_hr_baseline") is not None:
-                    st.caption(f"7-day sleeping-HR baseline: {coros_recovery['sleep_hr_baseline']} bpm")
-                elif coros_is_connected(athlete_key):
-                    st.caption("COROS connected")
-
-            with sleep_right:
-                coros_sleep_minutes = coros_recovery.get("sleep_minutes")
-                sleep_display = (
-                    f"{coros_sleep_minutes // 60}h {coros_sleep_minutes % 60}m"
-                    if coros_sleep_minutes is not None else "—"
-                )
-                st.metric("Sleep Time", sleep_display)
-                if coros_recovery.get("sleep_score") is not None:
-                    st.caption(f"COROS sleep score: {coros_recovery['sleep_score']}")
-
-            st.divider()
-
-            recovery_left, recovery_right = st.columns(2)
-
-            with recovery_left:
-                hrv_value = coros_recovery.get("hrv_avg")
-                st.metric(
-                    "Average HRV",
-                    f"{hrv_value} ms" if hrv_value is not None else "—",
-                )
-                if coros_recovery.get("hrv_status"):
-                    detail = f"COROS: {coros_recovery['hrv_status']}"
-                    if coros_recovery.get("hrv_baseline") is not None:
-                        detail += f" · baseline {coros_recovery['hrv_baseline']} ms"
-                    if (coros_recovery.get("hrv_normal_low") is not None
-                            and coros_recovery.get("hrv_normal_high") is not None):
-                        detail += f" · normal {coros_recovery['hrv_normal_low']}–{coros_recovery['hrv_normal_high']} ms"
-                    st.caption(detail)
-
-            with recovery_right:
-                recovery_score = coros_recovery.get("recovery_score")
-                recovery_display = f"{recovery_score}%" if recovery_score is not None else "—"
-                st.metric("VEKDYN Recovery Score", recovery_display)
-                if recovery_score is not None:
-                    st.caption("Sleep + individualized HRV + average sleeping HR")
-
-# =========================================================
-# VEKDYN PERFORMANCE PREDICTION ENGINE
-# =========================================================
-
-def vekdyn_time_to_seconds(value):
-    """Convert race/pace strings such as 1:55.20, 14:55, or 5:05/mi to seconds."""
-    if value in (None, "", "--"):
-        return None
-
-    clean = str(value).strip().lower()
-    clean = clean.replace("/mile", "").replace("/mi", "").replace("per mile", "")
-    clean = re.sub(r"[^0-9:.]", "", clean)
-
-    if not clean:
-        return None
-
-    try:
-        parts = clean.split(":")
-        if len(parts) == 3:
-            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-        if len(parts) == 2:
-            return float(parts[0]) * 60 + float(parts[1])
-        return float(parts[0])
-    except (ValueError, TypeError):
-        return None
+        best = min(samples, key=lambda sample: abs(sample["lactate"] - 2.75))
+        return 30, "LT uncertain", best, False
 
 
-def vekdyn_seconds_to_time(seconds, decimals=1):
-    if seconds is None:
-        return "--"
+    def vekdyn_recent_mileage(volume_data):
+        """Average up to the four most recent non-zero weekly mileage values."""
+        if volume_data is None or getattr(volume_data, "empty", True):
+            return None
 
-    minutes = int(seconds // 60)
-    remaining = seconds - (minutes * 60)
-
-    if decimals == 0:
-        return f"{minutes}:{int(round(remaining)):02d}"
-
-    width = 3 + decimals
-    return f"{minutes}:{remaining:0{width}.{decimals}f}"
-
-
-def vekdyn_linear_score(value, slow_value, fast_value, low_score, high_score):
-    """Continuous score where a lower time/pace is better."""
-    if value is None:
-        return 0
-
-    if value >= slow_value:
-        return int(round(low_score))
-    if value <= fast_value:
-        return int(round(high_score))
-
-    fraction = (slow_value - value) / (slow_value - fast_value)
-    return int(round(low_score + fraction * (high_score - low_score)))
+        try:
+            miles = pd.to_numeric(volume_data["Mileage"], errors="coerce").dropna()
+            miles = miles[miles > 0].tail(4)
+            if miles.empty:
+                return None
+            return float(miles.mean())
+        except (KeyError, TypeError, ValueError):
+            return None
 
 
-def vekdyn_male_speed_reserve_score(eight_seconds):
-    """Male distance-runner speed-reserve scale discussed for VEKDYN."""
-    if eight_seconds is None:
-        return 0, "No 800m PB"
+    def vekdyn_male_volume_compatibility(eight_seconds, weekly_miles):
+        """
+        VEKDYN volume/speed-reserve compatibility heuristic.
+        This is a performance-model assumption, not a safety cutoff.
+        """
+        if eight_seconds is None or weekly_miles is None:
+            return 50, "Unknown"
 
-    if eight_seconds >= 125:
-        return 12, "Low"
-    if eight_seconds >= 120:
-        return vekdyn_linear_score(eight_seconds, 125, 120, 15, 30), "Low"
-    if eight_seconds >= 118:
-        return vekdyn_linear_score(eight_seconds, 120, 118, 30, 45), "Developing"
-    if eight_seconds >= 115:
-        return vekdyn_linear_score(eight_seconds, 118, 115, 45, 65), "Good"
-    if eight_seconds >= 110:
-        return vekdyn_linear_score(eight_seconds, 115, 110, 65, 88), "Elite"
-    return min(100, vekdyn_linear_score(eight_seconds, 110, 105, 88, 100)), "National"
+        if eight_seconds >= 120:
+            target_low, target_high = 45, 60
+        elif eight_seconds >= 118:
+            target_low, target_high = 50, 65
+        elif eight_seconds >= 115:
+            target_low, target_high = 60, 75
+        elif eight_seconds >= 110:
+            target_low, target_high = 65, 85
+        else:
+            target_low, target_high = 70, 95
 
+        if target_low <= weekly_miles <= target_high:
+            return 92, "Matched"
 
-def vekdyn_male_aerobic_score(five_k_seconds):
-    """Continuous 5K ability score using the VEKDYN male distance framework."""
-    if five_k_seconds is None:
-        return 0, "No 5K PB"
+        if weekly_miles < target_low:
+            gap = target_low - weekly_miles
+            return max(35, int(round(88 - gap * 3))), "Below model range"
 
-    if five_k_seconds >= 1050:  # 17:30+
-        return 12, "Low"
-    if five_k_seconds >= 990:  # 17:30-16:30
-        return vekdyn_linear_score(five_k_seconds, 1050, 990, 15, 28), "Low"
-    if five_k_seconds >= 930:  # 16:30-15:30
-        return vekdyn_linear_score(five_k_seconds, 990, 930, 28, 43), "Okay"
-    if five_k_seconds >= 880:  # 15:30-14:40
-        return vekdyn_linear_score(five_k_seconds, 930, 880, 43, 65), "Good"
-    if five_k_seconds >= 840:  # 14:40-14:00
-        return vekdyn_linear_score(five_k_seconds, 880, 840, 65, 82), "Competitive"
-    if five_k_seconds >= 810:  # 14:00-13:30
-        return vekdyn_linear_score(five_k_seconds, 840, 810, 82, 92), "Elite"
-    return min(100, vekdyn_linear_score(five_k_seconds, 810, 780, 92, 100)), "National Competitive"
+        gap = weekly_miles - target_high
+        return max(35, int(round(85 - gap * 2.5))), "Check elasticity"
 
 
-def vekdyn_parse_lactate(value):
-    if value in (None, "", "--"):
-        return None
-    match = re.search(r"\d+(?:\.\d+)?", str(value))
-    return float(match.group()) if match else None
+    # =========================================================
+    # WOMEN'S PERFORMANCE MODEL — V1
+    # =========================================================
+    # The women's model is intentionally more aerobic-strength weighted than the
+    # men's model. Threshold values are displayed as coach data but are not yet
+    # used to move the women's prediction until VEKDYN has enough testing data to
+    # calibrate that relationship.
+
+    def vekdyn_is_female(profile):
+        sex = str((profile or {}).get("sex", "")).strip().casefold()
+        return sex in {"f", "female", "woman", "women", "w"}
 
 
-def vekdyn_threshold_profile(threshold):
-    """
-    Use the fastest entered threshold pace that remains controlled at 2.0-3.5 mmol.
-    If no controlled sample exists, fall back to the best usable entered sample
-    but lower the score/confidence.
-    """
-    samples = []
+    def vekdyn_women_speed_reserve_score(eight_seconds):
+        if eight_seconds is None:
+            return 0, "No 800m PB"
+        if eight_seconds >= 152:  # 2:32+
+            return 15, "Low"
+        if eight_seconds >= 145:  # 2:25-2:32
+            return vekdyn_linear_score(eight_seconds, 152, 145, 15, 28), "Low"
+        if eight_seconds >= 140:  # 2:20-2:24
+            return vekdyn_linear_score(eight_seconds, 145, 140, 28, 42), "Adequate"
+        if eight_seconds >= 135:  # 2:15-2:19
+            return vekdyn_linear_score(eight_seconds, 140, 135, 42, 58), "Good"
+        if eight_seconds >= 130:  # 2:10-2:14
+            return vekdyn_linear_score(eight_seconds, 135, 130, 58, 74), "High"
+        if eight_seconds >= 125:  # 2:05-2:09
+            return vekdyn_linear_score(eight_seconds, 130, 125, 74, 90), "Very High"
+        return min(100, vekdyn_linear_score(eight_seconds, 125, 120, 90, 100)), "Elite"
 
-    for rep_name in ("short_reps", "medium_reps", "long_reps"):
-        rep = threshold.get(rep_name, {}) or {}
-        pace_seconds = vekdyn_time_to_seconds(rep.get("pace"))
-        lactate = vekdyn_parse_lactate(rep.get("lactate"))
 
-        if pace_seconds is not None and lactate is not None:
-            samples.append({
-                "rep": rep_name,
-                "pace": pace_seconds,
-                "lactate": lactate,
-            })
+    def vekdyn_women_aerobic_score(five_k_seconds):
+        if five_k_seconds is None:
+            return 0, "No 5K PB"
+        if five_k_seconds >= 1140:  # 19:00+
+            return 18, "Developing"
+        if five_k_seconds >= 1100:  # 19:00-18:20
+            return vekdyn_linear_score(five_k_seconds, 1140, 1100, 20, 35), "Okay"
+        if five_k_seconds >= 1030:  # 18:20-17:10
+            return vekdyn_linear_score(five_k_seconds, 1100, 1030, 35, 58), "Good"
+        if five_k_seconds >= 970:  # 17:10-16:10
+            return vekdyn_linear_score(five_k_seconds, 1030, 970, 58, 78), "Competitive"
+        if five_k_seconds >= 920:  # 16:10-15:20
+            return vekdyn_linear_score(five_k_seconds, 970, 920, 78, 92), "Elite"
+        return min(100, vekdyn_linear_score(five_k_seconds, 920, 870, 92, 100)), "Pro-level"
 
-    if not samples:
-        return 0, "No LT data", None, False
 
-    controlled = [
-        sample for sample in samples
-        if 2.0 <= sample["lactate"] <= 3.5
+    def vekdyn_women_volume_compatibility(eight_seconds, weekly_miles):
+        if weekly_miles is None:
+            return 50, "Unknown"
+        if weekly_miles < 30:
+            return max(35, int(round(65 - (30 - weekly_miles) * 2))), "Below model range"
+        if weekly_miles < 45:
+            # Low for a 5K profile, but reasonable for an 800/1500 athlete.
+            score = 82 if eight_seconds is not None and eight_seconds <= 135 else 72
+            return score, "Low / middle-distance appropriate"
+        if weekly_miles < 60:
+            return 94, "Balanced"
+        if weekly_miles <= 80:
+            return 86, "High"
+        return max(45, int(round(78 - (weekly_miles - 80) * 1.5))), "Very high / specialized"
+
+
+    VEKDYN_WOMEN_800_GRID = [152, 145, 140, 135, 130, 125, 120]
+    VEKDYN_WOMEN_5K_GRID = [1140, 1100, 1030, 970, 920, 880]
+
+    # Women's 1500 capability surface (seconds). 5K strength carries more weight
+    # than in the men's surface, while 800 speed remains an important modifier.
+    VEKDYN_WOMEN_1500_MATRIX = [
+        [325, 314, 296, 281, 267, 259],  # 2:32
+        [317, 307, 290, 276, 263, 255],  # 2:25
+        [311, 301, 284, 271, 260, 252],  # 2:20
+        [304, 295, 279, 267, 257, 249],  # 2:15
+        [298, 289, 274, 263, 253, 246],  # 2:10
+        [292, 283, 269, 259, 249, 242],  # 2:05
+        [287, 278, 264, 254, 245, 238],  # 2:00
     ]
 
-    if controlled:
-        best = min(controlled, key=lambda sample: sample["pace"])
-        pace = best["pace"]
 
-        if pace >= 345:
-            score, label = 20, "Low"
-        elif pace >= 325:
-            score, label = vekdyn_linear_score(pace, 345, 325, 25, 40), "Developing"
-        elif pace >= 305:
-            score, label = vekdyn_linear_score(pace, 325, 305, 40, 60), "Good"
-        elif pace >= 290:
-            score, label = vekdyn_linear_score(pace, 305, 290, 60, 76), "Very Good"
-        elif pace >= 275:
-            score, label = vekdyn_linear_score(pace, 290, 275, 76, 90), "Elite"
-        else:
-            score, label = min(100, vekdyn_linear_score(pace, 275, 260, 90, 100)), "Exceptional"
-
-        # Reward a stable controlled profile across multiple entered rep lengths.
-        if len(controlled) >= 2:
-            score = min(100, score + 3)
-        if len(controlled) >= 3:
-            score = min(100, score + 2)
-
-        return score, label, best, True
-
-    best = min(samples, key=lambda sample: abs(sample["lactate"] - 2.75))
-    return 30, "LT uncertain", best, False
-
-
-def vekdyn_recent_mileage(volume_data):
-    """Average up to the four most recent non-zero weekly mileage values."""
-    if volume_data is None or getattr(volume_data, "empty", True):
-        return None
-
-    try:
-        miles = pd.to_numeric(volume_data["Mileage"], errors="coerce").dropna()
-        miles = miles[miles > 0].tail(4)
-        if miles.empty:
+    def vekdyn_women_base_1500_prediction(eight_seconds, five_k_seconds):
+        if eight_seconds is None or five_k_seconds is None:
             return None
-        return float(miles.mean())
-    except (KeyError, TypeError, ValueError):
-        return None
+
+        eight = max(min(eight_seconds, max(VEKDYN_WOMEN_800_GRID)), min(VEKDYN_WOMEN_800_GRID))
+        five_k = max(min(five_k_seconds, max(VEKDYN_WOMEN_5K_GRID)), min(VEKDYN_WOMEN_5K_GRID))
+
+        e_fast, e_slow = vekdyn_bracket(eight, VEKDYN_WOMEN_800_GRID, descending=False)
+        f_fast, f_slow = vekdyn_bracket(five_k, VEKDYN_WOMEN_5K_GRID, descending=False)
+
+        def matrix_value(e_value, f_value):
+            row = VEKDYN_WOMEN_800_GRID.index(e_value)
+            col = VEKDYN_WOMEN_5K_GRID.index(f_value)
+            return VEKDYN_WOMEN_1500_MATRIX[row][col]
+
+        q11 = matrix_value(e_fast, f_fast)
+        q12 = matrix_value(e_fast, f_slow)
+        q21 = matrix_value(e_slow, f_fast)
+        q22 = matrix_value(e_slow, f_slow)
+
+        if f_fast == f_slow:
+            top, bottom = q11, q21
+        else:
+            top = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q11, q12)
+            bottom = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q21, q22)
+
+        if e_fast == e_slow:
+            return top
+        return vekdyn_interpolate_1d(eight, e_fast, e_slow, top, bottom)
 
 
-def vekdyn_male_volume_compatibility(eight_seconds, weekly_miles):
-    """
-    VEKDYN volume/speed-reserve compatibility heuristic.
-    This is a performance-model assumption, not a safety cutoff.
-    """
-    if eight_seconds is None or weekly_miles is None:
-        return 50, "Unknown"
+    VEKDYN_800_GRID = [122, 119, 117, 115, 112, 110, 108]
+    VEKDYN_5K_GRID = [990, 930, 900, 880, 860, 840, 820, 800]
 
-    if eight_seconds >= 120:
-        target_low, target_high = 45, 60
-    elif eight_seconds >= 118:
-        target_low, target_high = 50, 65
-    elif eight_seconds >= 115:
-        target_low, target_high = 60, 75
-    elif eight_seconds >= 110:
-        target_low, target_high = 65, 85
-    else:
-        target_low, target_high = 70, 95
-
-    if target_low <= weekly_miles <= target_high:
-        return 92, "Matched"
-
-    if weekly_miles < target_low:
-        gap = target_low - weekly_miles
-        return max(35, int(round(88 - gap * 3))), "Below model range"
-
-    gap = weekly_miles - target_high
-    return max(35, int(round(85 - gap * 2.5))), "Check elasticity"
+    # Midpoints (seconds) of the mile ranges we built together.
+    VEKDYN_MILE_MATRIX = [
+        [280, 269, 263.5, 260, 257, 254, 251, 248],  # 2:02
+        [274, 265.5, 260, 257, 254, 251, 248, 245],  # 1:59
+        [271, 262.5, 258, 255, 252, 249, 246, 243],  # 1:57
+        [268, 260.5, 256, 253, 250, 247, 244, 241],  # 1:55
+        [264, 256.5, 252, 249, 246, 243, 240, 237],  # 1:52
+        [261, 253.5, 249, 246, 243, 240, 237, 234],  # 1:50
+        [258, 250.5, 246, 243, 240.5, 237, 234, 231],  # 1:48
+    ]
 
 
-# =========================================================
-# WOMEN'S PERFORMANCE MODEL — V1
-# =========================================================
-# The women's model is intentionally more aerobic-strength weighted than the
-# men's model. Threshold values are displayed as coach data but are not yet
-# used to move the women's prediction until VEKDYN has enough testing data to
-# calibrate that relationship.
-
-def vekdyn_is_female(profile):
-    sex = str((profile or {}).get("sex", "")).strip().casefold()
-    return sex in {"f", "female", "woman", "women", "w"}
+    def vekdyn_interpolate_1d(x, x1, x2, y1, y2):
+        if x1 == x2:
+            return y1
+        fraction = (x - x1) / (x2 - x1)
+        return y1 + fraction * (y2 - y1)
 
 
-def vekdyn_women_speed_reserve_score(eight_seconds):
-    if eight_seconds is None:
-        return 0, "No 800m PB"
-    if eight_seconds >= 152:  # 2:32+
-        return 15, "Low"
-    if eight_seconds >= 145:  # 2:25-2:32
-        return vekdyn_linear_score(eight_seconds, 152, 145, 15, 28), "Low"
-    if eight_seconds >= 140:  # 2:20-2:24
-        return vekdyn_linear_score(eight_seconds, 145, 140, 28, 42), "Adequate"
-    if eight_seconds >= 135:  # 2:15-2:19
-        return vekdyn_linear_score(eight_seconds, 140, 135, 42, 58), "Good"
-    if eight_seconds >= 130:  # 2:10-2:14
-        return vekdyn_linear_score(eight_seconds, 135, 130, 58, 74), "High"
-    if eight_seconds >= 125:  # 2:05-2:09
-        return vekdyn_linear_score(eight_seconds, 130, 125, 74, 90), "Very High"
-    return min(100, vekdyn_linear_score(eight_seconds, 125, 120, 90, 100)), "Elite"
+    def vekdyn_bracket(value, grid, descending=False):
+        ordered = sorted(grid, reverse=descending)
+
+        if descending:
+            if value >= ordered[0]:
+                return ordered[0], ordered[0]
+            if value <= ordered[-1]:
+                return ordered[-1], ordered[-1]
+            for a, b in zip(ordered, ordered[1:]):
+                if a >= value >= b:
+                    return a, b
+        else:
+            if value <= ordered[0]:
+                return ordered[0], ordered[0]
+            if value >= ordered[-1]:
+                return ordered[-1], ordered[-1]
+            for a, b in zip(ordered, ordered[1:]):
+                if a <= value <= b:
+                    return a, b
+
+        return ordered[-1], ordered[-1]
 
 
-def vekdyn_women_aerobic_score(five_k_seconds):
-    if five_k_seconds is None:
-        return 0, "No 5K PB"
-    if five_k_seconds >= 1140:  # 19:00+
-        return 18, "Developing"
-    if five_k_seconds >= 1100:  # 19:00-18:20
-        return vekdyn_linear_score(five_k_seconds, 1140, 1100, 20, 35), "Okay"
-    if five_k_seconds >= 1030:  # 18:20-17:10
-        return vekdyn_linear_score(five_k_seconds, 1100, 1030, 35, 58), "Good"
-    if five_k_seconds >= 970:  # 17:10-16:10
-        return vekdyn_linear_score(five_k_seconds, 1030, 970, 58, 78), "Competitive"
-    if five_k_seconds >= 920:  # 16:10-15:20
-        return vekdyn_linear_score(five_k_seconds, 970, 920, 78, 92), "Elite"
-    return min(100, vekdyn_linear_score(five_k_seconds, 920, 870, 92, 100)), "Pro-level"
+    def vekdyn_male_base_mile_prediction(eight_seconds, five_k_seconds):
+        """
+        Bilinear interpolation across the VEKDYN 800 x 5K matrix.
+        This avoids snapping a 1:53.4 / 14:32 athlete to a single box.
+        """
+        if eight_seconds is None or five_k_seconds is None:
+            return None
+
+        # Clamp only outside the current calibration surface.
+        eight = max(min(eight_seconds, max(VEKDYN_800_GRID)), min(VEKDYN_800_GRID))
+        five_k = max(min(five_k_seconds, max(VEKDYN_5K_GRID)), min(VEKDYN_5K_GRID))
+
+        e_fast, e_slow = vekdyn_bracket(eight, VEKDYN_800_GRID, descending=False)
+        f_fast, f_slow = vekdyn_bracket(five_k, VEKDYN_5K_GRID, descending=False)
+
+        def matrix_value(e_value, f_value):
+            row = VEKDYN_800_GRID.index(e_value)
+            col = VEKDYN_5K_GRID.index(f_value)
+            return VEKDYN_MILE_MATRIX[row][col]
+
+        q11 = matrix_value(e_fast, f_fast)
+        q12 = matrix_value(e_fast, f_slow)
+        q21 = matrix_value(e_slow, f_fast)
+        q22 = matrix_value(e_slow, f_slow)
+
+        if f_fast == f_slow:
+            top = q11
+            bottom = q21
+        else:
+            top = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q11, q12)
+            bottom = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q21, q22)
+
+        if e_fast == e_slow:
+            return top
+
+        return vekdyn_interpolate_1d(eight, e_fast, e_slow, top, bottom)
 
 
-def vekdyn_women_volume_compatibility(eight_seconds, weekly_miles):
-    if weekly_miles is None:
-        return 50, "Unknown"
-    if weekly_miles < 30:
-        return max(35, int(round(65 - (30 - weekly_miles) * 2))), "Below model range"
-    if weekly_miles < 45:
-        # Low for a 5K profile, but reasonable for an 800/1500 athlete.
-        score = 82 if eight_seconds is not None and eight_seconds <= 135 else 72
-        return score, "Low / middle-distance appropriate"
-    if weekly_miles < 60:
-        return 94, "Balanced"
-    if weekly_miles <= 80:
-        return 86, "High"
-    return max(45, int(round(78 - (weekly_miles - 80) * 1.5))), "Very high / specialized"
+    def vekdyn_elasticity_modifier(status="Preserved"):
+        """
+        The current VEKDYN model assumes elasticity/speed expression is preserved
+        unless the athlete/coach marks evidence that it is not.
+        """
+        modifiers = {
+            "Preserved": 0.0,
+            "Moderately Preserved": 2.0,
+            "Uncertain": 4.0,
+            "Suppressed": 7.0,
+        }
+        return modifiers.get(status, 0.0)
 
 
-VEKDYN_WOMEN_800_GRID = [152, 145, 140, 135, 130, 125, 120]
-VEKDYN_WOMEN_5K_GRID = [1140, 1100, 1030, 970, 920, 880]
+    def vekdyn_predict_1500(
+            personal_bests,
+            threshold,
+            volume_data,
+            elasticity_status="Preserved",
+            profile=None,
+    ):
+        eight_seconds = vekdyn_time_to_seconds(personal_bests.get("800"))
+        five_k_seconds = vekdyn_time_to_seconds(personal_bests.get("5k"))
+        is_female = vekdyn_is_female(profile)
 
-# Women's 1500 capability surface (seconds). 5K strength carries more weight
-# than in the men's surface, while 800 speed remains an important modifier.
-VEKDYN_WOMEN_1500_MATRIX = [
-    [325, 314, 296, 281, 267, 259],  # 2:32
-    [317, 307, 290, 276, 263, 255],  # 2:25
-    [311, 301, 284, 271, 260, 252],  # 2:20
-    [304, 295, 279, 267, 257, 249],  # 2:15
-    [298, 289, 274, 263, 253, 246],  # 2:10
-    [292, 283, 269, 259, 249, 242],  # 2:05
-    [287, 278, 264, 254, 245, 238],  # 2:00
-]
+        weekly_miles = vekdyn_recent_mileage(volume_data)
 
+        if is_female:
+            speed_score, speed_label = vekdyn_women_speed_reserve_score(eight_seconds)
+            aerobic_score, aerobic_label = vekdyn_women_aerobic_score(five_k_seconds)
+            volume_score, volume_label = vekdyn_women_volume_compatibility(eight_seconds, weekly_miles)
+            predicted_1500 = vekdyn_women_base_1500_prediction(eight_seconds, five_k_seconds)
+            threshold_score, threshold_label, lt_sample, lt_controlled = (
+                50, "Coach calibration pending", None, False
+            )
+            model_name = "Women's V1"
+        else:
+            speed_score, speed_label = vekdyn_male_speed_reserve_score(eight_seconds)
+            aerobic_score, aerobic_label = vekdyn_male_aerobic_score(five_k_seconds)
+            threshold_score, threshold_label, lt_sample, lt_controlled = vekdyn_threshold_profile(threshold)
+            volume_score, volume_label = vekdyn_male_volume_compatibility(eight_seconds, weekly_miles)
+            base_mile = vekdyn_male_base_mile_prediction(eight_seconds, five_k_seconds)
+            predicted_1500 = None if base_mile is None else (
+                    (base_mile + vekdyn_elasticity_modifier(elasticity_status)) * (1500.0 / 1609.344)
+            )
+            model_name = "Men's model"
 
-def vekdyn_women_base_1500_prediction(eight_seconds, five_k_seconds):
-    if eight_seconds is None or five_k_seconds is None:
-        return None
+        if predicted_1500 is None:
+            return {
+                "available": False,
+                "reason": "An 800m PB and 5K PB are needed for the VEKDYN prediction.",
+                "speed_score": speed_score,
+                "aerobic_score": aerobic_score,
+                "threshold_score": threshold_score,
+                "volume_score": volume_score,
+                "elasticity_score": 90 if elasticity_status == "Preserved" else 65,
+                "model_name": model_name,
+                "is_female": is_female,
+            }
 
-    eight = max(min(eight_seconds, max(VEKDYN_WOMEN_800_GRID)), min(VEKDYN_WOMEN_800_GRID))
-    five_k = max(min(five_k_seconds, max(VEKDYN_WOMEN_5K_GRID)), min(VEKDYN_WOMEN_5K_GRID))
+        # Women's V1 uses 5K strength as the primary anchor and 800 speed as a
+        # modifier. Elasticity is retained as a display factor but does not move
+        # the women's prediction until the model is calibrated with more data.
+        if is_female:
+            adjusted_1500 = predicted_1500
+            adjusted_mile = adjusted_1500 * (1609.344 / 1500.0)
+        else:
+            adjusted_1500 = predicted_1500
+            adjusted_mile = adjusted_1500 * (1609.344 / 1500.0)
 
-    e_fast, e_slow = vekdyn_bracket(eight, VEKDYN_WOMEN_800_GRID, descending=False)
-    f_fast, f_slow = vekdyn_bracket(five_k, VEKDYN_WOMEN_5K_GRID, descending=False)
+        confidence = 52
+        confidence += 12 if eight_seconds is not None else 0
+        confidence += 15 if five_k_seconds is not None else 0
+        confidence += 8 if weekly_miles is not None else 0
+        if not is_female:
+            confidence += 8 if lt_controlled else (3 if lt_sample is not None else 0)
+        confidence += 4 if volume_label in {"Matched", "Balanced"} else 0
+        confidence += 3 if elasticity_status == "Preserved" else 0
+        confidence = min(95 if not is_female else 88, confidence)
 
-    def matrix_value(e_value, f_value):
-        row = VEKDYN_WOMEN_800_GRID.index(e_value)
-        col = VEKDYN_WOMEN_5K_GRID.index(f_value)
-        return VEKDYN_WOMEN_1500_MATRIX[row][col]
+        half_range = 3.0 if not is_female else 5.0
+        if weekly_miles is None:
+            half_range += 1.0
+        if not is_female and lt_sample is None:
+            half_range += 1.5
+        if elasticity_status in {"Uncertain", "Suppressed"}:
+            half_range += 1.5
 
-    q11 = matrix_value(e_fast, f_fast)
-    q12 = matrix_value(e_fast, f_slow)
-    q21 = matrix_value(e_slow, f_fast)
-    q22 = matrix_value(e_slow, f_slow)
+        # Provisional 5K estimate: retain the athlete's actual 5K as the aerobic
+        # anchor, adjusted conservatively toward the 1500m model's equivalent.
+        # This is NOT a separately calibrated 5K prediction model.
+        equivalent_5k = adjusted_1500 * (5000.0 / 1500.0) ** 1.06
+        predicted_5k = (0.80 * five_k_seconds + 0.20 * equivalent_5k) if five_k_seconds else None
 
-    if f_fast == f_slow:
-        top, bottom = q11, q21
-    else:
-        top = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q11, q12)
-        bottom = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q21, q22)
-
-    if e_fast == e_slow:
-        return top
-    return vekdyn_interpolate_1d(eight, e_fast, e_slow, top, bottom)
-
-
-VEKDYN_800_GRID = [122, 119, 117, 115, 112, 110, 108]
-VEKDYN_5K_GRID = [990, 930, 900, 880, 860, 840, 820, 800]
-
-# Midpoints (seconds) of the mile ranges we built together.
-VEKDYN_MILE_MATRIX = [
-    [280, 269, 263.5, 260, 257, 254, 251, 248],  # 2:02
-    [274, 265.5, 260, 257, 254, 251, 248, 245],  # 1:59
-    [271, 262.5, 258, 255, 252, 249, 246, 243],  # 1:57
-    [268, 260.5, 256, 253, 250, 247, 244, 241],  # 1:55
-    [264, 256.5, 252, 249, 246, 243, 240, 237],  # 1:52
-    [261, 253.5, 249, 246, 243, 240, 237, 234],  # 1:50
-    [258, 250.5, 246, 243, 240.5, 237, 234, 231],  # 1:48
-]
-
-
-def vekdyn_interpolate_1d(x, x1, x2, y1, y2):
-    if x1 == x2:
-        return y1
-    fraction = (x - x1) / (x2 - x1)
-    return y1 + fraction * (y2 - y1)
-
-
-def vekdyn_bracket(value, grid, descending=False):
-    ordered = sorted(grid, reverse=descending)
-
-    if descending:
-        if value >= ordered[0]:
-            return ordered[0], ordered[0]
-        if value <= ordered[-1]:
-            return ordered[-1], ordered[-1]
-        for a, b in zip(ordered, ordered[1:]):
-            if a >= value >= b:
-                return a, b
-    else:
-        if value <= ordered[0]:
-            return ordered[0], ordered[0]
-        if value >= ordered[-1]:
-            return ordered[-1], ordered[-1]
-        for a, b in zip(ordered, ordered[1:]):
-            if a <= value <= b:
-                return a, b
-
-    return ordered[-1], ordered[-1]
-
-
-def vekdyn_male_base_mile_prediction(eight_seconds, five_k_seconds):
-    """
-    Bilinear interpolation across the VEKDYN 800 x 5K matrix.
-    This avoids snapping a 1:53.4 / 14:32 athlete to a single box.
-    """
-    if eight_seconds is None or five_k_seconds is None:
-        return None
-
-    # Clamp only outside the current calibration surface.
-    eight = max(min(eight_seconds, max(VEKDYN_800_GRID)), min(VEKDYN_800_GRID))
-    five_k = max(min(five_k_seconds, max(VEKDYN_5K_GRID)), min(VEKDYN_5K_GRID))
-
-    e_fast, e_slow = vekdyn_bracket(eight, VEKDYN_800_GRID, descending=False)
-    f_fast, f_slow = vekdyn_bracket(five_k, VEKDYN_5K_GRID, descending=False)
-
-    def matrix_value(e_value, f_value):
-        row = VEKDYN_800_GRID.index(e_value)
-        col = VEKDYN_5K_GRID.index(f_value)
-        return VEKDYN_MILE_MATRIX[row][col]
-
-    q11 = matrix_value(e_fast, f_fast)
-    q12 = matrix_value(e_fast, f_slow)
-    q21 = matrix_value(e_slow, f_fast)
-    q22 = matrix_value(e_slow, f_slow)
-
-    if f_fast == f_slow:
-        top = q11
-        bottom = q21
-    else:
-        top = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q11, q12)
-        bottom = vekdyn_interpolate_1d(five_k, f_fast, f_slow, q21, q22)
-
-    if e_fast == e_slow:
-        return top
-
-    return vekdyn_interpolate_1d(eight, e_fast, e_slow, top, bottom)
-
-
-def vekdyn_elasticity_modifier(status="Preserved"):
-    """
-    The current VEKDYN model assumes elasticity/speed expression is preserved
-    unless the athlete/coach marks evidence that it is not.
-    """
-    modifiers = {
-        "Preserved": 0.0,
-        "Moderately Preserved": 2.0,
-        "Uncertain": 4.0,
-        "Suppressed": 7.0,
-    }
-    return modifiers.get(status, 0.0)
-
-
-def vekdyn_predict_1500(
-        personal_bests,
-        threshold,
-        volume_data,
-        elasticity_status="Preserved",
-        profile=None,
-):
-    eight_seconds = vekdyn_time_to_seconds(personal_bests.get("800"))
-    five_k_seconds = vekdyn_time_to_seconds(personal_bests.get("5k"))
-    is_female = vekdyn_is_female(profile)
-
-    weekly_miles = vekdyn_recent_mileage(volume_data)
-
-    if is_female:
-        speed_score, speed_label = vekdyn_women_speed_reserve_score(eight_seconds)
-        aerobic_score, aerobic_label = vekdyn_women_aerobic_score(five_k_seconds)
-        volume_score, volume_label = vekdyn_women_volume_compatibility(eight_seconds, weekly_miles)
-        predicted_1500 = vekdyn_women_base_1500_prediction(eight_seconds, five_k_seconds)
-        threshold_score, threshold_label, lt_sample, lt_controlled = (
-            50, "Coach calibration pending", None, False
-        )
-        model_name = "Women's V1"
-    else:
-        speed_score, speed_label = vekdyn_male_speed_reserve_score(eight_seconds)
-        aerobic_score, aerobic_label = vekdyn_male_aerobic_score(five_k_seconds)
-        threshold_score, threshold_label, lt_sample, lt_controlled = vekdyn_threshold_profile(threshold)
-        volume_score, volume_label = vekdyn_male_volume_compatibility(eight_seconds, weekly_miles)
-        base_mile = vekdyn_male_base_mile_prediction(eight_seconds, five_k_seconds)
-        predicted_1500 = None if base_mile is None else (
-                (base_mile + vekdyn_elasticity_modifier(elasticity_status)) * (1500.0 / 1609.344)
-        )
-        model_name = "Men's model"
-
-    if predicted_1500 is None:
         return {
-            "available": False,
-            "reason": "An 800m PB and 5K PB are needed for the VEKDYN prediction.",
+            "available": True,
+            "5000_seconds": predicted_5k,
+            "5000_display": vekdyn_seconds_to_time(predicted_5k, 1) if predicted_5k else None,
+            "5000_method": "Provisional: 80% 5K PB + 20% 1500m-equivalent estimate",
+            "mile_seconds": adjusted_mile,
+            "mile_display": vekdyn_seconds_to_time(adjusted_mile, 1),
+            "1500_seconds": adjusted_1500,
+            "1500_low": vekdyn_seconds_to_time(adjusted_1500 - half_range, 1),
+            "1500_mid": vekdyn_seconds_to_time(adjusted_1500, 1),
+            "1500_high": vekdyn_seconds_to_time(adjusted_1500 + half_range, 1),
+            "1500_range": (
+                f"{vekdyn_seconds_to_time(adjusted_1500 - half_range, 1)}"
+                f"–{vekdyn_seconds_to_time(adjusted_1500 + half_range, 1)}"
+            ),
+            "confidence": confidence,
             "speed_score": speed_score,
+            "speed_label": speed_label,
             "aerobic_score": aerobic_score,
+            "aerobic_label": aerobic_label,
             "threshold_score": threshold_score,
+            "threshold_label": threshold_label,
             "volume_score": volume_score,
-            "elasticity_score": 90 if elasticity_status == "Preserved" else 65,
+            "volume_label": volume_label,
+            "weekly_miles": weekly_miles,
+            "elasticity_score": (
+                92 if elasticity_status == "Preserved"
+                else 75 if elasticity_status == "Moderately Preserved"
+                else 58 if elasticity_status == "Uncertain"
+                else 40
+            ),
+            "elasticity_status": elasticity_status,
+            "lt_sample": lt_sample,
             "model_name": model_name,
             "is_female": is_female,
         }
 
-    # Women's V1 uses 5K strength as the primary anchor and 800 speed as a
-    # modifier. Elasticity is retained as a display factor but does not move
-    # the women's prediction until the model is calibrated with more data.
-    if is_female:
-        adjusted_1500 = predicted_1500
-        adjusted_mile = adjusted_1500 * (1609.344 / 1500.0)
-    else:
-        adjusted_1500 = predicted_1500
-        adjusted_mile = adjusted_1500 * (1609.344 / 1500.0)
 
-    confidence = 52
-    confidence += 12 if eight_seconds is not None else 0
-    confidence += 15 if five_k_seconds is not None else 0
-    confidence += 8 if weekly_miles is not None else 0
-    if not is_female:
-        confidence += 8 if lt_controlled else (3 if lt_sample is not None else 0)
-    confidence += 4 if volume_label in {"Matched", "Balanced"} else 0
-    confidence += 3 if elasticity_status == "Preserved" else 0
-    confidence = min(95 if not is_female else 88, confidence)
-
-    half_range = 3.0 if not is_female else 5.0
-    if weekly_miles is None:
-        half_range += 1.0
-    if not is_female and lt_sample is None:
-        half_range += 1.5
-    if elasticity_status in {"Uncertain", "Suppressed"}:
-        half_range += 1.5
-
-    return {
-        "available": True,
-        "mile_seconds": adjusted_mile,
-        "mile_display": vekdyn_seconds_to_time(adjusted_mile, 1),
-        "1500_seconds": adjusted_1500,
-        "1500_low": vekdyn_seconds_to_time(adjusted_1500 - half_range, 1),
-        "1500_mid": vekdyn_seconds_to_time(adjusted_1500, 1),
-        "1500_high": vekdyn_seconds_to_time(adjusted_1500 + half_range, 1),
-        "1500_range": (
-            f"{vekdyn_seconds_to_time(adjusted_1500 - half_range, 1)}"
-            f"–{vekdyn_seconds_to_time(adjusted_1500 + half_range, 1)}"
-        ),
-        "confidence": confidence,
-        "speed_score": speed_score,
-        "speed_label": speed_label,
-        "aerobic_score": aerobic_score,
-        "aerobic_label": aerobic_label,
-        "threshold_score": threshold_score,
-        "threshold_label": threshold_label,
-        "volume_score": volume_score,
-        "volume_label": volume_label,
-        "weekly_miles": weekly_miles,
-        "elasticity_score": (
-            92 if elasticity_status == "Preserved"
-            else 75 if elasticity_status == "Moderately Preserved"
-            else 58 if elasticity_status == "Uncertain"
-            else 40
-        ),
-        "elasticity_status": elasticity_status,
-        "lt_sample": lt_sample,
-        "model_name": model_name,
-        "is_female": is_female,
+    # =========================================================
+    # CONFERENCE RANKINGS — VERIFIED RESULTS IMPORT
+    # =========================================================
+    CONFERENCE_BY_TEAM = {
+        "ollu_distance": "Red River Athletic Conference (RRAC)",
+        "sam_houston": "Conference (configure in school settings)",
+        "dark_horse_endurance": "Unattached / club",
+        DEMO_TEAM_ID: "Demo conference",
     }
 
-
-if dashboard_view == "Predictor":
-    # =========================================================
-    # PERFORMANCE PREDICTIONS — LIVE VEKDYN MODEL
-    # =========================================================
-
-    threshold_for_prediction = athlete.get("threshold", {})
-
-    # The current model assumes the athlete's elasticity/speed qualities are being
-    # preserved unless future athlete/coach data says otherwise.
-    elasticity_status = athlete.get("elasticity_status", "Preserved")
-
-    vekdyn_prediction = vekdyn_predict_1500(
-        personal_bests=personal_bests,
-        threshold=threshold_for_prediction,
-        volume_data=volume_data,
-        elasticity_status=elasticity_status,
-        profile=profile,
-    )
-
-    with st.container(border=True):
-
-        st.subheader("Performance Predictions")
-
-        if vekdyn_prediction.get("is_female"):
-            st.caption(
-                "VEKDYN Women's V1: 5K aerobic strength is the primary anchor, "
-                "with 800m speed reserve and volume as modifiers. Threshold calibration is pending coach testing data."
-            )
-        else:
-            st.caption(
-                "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
-                "supported by threshold, volume compatibility, and preserved elasticity."
-            )
-
-        prediction_col, confidence_col, factors_col = st.columns([2, 1, 2])
-
-        with prediction_col:
-            st.caption("Predicted 1500m Range")
-
-            if vekdyn_prediction["available"]:
-                st.markdown(f"## {vekdyn_prediction['1500_range']}")
-                st.caption(
-                    f"Estimated mile capability: {vekdyn_prediction['mile_display']}"
-                )
-            else:
-                st.markdown("## --")
-                st.caption(vekdyn_prediction["reason"])
-
-            st.caption("Prediction updates as athlete and training data change.")
-
-        with confidence_col:
-            confidence = vekdyn_prediction.get("confidence", 0)
-
-            st.metric(
-                "Confidence",
-                f"{confidence}%"
-            )
-
-            if confidence >= 85:
-                confidence_label = "High Confidence"
-            elif confidence >= 70:
-                confidence_label = "Moderate Confidence"
-            else:
-                confidence_label = "Developing Confidence"
-
-            st.caption(confidence_label)
-
-            recent_miles = vekdyn_prediction.get("weekly_miles")
-            if recent_miles is not None:
-                st.caption(f"Recent volume: {recent_miles:.1f} mi/wk")
-
-        with factors_col:
-            st.write("**Performance Factors**")
-
-            st.progress(
-                vekdyn_prediction.get("aerobic_score", 0) / 100,
-                text="Aerobic Fitness"
-            )
-
-            if vekdyn_prediction.get("is_female"):
-                st.progress(
-                    vekdyn_prediction.get("threshold_score", 50) / 100,
-                    text="Threshold — calibration pending"
-                )
-            else:
-                st.progress(
-                    vekdyn_prediction.get("threshold_score", 0) / 100,
-                    text="Threshold Fitness"
-                )
-
-            st.progress(
-                vekdyn_prediction.get("speed_score", 0) / 100,
-                text="Speed Reserve"
-            )
-
-            st.progress(
-                vekdyn_prediction.get("elasticity_score", 0) / 100,
-                text="Elasticity Preservation"
-            )
-
-            st.caption(
-                f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}"
-            )
-
-# =========================================================
-# TEAM WORKOUTS — WEEKLY COACH PLANNER + NEON
-# =========================================================
-# The coach planner uses a Sunday-Saturday grid like a traditional training
-# spreadsheet while keeping every session in Neon. Existing VEKDYN Athlete
-# reads remain compatible because the original workout columns are preserved.
-
-SESSION_SLOTS = ["AM", "PM"]
-
-
-@st.cache_resource(show_spinner=False)
-def initialize_workouts_database():
-    """Create/upgrade persistent team/athlete workout storage in Neon."""
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS team_workouts (
-                    id BIGSERIAL PRIMARY KEY,
-                    team_id TEXT NOT NULL,
-                    athlete_key TEXT,
-                    workout_date DATE NOT NULL,
-                    workout_type TEXT NOT NULL,
-                    warm_up TEXT,
-                    workout TEXT NOT NULL,
-                    cool_down TEXT,
-                    notes TEXT,
-                    created_by TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS team_workouts_lookup_idx
-                ON team_workouts (team_id, workout_date, athlete_key)
-                """
-            )
-            cursor.execute(
-                """
-                ALTER TABLE team_workouts
-                ADD COLUMN IF NOT EXISTS video_url TEXT
-                """
-            )
-            cursor.execute(
-                """
-                ALTER TABLE team_workouts
-                ADD COLUMN IF NOT EXISTS session_slot TEXT DEFAULT 'AM'
-                """
-            )
-            cursor.execute(
-                """
-                ALTER TABLE team_workouts
-                ADD COLUMN IF NOT EXISTS effort_level TEXT
-                """
-            )
-            cursor.execute(
-                """
-                ALTER TABLE team_workouts
-                ADD COLUMN IF NOT EXISTS planned_miles REAL
-                """
-            )
-            cursor.execute(
-                """
-                UPDATE team_workouts
-                SET session_slot = 'AM'
-                WHERE session_slot IS NULL OR BTRIM(session_slot) = ''
-                """
-            )
-        database.commit()
-
-
-def save_team_workout(
-        team_id,
-        athlete_key,
-        workout_date,
-        session_text,
-        description,
-        video_url="",
-        session_slot="AM",
-):
-    """Save one coach-written session. athlete_key=None means entire team."""
-    clean_session_text = str(session_text or "").strip()
-    clean_description = str(description or "").strip()
-    clean_video_url = str(video_url or "").strip()
-    clean_slot = str(session_slot or "AM").strip().upper()
-
-    if not clean_session_text:
-        raise ValueError("Add the session before saving.")
-
-    if clean_slot not in SESSION_SLOTS:
-        clean_slot = "AM"
-
-    if team_id != "dark_horse_endurance":
-        clean_video_url = ""
-
-    # Preserve the existing database schema so the Athlete Hub and old saved
-    # workouts remain compatible. New simplified entries use workout for the
-    # session text and notes for its description.
-    initialize_workouts_database()
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO team_workouts (
-                    team_id, athlete_key, workout_date, workout_type,
-                    warm_up, workout, cool_down, notes, video_url, created_by,
-                    session_slot, effort_level, planned_miles
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    team_id, athlete_key, workout_date, "Training",
-                    "", clean_session_text, "", clean_description, clean_video_url,
-                    st.session_state.get("logged_in_user", "Coach"),
-                    clean_slot, "", None,
-                ),
-            )
-        database.commit()
-
-def _workout_rows_to_dicts(rows):
-    return [
-        {
-            "id": row[0],
-            "athlete_key": row[1],
-            "Date": row[2],
-            "Type": row[3],
-            "Warm Up": row[4] or "",
-            "Workout": row[5] or "",
-            "Cool Down": row[6] or "",
-            "Notes": row[7] or "",
-            "Video URL": row[8] or "",
-            "Session": (row[9] or "AM").upper(),
-            "Effort": row[10] or "",
-            "Planned Miles": row[11],
-        }
-        for row in rows
-    ]
-
-
-def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
-    """Load upcoming team sessions plus sessions assigned to one athlete."""
-    initialize_workouts_database()
-    today = datetime.now(TEAM_TIMEZONE).date()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            if selected_athlete_key:
-                cursor.execute(
-                    """
-                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                           workout, cool_down, notes, video_url,
-                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
-                    FROM team_workouts
-                    WHERE team_id = %s
-                      AND workout_date >= %s
-                      AND (athlete_key IS NULL OR athlete_key = %s)
-                    ORDER BY workout_date ASC,
-                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
-                             id ASC
-                    LIMIT %s
-                    """,
-                    (team_id, today, selected_athlete_key, int(limit)),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                           workout, cool_down, notes, video_url,
-                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
-                    FROM team_workouts
-                    WHERE team_id = %s
-                      AND workout_date >= %s
-                      AND athlete_key IS NULL
-                    ORDER BY workout_date ASC,
-                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
-                             id ASC
-                    LIMIT %s
-                    """,
-                    (team_id, today, int(limit)),
-                )
-            rows = cursor.fetchall()
-
-    return _workout_rows_to_dicts(rows)
-
-
-def load_team_workouts_range(team_id, start_date, end_date, selected_athlete_key=None):
-    """Load a complete Sunday-Saturday planning window for the selected athlete."""
-    initialize_workouts_database()
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            if selected_athlete_key:
-                cursor.execute(
-                    """
-                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                           workout, cool_down, notes, video_url,
-                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
-                    FROM team_workouts
-                    WHERE team_id = %s
-                      AND workout_date BETWEEN %s AND %s
-                      AND (athlete_key IS NULL OR athlete_key = %s)
-                    ORDER BY workout_date ASC,
-                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
-                             id ASC
-                    """,
-                    (team_id, start_date, end_date, selected_athlete_key),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT id, athlete_key, workout_date, workout_type, warm_up,
-                           workout, cool_down, notes, video_url,
-                           COALESCE(session_slot, 'AM'), effort_level, planned_miles
-                    FROM team_workouts
-                    WHERE team_id = %s
-                      AND workout_date BETWEEN %s AND %s
-                      AND athlete_key IS NULL
-                    ORDER BY workout_date ASC,
-                             CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
-                             id ASC
-                    """,
-                    (team_id, start_date, end_date),
-                )
-            rows = cursor.fetchall()
-
-    return _workout_rows_to_dicts(rows)
-
-
-def delete_team_workout(workout_id, team_id):
-    """Delete one workout while keeping school data isolated."""
-    initialize_workouts_database()
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM team_workouts WHERE id = %s AND team_id = %s",
-                (int(workout_id), team_id),
-            )
-        database.commit()
-
-
-def workout_value(value, fallback="—"):
-    value = "" if value is None else str(value).strip()
-    return fallback if not value or value.lower() == "nan" else value
-
-
-def _session_title(workout):
-    """Session text shown in the AM/PM Session row."""
-    main = workout_value(workout.get("Workout"), "")
-    if main:
-        return main
-    return workout_value(workout.get("Type"), "Training")
-
-
-def _session_description(workout):
-    """Description/cues shown in the AM/PM Description row."""
-    notes = workout_value(workout.get("Notes"), "")
-    # Legacy workouts may still have warm-up/cool-down fields. Keep them visible.
-    pieces = []
-    warmup = workout_value(workout.get("Warm Up"), "")
-    cooldown = workout_value(workout.get("Cool Down"), "")
-    if warmup:
-        pieces.append(f"WU: {warmup}")
-    if notes:
-        pieces.append(notes)
-    if cooldown:
-        pieces.append(f"CD: {cooldown}")
-    return " | ".join(pieces) if pieces else "—"
-
-
-def _miles_from_text(text):
-    """Best-effort mileage extraction from coach-written session/description text."""
-    text = str(text or "").lower().replace("×", "x")
-    total = 0.0
-
-    # 5 x 1 mile / 6x800m / 8 x 400 m
-    for reps, distance, unit in re.findall(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*(miles?|mi|km|k|meters?|metres?|m)\b", text):
-        reps, distance = float(reps), float(distance)
-        if unit.startswith("mi"):
-            total += reps * distance
-        elif unit in ("km", "k"):
-            total += reps * distance * 0.621371
-        else:
-            total += reps * distance / 1609.344
-
-    # Remove rep expressions so their distance is not counted again below.
-    stripped = re.sub(r"\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?\s*(?:miles?|mi|km|k|meters?|metres?|m)\b", " ", text)
-
-    # Standalone distances: 3 mi, 2 miles, 5k, 3 km.
-    for distance, unit in re.findall(r"(?<![\dx])\b(\d+(?:\.\d+)?)\s*(miles?|mi|km|k)\b", stripped):
-        distance = float(distance)
-        total += distance if unit.startswith("mi") else distance * 0.621371
-
-    # Common shorthand used by the team: 3 WU/WP and 2 CD mean miles.
-    for distance, marker in re.findall(r"\b(\d+(?:\.\d+)?)\s*(wu|wp|cd)\b", stripped):
-        total += float(distance)
-
-    return round(total, 2) if total > 0 else None
-
-
-def _workout_miles(workout):
-    """Calculate one session's mileage from its written fields."""
-    texts = [
-        workout.get("Warm Up", ""), workout.get("Workout", ""),
-        workout.get("Cool Down", ""), workout.get("Notes", ""),
-    ]
-    values = [_miles_from_text(value) for value in texts]
-    values = [value for value in values if value is not None]
-    if values:
-        return round(sum(values), 2)
-    if workout.get("Planned Miles") is not None:
-        return float(workout["Planned Miles"])
-    return None
-
-
-@st.cache_resource(show_spinner=False)
-def initialize_daily_feedback_database():
-    """
-    Shared athlete day-feedback storage.
-
-    The Athlete Hub will write one short note per athlete/date.
-    The Coach Hub only reads it and displays it in the weekly training plan.
-    """
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS athlete_daily_feedback (
-                    id BIGSERIAL PRIMARY KEY,
-                    team_id TEXT NOT NULL,
-                    athlete_key TEXT NOT NULL,
-                    feedback_date DATE NOT NULL,
-                    note_text TEXT NOT NULL,
+    @st.cache_resource(show_spinner=False)
+    def initialize_conference_results_database():
+        with get_database_connection() as db:
+            with db.cursor() as cursor:
+                cursor.execute("""CREATE TABLE IF NOT EXISTS conference_results (
+                    team_id TEXT NOT NULL, season TEXT NOT NULL,
+                    event TEXT NOT NULL, division TEXT NOT NULL,
+                    athlete TEXT NOT NULL, school TEXT NOT NULL,
+                    performance_seconds DOUBLE PRECISION NOT NULL,
+                    performance_text TEXT NOT NULL,
+                    meet_date TEXT,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (team_id, athlete_key, feedback_date)
-                );
-                """
+                    PRIMARY KEY (team_id,season,event,division,athlete,school)
+                )""")
+            db.commit()
+
+
+    def parse_conference_time(value):
+        text_value = str(value).strip()
+        parts = text_value.split(":")
+        if not parts or len(parts) > 3:
+            raise ValueError("Invalid performance time")
+        try:
+            seconds = 0.0
+            for part in parts:
+                seconds = seconds * 60 + float(part)
+        except ValueError as exc:
+            raise ValueError("Invalid performance time") from exc
+        if seconds <= 0 or seconds > 86400:
+            raise ValueError("Invalid performance time")
+        return seconds
+
+
+    def save_conference_results(team_id, season, event, division, frame):
+        required = {"athlete", "school", "time"}
+        if not required.issubset(frame.columns):
+            raise ValueError("CSV must have athlete, school, and time columns; meet_date is optional.")
+        rows = []
+        for _, item in frame.iterrows():
+            athlete_name = str(item["athlete"]).strip()
+            school_name = str(item["school"]).strip()
+            if not athlete_name or not school_name:
+                continue
+            mark = str(item["time"]).strip()
+            rows.append((team_id, season, event, division, athlete_name,
+                         school_name, parse_conference_time(mark), mark,
+                         str(item.get("meet_date", "")).strip()))
+        if not rows:
+            raise ValueError("No valid performances in uploaded CSV.")
+        initialize_conference_results_database()
+        with get_database_connection() as db:
+            with db.cursor() as cursor:
+                cursor.execute("DELETE FROM conference_results WHERE team_id=%s AND season=%s AND event=%s AND division=%s",
+                               (team_id, season, event, division))
+                cursor.executemany("""INSERT INTO conference_results
+                    (team_id,season,event,division,athlete,school,performance_seconds,performance_text,meet_date)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", rows)
+            db.commit()
+        return len(rows)
+
+
+    def load_conference_results(team_id, season, event, division):
+        initialize_conference_results_database()
+        with get_database_connection() as db:
+            with db.cursor() as cursor:
+                cursor.execute("""SELECT athlete,school,performance_seconds,performance_text,meet_date,updated_at
+                    FROM conference_results WHERE team_id=%s AND season=%s AND event=%s AND division=%s
+                    ORDER BY performance_seconds,athlete""", (team_id, season, event, division))
+                return cursor.fetchall()
+
+
+    def sync_bundled_rrac_results(team_id):
+        """Import bundled RRAC results once per file revision, not on every rerun.
+
+        The CSV must also be committed to the Streamlit Cloud GitHub repository.
+        This imports a local snapshot; it does not fetch live TFRRS results.
+        """
+        if team_id != "ollu_distance":
+            return None
+        base = Path(__file__).resolve().parent
+        candidates = [base / "rrac_top8_2026_championship.csv", base / "rrac_results.csv"]
+        csv_path = next((candidate for candidate in candidates if candidate.exists() and candidate.stat().st_size > 100), None)
+        if csv_path is None:
+            return "No bundled RRAC results CSV found in deployed project."
+        raw = csv_path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        frame = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        required = {"athlete", "school", "gender", "event", "performance", "season"}
+        missing = required - set(frame.columns)
+        if missing:
+            return f"RRAC CSV missing columns: {', '.join(sorted(missing))}"
+        # Normalize the season label used by the downloaded results CSV.
+        frame["season"] = frame["season"].str.strip().replace({
+            "2026 Outdoor": "Outdoor 2026", "2026 Indoor": "Indoor 2026",
+            "2027 Outdoor": "Outdoor 2027", "2027 Indoor": "Indoor 2027",
+        })
+        frame["division"] = frame["gender"].str.strip().str.lower().map({
+            "m": "Men", "men": "Men", "male": "Men",
+            "f": "Women", "women": "Women", "female": "Women",
+        })
+        frame["event"] = frame["event"].str.strip()
+        frame["athlete"] = frame["athlete"].str.strip()
+        frame["school"] = frame["school"].str.strip()
+        frame["performance"] = frame["performance"].str.strip()
+        frame = frame[(frame["division"].notna()) & (frame["athlete"] != "") &
+                      (frame["school"] != "") & (frame["performance"] != "")].copy()
+        if frame.empty:
+            return "RRAC CSV has no usable performances."
+        # Validate the entire file before touching the database.
+        records = []
+        for _, item in frame.iterrows():
+            records.append((team_id, item["season"], item["event"], item["division"],
+                            item["athlete"], item["school"],
+                            parse_conference_time(item["performance"]), item["performance"],
+                            item.get("meet_date", "")))
+        # Preserve the best mark for duplicate athlete/event combinations.
+        best = {}
+        for record in records:
+            key = (record[0], record[1], record[2], record[3], record[4].casefold(), record[5].casefold())
+            if key not in best or record[6] < best[key][6]:
+                best[key] = record
+        records = list(best.values())
+        initialize_conference_results_database()
+        with get_database_connection() as db:
+            with db.cursor() as cursor:
+                cursor.execute("""CREATE TABLE IF NOT EXISTS conference_csv_imports (
+                    team_id TEXT NOT NULL, filename TEXT NOT NULL, sha256 TEXT NOT NULL,
+                    imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (team_id, filename))""")
+                cursor.execute("SELECT sha256 FROM conference_csv_imports WHERE team_id=%s AND filename=%s",
+                               (team_id, csv_path.name))
+                previous = cursor.fetchone()
+                if previous and previous[0] == digest:
+                    return None
+                # Only replace the event/season/division groups included in this file.
+                groups = sorted({(r[1], r[2], r[3]) for r in records})
+                for season, event, division in groups:
+                    cursor.execute("""DELETE FROM conference_results
+                        WHERE team_id=%s AND season=%s AND event=%s AND division=%s""",
+                        (team_id, season, event, division))
+                cursor.executemany("""INSERT INTO conference_results
+                    (team_id,season,event,division,athlete,school,performance_seconds,performance_text,meet_date)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", records)
+                cursor.execute("""INSERT INTO conference_csv_imports (team_id,filename,sha256)
+                    VALUES (%s,%s,%s) ON CONFLICT (team_id,filename) DO UPDATE SET
+                    sha256=EXCLUDED.sha256, imported_at=NOW()""", (team_id, csv_path.name, digest))
+            db.commit()
+        return f"Imported {len(records)} RRAC results from {csv_path.name}."
+
+
+    def render_conference_rankings(team_id, athlete_profile, prediction):
+        st.markdown("---")
+        with st.container(border=True):
+            st.subheader("Conference Rankings")
+            st.caption(CONFERENCE_BY_TEAM.get(team_id, "Conference not configured"))
+            try:
+                sync_status = sync_bundled_rrac_results(team_id)
+                if sync_status:
+                    st.caption(sync_status)
+            except (ValueError, psycopg2.Error, pd.errors.ParserError, OSError) as error:
+                st.warning(f"Bundled RRAC import failed: {error}")
+            event_col, season_col, division_col = st.columns(3)
+            with event_col:
+                event = st.selectbox("Event", ["1500m", "800m", "Mile", "3000m", "5000m", "10000m"], key="conference_event")
+            with season_col:
+                season = st.selectbox("Season", ["Outdoor 2026", "Indoor 2026", "Outdoor 2027", "Indoor 2027"], key="conference_season")
+            with division_col:
+                sex = str(athlete_profile.get("sex", "")).strip().lower()
+                default = 1 if sex in ("f", "female", "women", "woman") else 0
+                division = st.selectbox("Division", ["Men", "Women"], index=default, key="conference_division")
+            st.caption("Results load automatically from the bundled conference CSV. External feed checks are planned every 14 days once configured.")
+            try:
+                rows = load_conference_results(team_id, season, event, division)
+            except psycopg2.Error as error:
+                st.warning(f"Conference rankings unavailable: {error}")
+                return
+            if not rows:
+                st.info("No results available for this event, season, and division. Check the bundled conference CSV and deployment.")
+                return
+            updated = max(row[5] for row in rows if row[5] is not None)
+            next_update = updated + timedelta(days=14)
+            st.caption(
+                f"Last results update: {updated.strftime('%b %d, %Y')} · "
+                f"Next scheduled check: {next_update.strftime('%b %d, %Y')} · "
+                f"{len(rows)} performances"
             )
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_athlete_daily_feedback_lookup
-                ON athlete_daily_feedback (team_id, athlete_key, feedback_date);
-                """
-            )
-        database.commit()
+            if datetime.now(timezone.utc) >= next_update:
+                st.info("Results are due for a refresh. The scheduled importer will update them when an authorized feed is configured.")
+            athlete_name = str(athlete_profile.get("name", "")).strip().casefold()
+            school_name = str(athlete_profile.get("school", "")).strip().casefold()
+            own = next((i for i, r in enumerate(rows) if r[0].strip().casefold() == athlete_name
+                        and (not school_name or school_name in r[1].strip().casefold() or r[1].strip().casefold() in school_name)), None)
+            projection_keys = {
+                "1500m": ("1500_seconds", "1500_mid"),
+                "Mile": ("mile_seconds", "mile_display"),
+                "5000m": ("5000_seconds", "5000_display"),
+            }
+            projected = None
+            projected_label = None
+            if prediction.get("available") and event in projection_keys:
+                seconds_key, label_key = projection_keys[event]
+                if prediction.get(seconds_key) is not None:
+                    projected = float(prediction[seconds_key])
+                    projected_label = prediction.get(label_key)
+            # Do not count the athlete's own existing mark as an opponent.
+            projected_rank = (1 + sum(1 for i, r in enumerate(rows)
+                                      if i != own and float(r[2]) < projected)) if projected is not None else None
+            b, c = st.columns(2)
+            b.metric("Projected Conference Rank", f"#{projected_rank}" if projected_rank else "—")
+            c.metric("Potential Scoring Position", "Top 8" if projected_rank and projected_rank <= 8 else "—")
+            if projected is not None:
+                st.caption(f"VEKDYN projected {event}: {projected_label} · projected conference position #{projected_rank}.")
+            elif event not in projection_keys:
+                st.caption("No VEKDYN prediction model for this event yet; official rankings remain available.")
+            if event == "5000m" and projected is not None:
+                st.caption("5K estimate is provisional: it blends the existing 5K PB with the model's 1500m-equivalent estimate. It is not an independently calibrated 5K model.")
+            st.caption("Official performances remain unchanged. Projected rank is hypothetical, based on imported results; ties and championship entry rules may affect actual placement.")
+            display_rows = [{"Rank": i+1, "Athlete": r[0], "School": r[1], "Time": r[3], "Type": "Official"}
+                            for i, r in enumerate(rows)]
+            if projected is not None:
+                # Insert a clearly labeled projection without altering any official marks.
+                projection_row = {"Rank": projected_rank, "Athlete": athlete_profile.get("name", "Selected athlete"),
+                                  "School": athlete_profile.get("school", ""), "Time": projected_label,
+                                  "Type": "VEKDYN projection"}
+                display_rows.insert(max(0, projected_rank - 1), projection_row)
+                # Recalculate display positions to avoid duplicate numeric labels.
+                for index, item in enumerate(display_rows):
+                    item["Rank"] = index + 1
+            st.dataframe(pd.DataFrame(display_rows[:8]), hide_index=True, use_container_width=True)
 
 
-def load_daily_feedback_range(team_id, selected_athlete_key, start_date, end_date):
-    """Load the selected athlete's day-specific feedback for the visible week."""
-    if not selected_athlete_key:
-        return {}
 
-    initialize_daily_feedback_database()
+    if dashboard_view == "Predictor":
+        # =========================================================
+        # PERFORMANCE PREDICTIONS — LIVE VEKDYN MODEL
+        # =========================================================
 
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT feedback_date, note_text
-                FROM athlete_daily_feedback
-                WHERE team_id = %s
-                  AND athlete_key = %s
-                  AND feedback_date BETWEEN %s AND %s
-                ORDER BY feedback_date ASC;
-                """,
-                (
-                    team_id,
-                    selected_athlete_key,
-                    start_date,
-                    end_date,
-                ),
-            )
-            rows = cursor.fetchall()
+        threshold_for_prediction = athlete.get("threshold", {})
 
-    return {
-        row[0]: (row[1] or "").strip()
-        for row in rows
-        if row[1] and str(row[1]).strip()
-    }
+        # The current model assumes the athlete's elasticity/speed qualities are being
+        # preserved unless future athlete/coach data says otherwise.
+        elasticity_status = athlete.get("elasticity_status", "Preserved")
+
+        vekdyn_prediction = vekdyn_predict_1500(
+            personal_bests=personal_bests,
+            threshold=threshold_for_prediction,
+            volume_data=volume_data,
+            elasticity_status=elasticity_status,
+            profile=profile,
+        )
+
+        with st.container(border=True):
+            st.subheader("Performance Predictions")
+            st.caption("Projected race performances based on the current athlete profile.")
+
+            prediction_col, confidence_col = st.columns([3, 1])
+            with prediction_col:
+                if vekdyn_prediction.get("available"):
+                    race_a, race_b = st.columns(2)
+                    with race_a:
+                        st.caption("Projected 1500m Range")
+                        st.markdown(f"## {vekdyn_prediction['1500_range']}")
+                        st.caption(f"Projected mile: {vekdyn_prediction['mile_display']}")
+                    with race_b:
+                        st.caption("Projected 5000m")
+                        if vekdyn_prediction.get("5000_display"):
+                            st.markdown(f"## {vekdyn_prediction['5000_display']}")
+                            st.caption("Provisional estimate — calibration ongoing")
+                        else:
+                            st.markdown("## --")
+                            st.caption("Insufficient data for a 5000m estimate")
+                else:
+                    st.markdown("## --")
+                    st.caption(vekdyn_prediction.get("reason", "Insufficient data for a prediction."))
+                st.caption("Predictions update as athlete and training data change.")
+
+            with confidence_col:
+                confidence = vekdyn_prediction.get("confidence", 0)
+                st.metric("Confidence", f"{confidence}%")
+                if confidence >= 85:
+                    confidence_label = "High Confidence"
+                elif confidence >= 70:
+                    confidence_label = "Moderate Confidence"
+                else:
+                    confidence_label = "Developing Confidence"
+                st.caption(confidence_label)
+
+            # Coaches see the predictions first; the model explanation is optional.
+            with st.expander("Why VEKDYN predicts these times", expanded=False):
+                if vekdyn_prediction.get("is_female"):
+                    st.caption(
+                        "VEKDYN Women's V1: 5K aerobic strength is the primary anchor, "
+                        "with 800m speed reserve and volume as modifiers. "
+                        "Threshold calibration is pending coach testing data."
+                    )
+                else:
+                    st.caption(
+                        "VEKDYN profile model: 800m speed reserve + 5K aerobic ability, "
+                        "supported by threshold, volume compatibility, and preserved elasticity."
+                    )
+                st.write("**Performance Factors**")
+                st.progress(vekdyn_prediction.get("aerobic_score", 0) / 100, text="Aerobic Fitness")
+                if vekdyn_prediction.get("is_female"):
+                    st.progress(
+                        vekdyn_prediction.get("threshold_score", 50) / 100,
+                        text="Threshold — calibration pending",
+                    )
+                else:
+                    st.progress(
+                        vekdyn_prediction.get("threshold_score", 0) / 100,
+                        text="Threshold Fitness",
+                    )
+                st.progress(vekdyn_prediction.get("speed_score", 0) / 100, text="Speed Reserve")
+                st.progress(
+                    vekdyn_prediction.get("elasticity_score", 0) / 100,
+                    text="Elasticity Preservation",
+                )
+                st.caption(f"Volume compatibility: {vekdyn_prediction.get('volume_label', 'Unknown')}")
+                recent_miles = vekdyn_prediction.get("weekly_miles")
+                if recent_miles is not None:
+                    st.caption(f"Recent volume: {recent_miles:.1f} mi/wk")
+
+        render_conference_rankings(active_team, profile, vekdyn_prediction)
+
+    # =========================================================
+    # TEAM WORKOUTS — WEEKLY COACH PLANNER + NEON
+    # =========================================================
+    # The coach planner uses a Sunday-Saturday grid like a traditional training
+    # spreadsheet while keeping every session in Neon. Existing VEKDYN Athlete
+    # reads remain compatible because the original workout columns are preserved.
+
+    SESSION_SLOTS = ["AM", "PM"]
 
 
-def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
-    """Build the Sunday-Saturday matrix shown to the coach."""
-    dates = [week_start + timedelta(days=i) for i in range(7)]
-    by_day_slot = {(day, slot): [] for day in dates for slot in SESSION_SLOTS}
+    @st.cache_resource(show_spinner=False)
+    def initialize_workouts_database():
+        """Create/upgrade persistent team/athlete workout storage in Neon."""
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS team_workouts (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id TEXT NOT NULL,
+                        athlete_key TEXT,
+                        workout_date DATE NOT NULL,
+                        workout_type TEXT NOT NULL,
+                        warm_up TEXT,
+                        workout TEXT NOT NULL,
+                        cool_down TEXT,
+                        notes TEXT,
+                        created_by TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS team_workouts_lookup_idx
+                    ON team_workouts (team_id, workout_date, athlete_key)
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE team_workouts
+                    ADD COLUMN IF NOT EXISTS video_url TEXT
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE team_workouts
+                    ADD COLUMN IF NOT EXISTS session_slot TEXT DEFAULT 'AM'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE team_workouts
+                    ADD COLUMN IF NOT EXISTS effort_level TEXT
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE team_workouts
+                    ADD COLUMN IF NOT EXISTS planned_miles REAL
+                    """
+                )
+                cursor.execute(
+                    """
+                    UPDATE team_workouts
+                    SET session_slot = 'AM'
+                    WHERE session_slot IS NULL OR BTRIM(session_slot) = ''
+                    """
+                )
+            database.commit()
 
-    for workout in workouts:
-        day = workout.get("Date")
-        if hasattr(day, "date"):
-            day = day.date()
-        slot = str(workout.get("Session") or "AM").upper()
-        if slot not in SESSION_SLOTS:
-            slot = "AM"
-        if (day, slot) in by_day_slot:
-            by_day_slot[(day, slot)].append(workout)
 
-    def join_for(day, slot, field):
-        sessions = by_day_slot[(day, slot)]
-        if not sessions:
+    def save_team_workout(
+            team_id,
+            athlete_key,
+            workout_date,
+            session_text,
+            description,
+            video_url="",
+            session_slot="AM",
+    ):
+        """Save one coach-written session. athlete_key=None means entire team."""
+        clean_session_text = str(session_text or "").strip()
+        clean_description = str(description or "").strip()
+        clean_video_url = str(video_url or "").strip()
+        clean_slot = str(session_slot or "AM").strip().upper()
+
+        if not clean_session_text:
+            raise ValueError("Add the session before saving.")
+
+        if clean_slot not in SESSION_SLOTS:
+            clean_slot = "AM"
+
+        if team_id != "dark_horse_endurance":
+            clean_video_url = ""
+
+        # Preserve the existing database schema so the Athlete Hub and old saved
+        # workouts remain compatible. New simplified entries use workout for the
+        # session text and notes for its description.
+        initialize_workouts_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO team_workouts (
+                        team_id, athlete_key, workout_date, workout_type,
+                        warm_up, workout, cool_down, notes, video_url, created_by,
+                        session_slot, effort_level, planned_miles
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        team_id, athlete_key, workout_date, "Training",
+                        "", clean_session_text, "", clean_description, clean_video_url,
+                        st.session_state.get("logged_in_user", "Coach"),
+                        clean_slot, "", None,
+                    ),
+                )
+            database.commit()
+        load_team_workouts_range.clear()
+
+    def _workout_rows_to_dicts(rows):
+        return [
+            {
+                "id": row[0],
+                "athlete_key": row[1],
+                "Date": row[2],
+                "Type": row[3],
+                "Warm Up": row[4] or "",
+                "Workout": row[5] or "",
+                "Cool Down": row[6] or "",
+                "Notes": row[7] or "",
+                "Video URL": row[8] or "",
+                "Session": (row[9] or "AM").upper(),
+                "Effort": row[10] or "",
+                "Planned Miles": row[11],
+            }
+            for row in rows
+        ]
+
+
+    def load_team_workouts(team_id, selected_athlete_key=None, limit=12):
+        """Load upcoming team sessions plus sessions assigned to one athlete."""
+        initialize_workouts_database()
+        today = datetime.now(TEAM_TIMEZONE).date()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                if selected_athlete_key:
+                    cursor.execute(
+                        """
+                        SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                               workout, cool_down, notes, video_url,
+                               COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                        FROM team_workouts
+                        WHERE team_id = %s
+                          AND workout_date >= %s
+                          AND (athlete_key IS NULL OR athlete_key = %s)
+                        ORDER BY workout_date ASC,
+                                 CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                                 id ASC
+                        LIMIT %s
+                        """,
+                        (team_id, today, selected_athlete_key, int(limit)),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                               workout, cool_down, notes, video_url,
+                               COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                        FROM team_workouts
+                        WHERE team_id = %s
+                          AND workout_date >= %s
+                          AND athlete_key IS NULL
+                        ORDER BY workout_date ASC,
+                                 CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                                 id ASC
+                        LIMIT %s
+                        """,
+                        (team_id, today, int(limit)),
+                    )
+                rows = cursor.fetchall()
+
+        return _workout_rows_to_dicts(rows)
+
+
+    @st.cache_data(ttl=30, show_spinner=False)
+    def load_team_workouts_range(team_id, start_date, end_date, selected_athlete_key=None):
+        """Load a complete Sunday-Saturday planning window for the selected athlete."""
+        initialize_workouts_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                if selected_athlete_key:
+                    cursor.execute(
+                        """
+                        SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                               workout, cool_down, notes, video_url,
+                               COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                        FROM team_workouts
+                        WHERE team_id = %s
+                          AND workout_date BETWEEN %s AND %s
+                          AND (athlete_key IS NULL OR athlete_key = %s)
+                        ORDER BY workout_date ASC,
+                                 CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                                 id ASC
+                        """,
+                        (team_id, start_date, end_date, selected_athlete_key),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT id, athlete_key, workout_date, workout_type, warm_up,
+                               workout, cool_down, notes, video_url,
+                               COALESCE(session_slot, 'AM'), effort_level, planned_miles
+                        FROM team_workouts
+                        WHERE team_id = %s
+                          AND workout_date BETWEEN %s AND %s
+                          AND athlete_key IS NULL
+                        ORDER BY workout_date ASC,
+                                 CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                                 id ASC
+                        """,
+                        (team_id, start_date, end_date),
+                    )
+                rows = cursor.fetchall()
+
+        return _workout_rows_to_dicts(rows)
+
+
+    def delete_team_workout(workout_id, team_id):
+        """Delete one workout while keeping school data isolated."""
+        initialize_workouts_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM team_workouts WHERE id = %s AND team_id = %s",
+                    (int(workout_id), team_id),
+                )
+            database.commit()
+        load_team_workouts_range.clear()
+
+
+    def workout_value(value, fallback="—"):
+        value = "" if value is None else str(value).strip()
+        return fallback if not value or value.lower() == "nan" else value
+
+
+    def _session_title(workout):
+        """Session text shown in the AM/PM Session row."""
+        main = workout_value(workout.get("Workout"), "")
+        if main:
+            return main
+        return workout_value(workout.get("Type"), "Training")
+
+
+    def _session_description(workout):
+        """Description/cues shown in the AM/PM Description row."""
+        notes = workout_value(workout.get("Notes"), "")
+        # Legacy workouts may still have warm-up/cool-down fields. Keep them visible.
+        pieces = []
+        warmup = workout_value(workout.get("Warm Up"), "")
+        cooldown = workout_value(workout.get("Cool Down"), "")
+        if warmup:
+            pieces.append(f"WU: {warmup}")
+        if notes:
+            pieces.append(notes)
+        if cooldown:
+            pieces.append(f"CD: {cooldown}")
+        return " | ".join(pieces) if pieces else "—"
+
+
+    def _miles_from_text(text):
+        """Best-effort mileage extraction from coach-written session/description text."""
+        text = str(text or "").lower().replace("×", "x")
+        total = 0.0
+
+        # 5 x 1 mile / 6x800m / 8 x 400 m
+        for reps, distance, unit in re.findall(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*(miles?|mi|km|k|meters?|metres?|m)\b", text):
+            reps, distance = float(reps), float(distance)
+            if unit.startswith("mi"):
+                total += reps * distance
+            elif unit in ("km", "k"):
+                total += reps * distance * 0.621371
+            else:
+                total += reps * distance / 1609.344
+
+        # Remove rep expressions so their distance is not counted again below.
+        stripped = re.sub(r"\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?\s*(?:miles?|mi|km|k|meters?|metres?|m)\b", " ", text)
+
+        # Standalone distances: 3 mi, 2 miles, 5k, 3 km.
+        for distance, unit in re.findall(r"(?<![\dx])\b(\d+(?:\.\d+)?)\s*(miles?|mi|km|k)\b", stripped):
+            distance = float(distance)
+            total += distance if unit.startswith("mi") else distance * 0.621371
+
+        # Common shorthand used by the team: 3 WU/WP and 2 CD mean miles.
+        for distance, marker in re.findall(r"\b(\d+(?:\.\d+)?)\s*(wu|wp|cd)\b", stripped):
+            total += float(distance)
+
+        return round(total, 2) if total > 0 else None
+
+
+    def _workout_miles(workout):
+        """Calculate one session's mileage from its written fields."""
+        texts = [
+            workout.get("Warm Up", ""), workout.get("Workout", ""),
+            workout.get("Cool Down", ""), workout.get("Notes", ""),
+        ]
+        values = [_miles_from_text(value) for value in texts]
+        values = [value for value in values if value is not None]
+        if values:
+            return round(sum(values), 2)
+        if workout.get("Planned Miles") is not None:
+            return float(workout["Planned Miles"])
+        return None
+
+
+    @st.cache_resource(show_spinner=False)
+    def initialize_daily_feedback_database():
+        """
+        Shared athlete day-feedback storage.
+
+        The Athlete Hub will write one short note per athlete/date.
+        The Coach Hub only reads it and displays it in the weekly training plan.
+        """
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_daily_feedback (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id TEXT NOT NULL,
+                        athlete_key TEXT NOT NULL,
+                        feedback_date DATE NOT NULL,
+                        note_text TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (team_id, athlete_key, feedback_date)
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_athlete_daily_feedback_lookup
+                    ON athlete_daily_feedback (team_id, athlete_key, feedback_date);
+                    """
+                )
+            database.commit()
+
+
+    def load_daily_feedback_range(team_id, selected_athlete_key, start_date, end_date):
+        """Load the selected athlete's day-specific feedback for the visible week."""
+        if not selected_athlete_key:
+            return {}
+
+        initialize_daily_feedback_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT feedback_date, note_text
+                    FROM athlete_daily_feedback
+                    WHERE team_id = %s
+                      AND athlete_key = %s
+                      AND feedback_date BETWEEN %s AND %s
+                    ORDER BY feedback_date ASC;
+                    """,
+                    (
+                        team_id,
+                        selected_athlete_key,
+                        start_date,
+                        end_date,
+                    ),
+                )
+                rows = cursor.fetchall()
+
+        return {
+            row[0]: (row[1] or "").strip()
+            for row in rows
+            if row[1] and str(row[1]).strip()
+        }
+
+
+    def _weekly_workout_matrix(workouts, week_start, athlete_feedback=None):
+        """Build the Sunday-Saturday matrix shown to the coach."""
+        dates = [week_start + timedelta(days=i) for i in range(7)]
+        by_day_slot = {(day, slot): [] for day in dates for slot in SESSION_SLOTS}
+
+        for workout in workouts:
+            day = workout.get("Date")
+            if hasattr(day, "date"):
+                day = day.date()
+            slot = str(workout.get("Session") or "AM").upper()
+            if slot not in SESSION_SLOTS:
+                slot = "AM"
+            if (day, slot) in by_day_slot:
+                by_day_slot[(day, slot)].append(workout)
+
+        def join_for(day, slot, field):
+            sessions = by_day_slot[(day, slot)]
+            if not sessions:
+                return "—"
+            if field == "title":
+                return " / ".join(_session_title(item) for item in sessions)
+            if field == "description":
+                return " || ".join(_session_description(item) for item in sessions)
+            if field == "effort":
+                values = [workout_value(item.get("Effort"), "") for item in sessions]
+                values = [value for value in values if value]
+                return " / ".join(values) if values else "—"
             return "—"
-        if field == "title":
-            return " / ".join(_session_title(item) for item in sessions)
-        if field == "description":
-            return " || ".join(_session_description(item) for item in sessions)
-        if field == "effort":
-            values = [workout_value(item.get("Effort"), "") for item in sessions]
-            values = [value for value in values if value]
-            return " / ".join(values) if values else "—"
-        return "—"
 
-    columns = [day.strftime("%a\n%b %-d") for day in dates]
-    rows = {
-        "AM Session": [join_for(day, "AM", "title") for day in dates],
-        "PM Session": [join_for(day, "PM", "title") for day in dates],
-        "AM Description": [join_for(day, "AM", "description") for day in dates],
-        "PM Description": [join_for(day, "PM", "description") for day in dates],
-    }
+        columns = [day.strftime("%a\n%b %-d") for day in dates]
+        rows = {
+            "AM Session": [join_for(day, "AM", "title") for day in dates],
+            "PM Session": [join_for(day, "PM", "title") for day in dates],
+            "AM Description": [join_for(day, "AM", "description") for day in dates],
+            "PM Description": [join_for(day, "PM", "description") for day in dates],
+        }
 
-    daily_miles = []
-    for day in dates:
-        miles = [
-            _workout_miles(item)
-            for slot in SESSION_SLOTS
-            for item in by_day_slot[(day, slot)]
-        ]
-        miles = [value for value in miles if value is not None]
-        daily_miles.append(round(sum(miles), 1) if miles else None)
+        daily_miles = []
+        for day in dates:
+            miles = [
+                _workout_miles(item)
+                for slot in SESSION_SLOTS
+                for item in by_day_slot[(day, slot)]
+            ]
+            miles = [value for value in miles if value is not None]
+            daily_miles.append(round(sum(miles), 1) if miles else None)
 
-    rows["Total Day Mileage"] = [
-        f"{value:g}" if value is not None else "—"
-        for value in daily_miles
-    ]
-
-    # Day-specific athlete feedback replaces the old standalone Notes area.
-    # It stays attached to the exact training day where it is useful.
-    if athlete_feedback is not None:
-        rows["Athlete Feedback"] = [
-            workout_value(athlete_feedback.get(day), "—")
-            for day in dates
+        rows["Total Day Mileage"] = [
+            f"{value:g}" if value is not None else "—"
+            for value in daily_miles
         ]
 
-    matrix = pd.DataFrame(rows, index=columns).T
-    weekly_total = round(sum(value for value in daily_miles if value is not None), 1)
-    has_mileage = any(value is not None for value in daily_miles)
-    return matrix, (weekly_total if has_mileage else None)
+        # Day-specific athlete feedback replaces the old standalone Notes area.
+        # It stays attached to the exact training day where it is useful.
+        if athlete_feedback is not None:
+            rows["Athlete Feedback"] = [
+                workout_value(athlete_feedback.get(day), "—")
+                for day in dates
+            ]
+
+        matrix = pd.DataFrame(rows, index=columns).T
+        weekly_total = round(sum(value for value in daily_miles if value is not None), 1)
+        has_mileage = any(value is not None for value in daily_miles)
+        return matrix, (weekly_total if has_mileage else None)
 
 
-def _dark_horse_workout_calendar_style(matrix):
-    """Dark Horse spreadsheet-inspired weekly planner styling."""
-    styler = matrix.style
-    styler = styler.set_properties(**{
-        "background-color": "#111116",
-        "color": "#f7f7f8",
-        "border-color": "#4d3563",
-        "font-size": "13px",
-    })
-    styler = styler.set_table_styles([
-        {"selector": "th", "props": [
-            ("background-color", "#7c35b8"),
-            ("color", "#ffffff"),
-            ("font-weight", "700"),
-            ("border", "1px solid #a65ae0"),
-            ("text-align", "center"),
-        ]},
-        {"selector": "th.row_heading", "props": [
-            ("background-color", "#24152f"),
-            ("color", "#f5eefe"),
-            ("font-weight", "700"),
-            ("border", "1px solid #5c3a73"),
-            ("text-align", "left"),
-        ]},
-        {"selector": "td", "props": [
-            ("background-color", "#111116"),
-            ("color", "#f7f7f8"),
-            ("border", "1px solid #3d3047"),
-        ]},
-        {"selector": "tbody tr:nth-child(odd) td", "props": [
-            ("background-color", "#17121d"),
-        ]},
-        {"selector": "tbody tr:last-child td", "props": [
-            ("background-color", "#2b1738"),
-            ("color", "#ffffff"),
-            ("font-weight", "700"),
-        ]},
-    ], overwrite=False)
-    return styler
+    def _dark_horse_workout_calendar_style(matrix):
+        """Dark Horse spreadsheet-inspired weekly planner styling."""
+        styler = matrix.style
+        styler = styler.set_properties(**{
+            "background-color": "#111116",
+            "color": "#f7f7f8",
+            "border-color": "#4d3563",
+            "font-size": "13px",
+        })
+        styler = styler.set_table_styles([
+            {"selector": "th", "props": [
+                ("background-color", "#7c35b8"),
+                ("color", "#ffffff"),
+                ("font-weight", "700"),
+                ("border", "1px solid #a65ae0"),
+                ("text-align", "center"),
+            ]},
+            {"selector": "th.row_heading", "props": [
+                ("background-color", "#24152f"),
+                ("color", "#f5eefe"),
+                ("font-weight", "700"),
+                ("border", "1px solid #5c3a73"),
+                ("text-align", "left"),
+            ]},
+            {"selector": "td", "props": [
+                ("background-color", "#111116"),
+                ("color", "#f7f7f8"),
+                ("border", "1px solid #3d3047"),
+            ]},
+            {"selector": "tbody tr:nth-child(odd) td", "props": [
+                ("background-color", "#17121d"),
+            ]},
+            {"selector": "tbody tr:last-child td", "props": [
+                ("background-color", "#2b1738"),
+                ("color", "#ffffff"),
+                ("font-weight", "700"),
+            ]},
+        ], overwrite=False)
+        return styler
 
 
 
-def _render_dark_horse_workout_calendar(matrix):
-    """Render Dark Horse weekly plan with guaranteed branded colors."""
-    headers = "".join(f'<th>{html.escape(str(c)).replace(chr(10), "<br>")}</th>' for c in matrix.columns)
-    body = []
-    for n, (label, row) in enumerate(matrix.iterrows()):
-        cls = "dh-total" if str(label) == "Total Day Mileage" else ("dh-alt" if n % 2 else "")
-        cells = "".join(f'<td>{html.escape(str(v if v not in (None, "") else "—")).replace(chr(10), "<br>")}</td>' for v in row.tolist())
-        body.append(f'<tr class="{cls}"><th>{html.escape(str(label))}</th>{cells}</tr>')
-    markup = """
-<style>
-.dh-wrap{width:100%;overflow-x:auto;border:1px solid #8f45c2;border-radius:10px;background:#0e0912}
-.dh-cal{width:100%;min-width:900px;border-collapse:collapse;table-layout:fixed}
-.dh-cal th,.dh-cal td{padding:16px 12px;border-right:1px solid #613878;border-bottom:1px solid #513062;font-size:14px;line-height:1.35}
-.dh-cal thead th{background:#7d3caf;color:#fff;font-weight:800;text-align:center}
-.dh-cal thead th:first-child{background:#321a40;width:150px}
-.dh-cal tbody th{background:#2b1836;color:#f8efff;font-weight:750;text-align:left;width:150px}
-.dh-cal td{background:#18111f;color:#fff;font-weight:550}
-.dh-cal tr.dh-alt td{background:#23152c}.dh-cal tr.dh-alt th{background:#372044}
-.dh-cal tr.dh-total td{background:#422154;font-weight:800}.dh-cal tr.dh-total th{background:#632b7d;color:#fff}
-.dh-cal tr:last-child th,.dh-cal tr:last-child td{border-bottom:0}.dh-cal th:last-child,.dh-cal td:last-child{border-right:0}
-</style>
-<div class="dh-wrap"><table class="dh-cal"><thead><tr><th>Guide</th>__HEADERS__</tr></thead><tbody>__BODY__</tbody></table></div>
-""".replace("__HEADERS__", headers).replace("__BODY__", "".join(body))
-    st.markdown(markup, unsafe_allow_html=True)
+    def _render_dark_horse_workout_calendar(matrix):
+        """Render Dark Horse weekly plan with guaranteed branded colors."""
+        headers = "".join(f'<th>{html.escape(str(c)).replace(chr(10), "<br>")}</th>' for c in matrix.columns)
+        body = []
+        for n, (label, row) in enumerate(matrix.iterrows()):
+            cls = "dh-total" if str(label) == "Total Day Mileage" else ("dh-alt" if n % 2 else "")
+            cells = "".join(f'<td>{html.escape(str(v if v not in (None, "") else "—")).replace(chr(10), "<br>")}</td>' for v in row.tolist())
+            body.append(f'<tr class="{cls}"><th>{html.escape(str(label))}</th>{cells}</tr>')
+        markup = """
+    <style>
+    .dh-wrap{width:100%;overflow-x:auto;border:1px solid #8f45c2;border-radius:10px;background:#0e0912}
+    .dh-cal{width:100%;min-width:900px;border-collapse:collapse;table-layout:fixed}
+    .dh-cal th,.dh-cal td{padding:16px 12px;border-right:1px solid #613878;border-bottom:1px solid #513062;font-size:14px;line-height:1.35}
+    .dh-cal thead th{background:#7d3caf;color:#fff;font-weight:800;text-align:center}
+    .dh-cal thead th:first-child{background:#321a40;width:150px}
+    .dh-cal tbody th{background:#2b1836;color:#f8efff;font-weight:750;text-align:left;width:150px}
+    .dh-cal td{background:#18111f;color:#fff;font-weight:550}
+    .dh-cal tr.dh-alt td{background:#23152c}.dh-cal tr.dh-alt th{background:#372044}
+    .dh-cal tr.dh-total td{background:#422154;font-weight:800}.dh-cal tr.dh-total th{background:#632b7d;color:#fff}
+    .dh-cal tr:last-child th,.dh-cal tr:last-child td{border-bottom:0}.dh-cal th:last-child,.dh-cal td:last-child{border-right:0}
+    </style>
+    <div class="dh-wrap"><table class="dh-cal"><thead><tr><th>Guide</th>__HEADERS__</tr></thead><tbody>__BODY__</tbody></table></div>
+    """.replace("__HEADERS__", headers).replace("__BODY__", "".join(body))
+        st.markdown(markup, unsafe_allow_html=True)
 
-def render_team_workout_card(workout, athlete_lookup):
-    """Detailed saved-session card used inside the management expander."""
-    workout_date = pd.Timestamp(workout["Date"])
-    date_label = workout_date.strftime("%a, %b %d")
-    assigned_key = workout.get("athlete_key")
-    assigned_name = (
-        athlete_lookup.get(assigned_key, {}).get("profile", {}).get("name", assigned_key)
-        if assigned_key else "Entire Team"
-    )
+    def render_team_workout_card(workout, athlete_lookup):
+        """Detailed saved-session card used inside the management expander."""
+        workout_date = pd.Timestamp(workout["Date"])
+        date_label = workout_date.strftime("%a, %b %d")
+        assigned_key = workout.get("athlete_key")
+        assigned_name = (
+            athlete_lookup.get(assigned_key, {}).get("profile", {}).get("name", assigned_key)
+            if assigned_key else "Entire Team"
+        )
 
-    with st.container(border=True):
-        st.caption(f"{date_label} · {workout.get('Session', 'AM')}")
-        st.markdown(f"### {_session_title(workout)}")
-        st.caption(f"Assigned to: {assigned_name}")
-        description = _session_description(workout)
-        if description != "—":
-            st.markdown(f"**Description:** {description}")
-        miles = _workout_miles(workout)
-        if miles is not None:
-            st.caption(f"Calculated mileage: {miles:g} mi")
-        if active_team == "dark_horse_endurance" and workout_value(workout.get("Video URL"), ""):
-            st.markdown("**Coach video:**")
-            st.video(workout_value(workout.get("Video URL"), ""))
-        if st.button("Delete", key=f"delete_workout_{workout['id']}"):
-            delete_team_workout(workout["id"], active_team)
-            st.rerun()
+        with st.container(border=True):
+            st.caption(f"{date_label} · {workout.get('Session', 'AM')}")
+            st.markdown(f"### {_session_title(workout)}")
+            st.caption(f"Assigned to: {assigned_name}")
+            description = _session_description(workout)
+            if description != "—":
+                st.markdown(f"**Description:** {description}")
+            miles = _workout_miles(workout)
+            if miles is not None:
+                st.caption(f"Calculated mileage: {miles:g} mi")
+            if active_team == "dark_horse_endurance" and workout_value(workout.get("Video URL"), ""):
+                st.markdown("**Coach video:**")
+                st.video(workout_value(workout.get("Video URL"), ""))
+            if st.button("Delete", key=f"delete_workout_{workout['id']}"):
+                delete_team_workout(workout["id"], active_team)
+                st.rerun()
 
 
-def render_team_workouts():
-    """Sunday-Saturday coach planner with AM/PM sessions and weekly mileage."""
-    if active_team == DEMO_TEAM_ID:
-        # Keep the sales demo visually identical to the real school workspaces.
-        # The only difference is that its workouts are an in-memory sample and
-        # never write to Neon or modify a live athlete account.
+    def render_team_workouts():
+        """Sunday-Saturday coach planner with AM/PM sessions and weekly mileage."""
+        if active_team == DEMO_TEAM_ID:
+            # Keep the sales demo visually identical to the real school workspaces.
+            # The only difference is that its workouts are an in-memory sample and
+            # never write to Neon or modify a live athlete account.
+            st.markdown(
+                '<div class="team-workout-title">Weekly Training Plan</div>'
+                '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, descriptions and mileage.</div>',
+                unsafe_allow_html=True,
+            )
+
+            today = datetime.now(TEAM_TIMEZONE).date()
+            current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+            week_state_key = f"coach_workout_week_offset_{active_team}_{athlete_key}"
+            if week_state_key not in st.session_state:
+                st.session_state[week_state_key] = 0
+
+            nav_left, nav_mid, nav_right = st.columns([1, 1, 1])
+            with nav_left:
+                if st.button("← Previous week", key=f"prev_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+                    st.session_state[week_state_key] -= 1
+                    st.rerun()
+            with nav_mid:
+                if st.button("This week", key=f"this_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+                    st.session_state[week_state_key] = 0
+                    st.rerun()
+            with nav_right:
+                if st.button("Next week →", key=f"next_workout_week_{active_team}_{athlete_key}", use_container_width=True):
+                    st.session_state[week_state_key] += 1
+                    st.rerun()
+
+            week_start = current_sunday + timedelta(weeks=int(st.session_state[week_state_key]))
+            week_end = week_start + timedelta(days=6)
+
+            title_left, title_right = st.columns([3, 1])
+            with title_left:
+                st.markdown(f"### {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}")
+                st.caption("Showing team-wide sessions plus individual sessions for Diego Moran.")
+
+            # Sample data uses the exact workout structure consumed by the normal
+            # school calendar, so the Oregon demo renders through the same matrix.
+            def demo_workout(day_offset, session, workout_type, description, miles, effort=""):
+                return {
+                    "Date": week_start + timedelta(days=day_offset),
+                    "Session": session,
+                    "Type": "Training",
+                    "Warm Up": "",
+                    "Workout": workout_type,
+                    "Cool Down": "",
+                    "Notes": description,
+                    "Effort": effort,
+                    "Planned Miles": miles,
+                }
+
+            demo_workouts = [
+                demo_workout(0, "AM", "Long Run", "13 mi relaxed aerobic", 13, "6"),
+                demo_workout(1, "AM", "Easy + Strides", "8 mi easy · 6 × 10s hill sprints", 8, "4"),
+                demo_workout(2, "AM", "Threshold", "5 × 6 min @ LT1 · 60s jog", 8, "7"),
+                demo_workout(2, "PM", "Threshold", "2 × (5 × 600m) controlled · 60s jog", 6, "7"),
+                demo_workout(3, "AM", "Recovery", "7 mi easy + mobility", 7, "3"),
+                demo_workout(4, "AM", "Aerobic", "10 mi steady-easy", 10, "5"),
+                demo_workout(5, "AM", "Easy", "6 mi easy + 6 strides", 6, "3"),
+                demo_workout(6, "AM", "Hills", "8 × 200m hill · full controlled recovery", 8, "8"),
+            ]
+            demo_feedback = {
+                week_start + timedelta(days=1): "Felt smooth and relaxed.",
+                week_start + timedelta(days=2): "Strong on both threshold sessions.",
+                week_start + timedelta(days=4): "Good aerobic rhythm.",
+            }
+            matrix, weekly_miles = _weekly_workout_matrix(
+                demo_workouts, week_start, athlete_feedback=demo_feedback
+            )
+
+            with title_right:
+                st.metric("Planned Week", f"{weekly_miles:g} mi" if weekly_miles is not None else "— mi")
+
+            # Keep all seven day columns (Sun-Sat) visible on normal desktop widths.
+            # An explicit pixel width is narrower than Streamlit's "small" preset,
+            # while Streamlit still provides horizontal scrolling on smaller screens.
+            calendar_columns = {
+                column: st.column_config.TextColumn(width=92)
+                for column in matrix.columns
+            }
+            st.dataframe(
+                matrix,
+                use_container_width=True,
+                height=635,
+                row_height=90,
+                column_config=calendar_columns,
+            )
+            st.caption("Demo workspace · sample plan only · no live athlete account is modified.")
+            return
         st.markdown(
             '<div class="team-workout-title">Weekly Training Plan</div>'
             '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, descriptions and mileage.</div>',
             unsafe_allow_html=True,
         )
+
+        team_athletes = get_team_athletes(active_team)
+        athlete_names = {
+            key: value.get("profile", {}).get("name", key)
+            for key, value in team_athletes.items()
+        }
+        name_to_key = {name: key for key, name in athlete_names.items()}
 
         today = datetime.now(TEAM_TIMEZONE).date()
         current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
@@ -5250,785 +5506,5125 @@ def render_team_workouts():
 
         title_left, title_right = st.columns([3, 1])
         with title_left:
-            st.markdown(f"### {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}")
-            st.caption("Showing team-wide sessions plus individual sessions for Diego Moran.")
+            st.markdown(
+                f"### {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
+            )
+            st.caption(
+                "Showing team-wide sessions plus individual sessions for "
+                f"{athlete_names.get(athlete_key, 'the selected athlete')}."
+            )
 
-        # Sample data uses the exact workout structure consumed by the normal
-        # school calendar, so the Oregon demo renders through the same matrix.
-        def demo_workout(day_offset, session, workout_type, description, miles, effort=""):
-            return {
-                "Date": week_start + timedelta(days=day_offset),
-                "Session": session,
-                "Type": "Training",
-                "Warm Up": "",
-                "Workout": workout_type,
-                "Cool Down": "",
-                "Notes": description,
-                "Effort": effort,
-                "Planned Miles": miles,
-            }
+        with st.expander("+ Write a workout", expanded=False):
+            assignment_options = ["Entire Team"] + sorted(name_to_key.keys())
+            with st.form(f"workout_form_{active_team}_{athlete_key}", clear_on_submit=True):
+                top_left, top_mid, top_slot = st.columns([1.4, 1, .7])
+                with top_left:
+                    assignment = st.selectbox("Assign to", assignment_options)
+                with top_mid:
+                    workout_date = st.date_input("Date", value=week_start)
+                with top_slot:
+                    session_slot = st.selectbox("Time", SESSION_SLOTS)
 
-        demo_workouts = [
-            demo_workout(0, "AM", "Long Run", "13 mi relaxed aerobic", 13, "6"),
-            demo_workout(1, "AM", "Easy + Strides", "8 mi easy · 6 × 10s hill sprints", 8, "4"),
-            demo_workout(2, "AM", "Threshold", "5 × 6 min @ LT1 · 60s jog", 8, "7"),
-            demo_workout(2, "PM", "Threshold", "2 × (5 × 600m) controlled · 60s jog", 6, "7"),
-            demo_workout(3, "AM", "Recovery", "7 mi easy + mobility", 7, "3"),
-            demo_workout(4, "AM", "Aerobic", "10 mi steady-easy", 10, "5"),
-            demo_workout(5, "AM", "Easy", "6 mi easy + 6 strides", 6, "3"),
-            demo_workout(6, "AM", "Hills", "8 × 200m hill · full controlled recovery", 8, "8"),
-        ]
-        demo_feedback = {
-            week_start + timedelta(days=1): "Felt smooth and relaxed.",
-            week_start + timedelta(days=2): "Strong on both threshold sessions.",
-            week_start + timedelta(days=4): "Good aerobic rhythm.",
-        }
+                session_text = st.text_area(
+                    "Session",
+                    placeholder="Example: 5 × 1 mile, 2 min recovery",
+                    help="Write the actual session here. No separate workout-type selection is needed.",
+                )
+                description = st.text_area(
+                    "Description",
+                    placeholder="Optional cues, warm-up/cool-down details, targets, or instructions",
+                )
+
+                if active_team == "dark_horse_endurance":
+                    video_url = st.text_input(
+                        "Coach Video URL",
+                        placeholder="Paste a YouTube or supported video link (optional)",
+                        help="Video publishing is enabled only for the Dark Horse Endurance coach workspace.",
+                    )
+                else:
+                    video_url = ""
+
+                submitted = st.form_submit_button(
+                    "Save Workout", type="primary", use_container_width=True
+                )
+
+            if submitted:
+                assigned_key = None if assignment == "Entire Team" else name_to_key[assignment]
+                try:
+                    save_team_workout(
+                        active_team,
+                        assigned_key,
+                        workout_date,
+                        session_text,
+                        description,
+                        video_url,
+                        session_slot=session_slot,
+                    )
+                    st.success("Workout saved to VEKDYN.")
+                    st.rerun()
+                except (ValueError, psycopg2.Error) as error:
+                    st.warning(str(error))
+
+        try:
+            workouts = load_team_workouts_range(
+                active_team,
+                week_start,
+                week_end,
+                athlete_key,
+            )
+        except Exception as error:
+            st.warning(f"VEKDYN could not load workouts: {error}")
+            return
+
+        # Build the athlete's effective plan one date + AM/PM slot at a time.
+        # Priority:
+        #   1) newest individual workout for this athlete
+        #   2) newest team workout
+        # This makes an individual workout truly override the team workout in the
+        # same slot, and also lets a newly-written individual workout replace an
+        # older individual workout instead of leaving the older one in the calendar.
+        effective = {}
+        for item in workouts:
+            day = item.get("Date")
+            if hasattr(day, "date"):
+                day = day.date()
+            slot = str(item.get("Session") or "AM").upper()
+            key = (day, slot)
+
+            existing = effective.get(key)
+            item_is_individual = item.get("athlete_key") == athlete_key
+            existing_is_individual = bool(
+                existing and existing.get("athlete_key") == athlete_key
+            )
+
+            if existing is None:
+                effective[key] = item
+            elif item_is_individual and not existing_is_individual:
+                # Individual beats team for the same date/session.
+                effective[key] = item
+            elif item_is_individual == existing_is_individual:
+                # Same assignment level: newest saved workout wins.
+                if int(item.get("id") or 0) > int(existing.get("id") or 0):
+                    effective[key] = item
+
+        calendar_workouts = list(effective.values())
+
+        try:
+            athlete_feedback = load_daily_feedback_range(
+                active_team,
+                athlete_key,
+                week_start,
+                week_end,
+            )
+        except Exception as error:
+            athlete_feedback = {}
+            st.warning(f"VEKDYN could not load athlete day feedback: {error}")
+
         matrix, weekly_miles = _weekly_workout_matrix(
-            demo_workouts, week_start, athlete_feedback=demo_feedback
+            calendar_workouts,
+            week_start,
+            athlete_feedback=athlete_feedback,
         )
 
         with title_right:
-            st.metric("Planned Week", f"{weekly_miles:g} mi" if weekly_miles is not None else "— mi")
-
-        # Keep all seven day columns (Sun-Sat) visible on normal desktop widths.
-        # An explicit pixel width is narrower than Streamlit's "small" preset,
-        # while Streamlit still provides horizontal scrolling on smaller screens.
-        calendar_columns = {
-            column: st.column_config.TextColumn(width=92)
-            for column in matrix.columns
-        }
-        st.dataframe(
-            matrix,
-            use_container_width=True,
-            height=635,
-            row_height=90,
-            column_config=calendar_columns,
-        )
-        st.caption("Demo workspace · sample plan only · no live athlete account is modified.")
-        return
-    st.markdown(
-        '<div class="team-workout-title">Weekly Training Plan</div>'
-        '<div class="team-workout-subtitle">A full week at a glance — AM/PM sessions, descriptions and mileage.</div>',
-        unsafe_allow_html=True,
-    )
-
-    team_athletes = get_team_athletes(active_team)
-    athlete_names = {
-        key: value.get("profile", {}).get("name", key)
-        for key, value in team_athletes.items()
-    }
-    name_to_key = {name: key for key, name in athlete_names.items()}
-
-    today = datetime.now(TEAM_TIMEZONE).date()
-    current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
-    week_state_key = f"coach_workout_week_offset_{active_team}_{athlete_key}"
-    if week_state_key not in st.session_state:
-        st.session_state[week_state_key] = 0
-
-    nav_left, nav_mid, nav_right = st.columns([1, 1, 1])
-    with nav_left:
-        if st.button("← Previous week", key=f"prev_workout_week_{active_team}_{athlete_key}", use_container_width=True):
-            st.session_state[week_state_key] -= 1
-            st.rerun()
-    with nav_mid:
-        if st.button("This week", key=f"this_workout_week_{active_team}_{athlete_key}", use_container_width=True):
-            st.session_state[week_state_key] = 0
-            st.rerun()
-    with nav_right:
-        if st.button("Next week →", key=f"next_workout_week_{active_team}_{athlete_key}", use_container_width=True):
-            st.session_state[week_state_key] += 1
-            st.rerun()
-
-    week_start = current_sunday + timedelta(weeks=int(st.session_state[week_state_key]))
-    week_end = week_start + timedelta(days=6)
-
-    title_left, title_right = st.columns([3, 1])
-    with title_left:
-        st.markdown(
-            f"### {week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
-        )
-        st.caption(
-            "Showing team-wide sessions plus individual sessions for "
-            f"{athlete_names.get(athlete_key, 'the selected athlete')}."
-        )
-
-    with st.expander("+ Write a workout", expanded=False):
-        assignment_options = ["Entire Team"] + sorted(name_to_key.keys())
-        with st.form(f"workout_form_{active_team}_{athlete_key}", clear_on_submit=True):
-            top_left, top_mid, top_slot = st.columns([1.4, 1, .7])
-            with top_left:
-                assignment = st.selectbox("Assign to", assignment_options)
-            with top_mid:
-                workout_date = st.date_input("Date", value=week_start)
-            with top_slot:
-                session_slot = st.selectbox("Time", SESSION_SLOTS)
-
-            session_text = st.text_area(
-                "Session",
-                placeholder="Example: 5 × 1 mile, 2 min recovery",
-                help="Write the actual session here. No separate workout-type selection is needed.",
-            )
-            description = st.text_area(
-                "Description",
-                placeholder="Optional cues, warm-up/cool-down details, targets, or instructions",
-            )
-
-            if active_team == "dark_horse_endurance":
-                video_url = st.text_input(
-                    "Coach Video URL",
-                    placeholder="Paste a YouTube or supported video link (optional)",
-                    help="Video publishing is enabled only for the Dark Horse Endurance coach workspace.",
-                )
+            if weekly_miles is None:
+                st.metric("Planned Week", "— mi")
             else:
-                video_url = ""
+                st.metric("Planned Week", f"{weekly_miles:g} mi")
 
-            submitted = st.form_submit_button(
-                "Save Workout", type="primary", use_container_width=True
-            )
-
-        if submitted:
-            assigned_key = None if assignment == "Entire Team" else name_to_key[assignment]
-            try:
-                save_team_workout(
-                    active_team,
-                    assigned_key,
-                    workout_date,
-                    session_text,
-                    description,
-                    video_url,
-                    session_slot=session_slot,
-                )
-                st.success("Workout saved to VEKDYN.")
-                st.rerun()
-            except (ValueError, psycopg2.Error) as error:
-                st.warning(str(error))
-
-    try:
-        workouts = load_team_workouts_range(
-            active_team,
-            week_start,
-            week_end,
-            athlete_key,
-        )
-    except Exception as error:
-        st.warning(f"VEKDYN could not load workouts: {error}")
-        return
-
-    # Team sessions are the default. If this athlete has an individual session
-    # on the same date + AM/PM slot, use the individual session instead.
-    effective = {}
-    for item in workouts:
-        day = item.get("Date")
-        if hasattr(day, "date"):
-            day = day.date()
-        slot = str(item.get("Session") or "AM").upper()
-        key = (day, slot)
-        existing = effective.get(key)
-        if existing is None or (item.get("athlete_key") == athlete_key and existing.get("athlete_key") is None):
-            effective[key] = item
-    calendar_workouts = list(effective.values())
-
-    try:
-        athlete_feedback = load_daily_feedback_range(
-            active_team,
-            athlete_key,
-            week_start,
-            week_end,
-        )
-    except Exception as error:
-        athlete_feedback = {}
-        st.warning(f"VEKDYN could not load athlete day feedback: {error}")
-
-    matrix, weekly_miles = _weekly_workout_matrix(
-        calendar_workouts,
-        week_start,
-        athlete_feedback=athlete_feedback,
-    )
-
-    with title_right:
-        if weekly_miles is None:
-            st.metric("Planned Week", "— mi")
+        # Spreadsheet-style overview. Long descriptions get extra row height instead
+        # of forcing the coach to open seven separate cards.
+        if active_team == "dark_horse_endurance":
+            _render_dark_horse_workout_calendar(matrix)
         else:
-            st.metric("Planned Week", f"{weekly_miles:g} mi")
+            # Keep all seven day columns (Sun-Sat) visible on normal desktop widths.
+            # An explicit pixel width is narrower than Streamlit's "small" preset,
+            # while Streamlit still provides horizontal scrolling on smaller screens.
+            calendar_columns = {
+                column: st.column_config.TextColumn(width=92)
+                for column in matrix.columns
+            }
+            st.dataframe(
+                matrix,
+                use_container_width=True,
+                height=635,
+                row_height=90,
+                column_config=calendar_columns,
+            )
 
-    # Spreadsheet-style overview. Long descriptions get extra row height instead
-    # of forcing the coach to open seven separate cards.
-    if active_team == "dark_horse_endurance":
-        _render_dark_horse_workout_calendar(matrix)
-    else:
-        # Keep all seven day columns (Sun-Sat) visible on normal desktop widths.
-        # An explicit pixel width is narrower than Streamlit's "small" preset,
-        # while Streamlit still provides horizontal scrolling on smaller screens.
-        calendar_columns = {
-            column: st.column_config.TextColumn(width=92)
-            for column in matrix.columns
-        }
-        st.dataframe(
-            matrix,
-            use_container_width=True,
-            height=635,
-            row_height=90,
-            column_config=calendar_columns,
-        )
+        if not workouts:
+            st.info("No sessions are saved for this week yet.")
+        else:
+            with st.expander("Manage saved sessions", expanded=False):
+                for start_index in range(0, len(workouts), 3):
+                    row = workouts[start_index:start_index + 3]
+                    columns = st.columns(3, gap="medium")
+                    for column, workout in zip(columns, row):
+                        with column:
+                            render_team_workout_card(workout, team_athletes)
+            return
 
-    if not workouts:
-        st.info("No sessions are saved for this week yet.")
-    else:
-        with st.expander("Manage saved sessions", expanded=False):
-            for start_index in range(0, len(workouts), 3):
-                row = workouts[start_index:start_index + 3]
-                columns = st.columns(3, gap="medium")
-                for column, workout in zip(columns, row):
-                    with column:
-                        render_team_workout_card(workout, team_athletes)
+        # No saved sessions to manage. The weekly calendar above can still show
+        # athlete feedback on rest/unassigned days.
         return
 
-    # No saved sessions to manage. The weekly calendar above can still show
-    # athlete feedback on rest/unassigned days.
-    return
-
-if dashboard_view == "Dashboard":
-    render_team_workouts()
+    if dashboard_view == "Dashboard":
+        render_team_workouts()
 
 
-# =========================================================
-# THRESHOLD LACTATE PROFILE — NEON
-# =========================================================
+    # =========================================================
+    # THRESHOLD LACTATE PROFILE — NEON
+    # =========================================================
 
-@st.cache_resource(show_spinner=False)
-def initialize_threshold_database():
-    """Create persistent athlete threshold profile storage in Neon."""
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS athlete_threshold_profiles (
-                    id BIGSERIAL PRIMARY KEY,
-                    team_id TEXT NOT NULL,
-                    athlete_key TEXT NOT NULL,
-                    short_lactate REAL,
-                    short_pace TEXT,
-                    medium_lactate REAL,
-                    medium_pace TEXT,
-                    long_lactate REAL,
-                    long_pace TEXT,
-                    short_400_lactate REAL,
-                    short_400_time TEXT,
-                    short_800_lactate REAL,
-                    short_800_time TEXT,
-                    short_1k_lactate REAL,
-                    short_1k_time TEXT,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE(team_id, athlete_key)
+    @st.cache_resource(show_spinner=False)
+    def initialize_threshold_database():
+        """Create persistent athlete threshold profile storage in Neon."""
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_threshold_profiles (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id TEXT NOT NULL,
+                        athlete_key TEXT NOT NULL,
+                        short_lactate REAL,
+                        short_pace TEXT,
+                        medium_lactate REAL,
+                        medium_pace TEXT,
+                        long_lactate REAL,
+                        long_pace TEXT,
+                        short_400_lactate REAL,
+                        short_400_time TEXT,
+                        short_800_lactate REAL,
+                        short_800_time TEXT,
+                        short_1k_lactate REAL,
+                        short_1k_time TEXT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE(team_id, athlete_key)
+                    )
+                    """
                 )
-                """
-            )
-            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_400_lactate REAL")
-            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_400_time TEXT")
-            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_800_lactate REAL")
-            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_800_time TEXT")
-            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_1k_lactate REAL")
-            cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_1k_time TEXT")
-        database.commit()
+                cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_400_lactate REAL")
+                cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_400_time TEXT")
+                cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_800_lactate REAL")
+                cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_800_time TEXT")
+                cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_1k_lactate REAL")
+                cursor.execute("ALTER TABLE athlete_threshold_profiles ADD COLUMN IF NOT EXISTS short_1k_time TEXT")
+            database.commit()
 
 
-def save_threshold_profile(
-        team_id,
-        athlete_key,
-        short_lactate,
-        short_pace,
-        medium_lactate,
-        medium_pace,
-        long_lactate,
-        long_pace,
-        short_400_lactate,
-        short_400_time,
-        short_800_lactate,
-        short_800_time,
-        short_1k_lactate,
-        short_1k_time,
-):
-    """Save or update one athlete's threshold profile in Neon."""
-    initialize_threshold_database()
+    def save_threshold_profile(
+            team_id,
+            athlete_key,
+            short_lactate,
+            short_pace,
+            medium_lactate,
+            medium_pace,
+            long_lactate,
+            long_pace,
+            short_400_lactate,
+            short_400_time,
+            short_800_lactate,
+            short_800_time,
+            short_1k_lactate,
+            short_1k_time,
+    ):
+        """Save or update one athlete's threshold profile in Neon."""
+        initialize_threshold_database()
 
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO athlete_threshold_profiles (
-                    team_id, athlete_key,
-                    short_lactate, short_pace,
-                    medium_lactate, medium_pace,
-                    long_lactate, long_pace,
-                    short_400_lactate, short_400_time,
-                    short_800_lactate, short_800_time,
-                    short_1k_lactate, short_1k_time
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO athlete_threshold_profiles (
+                        team_id, athlete_key,
+                        short_lactate, short_pace,
+                        medium_lactate, medium_pace,
+                        long_lactate, long_pace,
+                        short_400_lactate, short_400_time,
+                        short_800_lactate, short_800_time,
+                        short_1k_lactate, short_1k_time
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (team_id, athlete_key)
+                    DO UPDATE SET
+                        short_lactate = EXCLUDED.short_lactate,
+                        short_pace = EXCLUDED.short_pace,
+                        medium_lactate = EXCLUDED.medium_lactate,
+                        medium_pace = EXCLUDED.medium_pace,
+                        long_lactate = EXCLUDED.long_lactate,
+                        long_pace = EXCLUDED.long_pace,
+                        short_400_lactate = EXCLUDED.short_400_lactate,
+                        short_400_time = EXCLUDED.short_400_time,
+                        short_800_lactate = EXCLUDED.short_800_lactate,
+                        short_800_time = EXCLUDED.short_800_time,
+                        short_1k_lactate = EXCLUDED.short_1k_lactate,
+                        short_1k_time = EXCLUDED.short_1k_time,
+                        updated_at = NOW()
+                    """,
+                    (
+                        team_id, athlete_key,
+                        short_lactate, short_pace,
+                        medium_lactate, medium_pace,
+                        long_lactate, long_pace,
+                        short_400_lactate, short_400_time,
+                        short_800_lactate, short_800_time,
+                        short_1k_lactate, short_1k_time,
+                    ),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (team_id, athlete_key)
-                DO UPDATE SET
-                    short_lactate = EXCLUDED.short_lactate,
-                    short_pace = EXCLUDED.short_pace,
-                    medium_lactate = EXCLUDED.medium_lactate,
-                    medium_pace = EXCLUDED.medium_pace,
-                    long_lactate = EXCLUDED.long_lactate,
-                    long_pace = EXCLUDED.long_pace,
-                    short_400_lactate = EXCLUDED.short_400_lactate,
-                    short_400_time = EXCLUDED.short_400_time,
-                    short_800_lactate = EXCLUDED.short_800_lactate,
-                    short_800_time = EXCLUDED.short_800_time,
-                    short_1k_lactate = EXCLUDED.short_1k_lactate,
-                    short_1k_time = EXCLUDED.short_1k_time,
-                    updated_at = NOW()
-                """,
-                (
-                    team_id, athlete_key,
-                    short_lactate, short_pace,
-                    medium_lactate, medium_pace,
-                    long_lactate, long_pace,
-                    short_400_lactate, short_400_time,
-                    short_800_lactate, short_800_time,
-                    short_1k_lactate, short_1k_time,
-                ),
-            )
-        database.commit()
+            database.commit()
 
 
-def load_threshold_profile(team_id, athlete_key):
-    """Load one athlete's saved threshold profile from Neon."""
-    if team_id == DEMO_TEAM_ID:
+    def load_threshold_profile(team_id, athlete_key):
+        """Load one athlete's saved threshold profile from Neon."""
+        if team_id == DEMO_TEAM_ID:
+            return {
+                "short_reps": {"lactate": 2.4, "pace": "5:18/mi"},
+                "medium_reps": {"lactate": 2.6, "pace": "5:30/mi"},
+                "long_reps": {"lactate": 2.8, "pace": "5:40/mi"},
+                "short_400": {"lactate": 2.5, "time": "70.0"},
+                "short_800": {"lactate": 2.6, "time": "2:22"},
+                "short_1k": {"lactate": 2.7, "time": "2:58"},
+            }
+        initialize_threshold_database()
+
+        if not athlete_key:
+            return {}
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        short_lactate, short_pace,
+                        medium_lactate, medium_pace,
+                        long_lactate, long_pace,
+                        short_400_lactate, short_400_time,
+                        short_800_lactate, short_800_time,
+                        short_1k_lactate, short_1k_time
+                    FROM athlete_threshold_profiles
+                    WHERE team_id = %s AND athlete_key = %s
+                    LIMIT 1
+                    """,
+                    (team_id, athlete_key),
+                )
+                row = cursor.fetchone()
+
+        if not row:
+            return {}
+
         return {
-            "short_reps": {"lactate": 2.4, "pace": "5:18/mi"},
-            "medium_reps": {"lactate": 2.6, "pace": "5:30/mi"},
-            "long_reps": {"lactate": 2.8, "pace": "5:40/mi"},
-            "short_400": {"lactate": 2.5, "time": "70.0"},
-            "short_800": {"lactate": 2.6, "time": "2:22"},
-            "short_1k": {"lactate": 2.7, "time": "2:58"},
+            "short_reps": {"lactate": row[0], "pace": row[1] or "--"},
+            "medium_reps": {"lactate": row[2], "pace": row[3] or "--"},
+            "long_reps": {"lactate": row[4], "pace": row[5] or "--"},
+            "short_400": {"lactate": row[6], "time": row[7] or "--"},
+            "short_800": {"lactate": row[8], "time": row[9] or "--"},
+            "short_1k": {"lactate": row[10], "time": row[11] or "--"},
         }
-    initialize_threshold_database()
-
-    if not athlete_key:
-        return {}
-
-    with get_database_connection() as database:
-        with database.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    short_lactate, short_pace,
-                    medium_lactate, medium_pace,
-                    long_lactate, long_pace,
-                    short_400_lactate, short_400_time,
-                    short_800_lactate, short_800_time,
-                    short_1k_lactate, short_1k_time
-                FROM athlete_threshold_profiles
-                WHERE team_id = %s AND athlete_key = %s
-                LIMIT 1
-                """,
-                (team_id, athlete_key),
-            )
-            row = cursor.fetchone()
-
-    if not row:
-        return {}
-
-    return {
-        "short_reps": {"lactate": row[0], "pace": row[1] or "--"},
-        "medium_reps": {"lactate": row[2], "pace": row[3] or "--"},
-        "long_reps": {"lactate": row[4], "pace": row[5] or "--"},
-        "short_400": {"lactate": row[6], "time": row[7] or "--"},
-        "short_800": {"lactate": row[8], "time": row[9] or "--"},
-        "short_1k": {"lactate": row[10], "time": row[11] or "--"},
-    }
 
 
-# =========================================================
-# THRESHOLD LACTATE PROFILE — DISPLAY + COACH EDITOR
-# =========================================================
+    # =========================================================
+    # THRESHOLD LACTATE PROFILE — DISPLAY + COACH EDITOR
+    # =========================================================
 
-if dashboard_view == "Dashboard":
-    st.subheader("Threshold Lactate Profile")
+    if dashboard_view == "Dashboard":
+        st.subheader("Threshold Lactate Profile")
 
-    # Neon is the current source after a coach saves a profile.
-    # Until then, keep showing the original CSV threshold values.
-    try:
-        saved_threshold = load_threshold_profile(active_team, athlete_key)
-    except Exception as error:
-        saved_threshold = {}
-        st.warning(f"VEKDYN could not load saved threshold data: {error}")
-
-    threshold = saved_threshold or athlete.get("threshold", {})
-
-    short_data = threshold.get("short_reps", {}) or {}
-    medium_data = threshold.get("medium_reps", {}) or {}
-    long_data = threshold.get("long_reps", {}) or {}
-    short_400_data = threshold.get("short_400", {}) or {}
-    short_800_data = threshold.get("short_800", {}) or {}
-    short_1k_data = threshold.get("short_1k", {}) or {}
-
-
-    def threshold_display_lactate(rep_data):
-        value = rep_data.get("lactate")
-        if value in (None, "", "--"):
-            return "--"
+        # Neon is the current source after a coach saves a profile.
+        # Until then, keep showing the original CSV threshold values.
         try:
-            return f"{float(value):.1f}"
-        except (TypeError, ValueError):
-            return str(value)
+            saved_threshold = load_threshold_profile(active_team, athlete_key)
+        except Exception as error:
+            saved_threshold = {}
+            st.warning(f"VEKDYN could not load saved threshold data: {error}")
+
+        threshold = saved_threshold or athlete.get("threshold", {})
+
+        short_data = threshold.get("short_reps", {}) or {}
+        medium_data = threshold.get("medium_reps", {}) or {}
+        long_data = threshold.get("long_reps", {}) or {}
+        short_400_data = threshold.get("short_400", {}) or {}
+        short_800_data = threshold.get("short_800", {}) or {}
+        short_1k_data = threshold.get("short_1k", {}) or {}
 
 
-    def threshold_editor_lactate(rep_data):
-        value = rep_data.get("lactate")
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
+        def threshold_display_lactate(rep_data):
+            value = rep_data.get("lactate")
+            if value in (None, "", "--"):
+                return "--"
+            try:
+                return f"{float(value):.1f}"
+            except (TypeError, ValueError):
+                return str(value)
 
 
-    def threshold_editor_pace(rep_data):
-        value = rep_data.get("pace", "")
-        return "" if value in (None, "--") else str(value)
+        def threshold_editor_lactate(rep_data):
+            value = rep_data.get("lactate")
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
 
 
-    def threshold_editor_rep_time(rep_data):
-        value = rep_data.get("time", "")
-        return "" if value in (None, "--") else str(value)
+        def threshold_editor_pace(rep_data):
+            value = rep_data.get("pace", "")
+            return "" if value in (None, "--") else str(value)
 
 
-    # -----------------------------------------------------
-    # ORIGINAL THREE-CARD THRESHOLD DISPLAY
-    # -----------------------------------------------------
-    with st.container(border=True):
-        short_col, medium_col, long_col = st.columns(3)
+        def threshold_editor_rep_time(rep_data):
+            value = rep_data.get("time", "")
+            return "" if value in (None, "--") else str(value)
 
-        with short_col:
-            st.metric(
-                "Short Reps (1–3 min)",
-                f"{threshold_display_lactate(short_data)} mmol",
-            )
-            st.caption(short_data.get("pace") or "--")
 
-        with medium_col:
-            st.metric(
-                "Medium Reps (5–10 min)",
-                f"{threshold_display_lactate(medium_data)} mmol",
-            )
-            st.caption(medium_data.get("pace") or "--")
-
-        with long_col:
-            st.metric(
-                "Long Reps (10–15 min)",
-                f"{threshold_display_lactate(long_data)} mmol",
-            )
-            st.caption(long_data.get("pace") or "--")
-
-    # -----------------------------------------------------
-    # COACH EDITOR — COLLAPSED UNTIL NEEDED
-    # -----------------------------------------------------
-    with st.expander("Edit Threshold Profile", expanded=False):
-        st.caption(
-            "Update this athlete's threshold values. Saved values persist in Neon."
-        )
-
-        with st.form(
-                f"threshold_profile_form_{active_team}_{athlete_key}",
-                clear_on_submit=False,
-        ):
+        # -----------------------------------------------------
+        # ORIGINAL THREE-CARD THRESHOLD DISPLAY
+        # -----------------------------------------------------
+        with st.container(border=True):
             short_col, medium_col, long_col = st.columns(3)
 
             with short_col:
-                st.markdown("**Short Reps (1–3 min)**")
-                short_lactate = st.number_input(
-                    "Lactate (mmol)",
-                    min_value=0.0,
-                    max_value=20.0,
-                    value=threshold_editor_lactate(short_data),
-                    step=0.1,
-                    format="%.1f",
-                    key=f"short_lactate_{active_team}_{athlete_key}",
+                st.metric(
+                    "Short Reps (1–3 min)",
+                    f"{threshold_display_lactate(short_data)} mmol",
                 )
-                short_pace = st.text_input(
-                    "Pace",
-                    value=threshold_editor_pace(short_data),
-                    placeholder="Example: 5:00/mi",
-                    key=f"short_pace_{active_team}_{athlete_key}",
-                )
-                st.markdown("**400 m Check**")
-                short_400_lactate = st.number_input(
-                    "400 Lactate (mmol)",
-                    min_value=0.0,
-                    max_value=20.0,
-                    value=threshold_editor_lactate(short_400_data),
-                    step=0.1,
-                    format="%.1f",
-                    key=f"short_400_lactate_{active_team}_{athlete_key}",
-                )
-                short_400_time = st.text_input(
-                    "400 Time",
-                    value=threshold_editor_rep_time(short_400_data),
-                    placeholder="Example: 69.5",
-                    key=f"short_400_time_{active_team}_{athlete_key}",
-                    help="Enter the athlete's 400 m rep time in seconds, e.g. 69.5.",
-                )
-
-                st.markdown("**800 m Check**")
-                short_800_lactate = st.number_input(
-                    "800 Lactate (mmol)", min_value=0.0, max_value=20.0,
-                    value=threshold_editor_lactate(short_800_data), step=0.1, format="%.1f",
-                    key=f"short_800_lactate_{active_team}_{athlete_key}",
-                )
-                short_800_time = st.text_input(
-                    "800 Time", value=threshold_editor_rep_time(short_800_data),
-                    placeholder="Example: 2:20.0",
-                    key=f"short_800_time_{active_team}_{athlete_key}",
-                    help="Enter the athlete's 800 m rep time, e.g. 2:20.0.",
-                )
-
-                st.markdown("**1K Check**")
-                short_1k_lactate = st.number_input(
-                    "1K Lactate (mmol)", min_value=0.0, max_value=20.0,
-                    value=threshold_editor_lactate(short_1k_data), step=0.1, format="%.1f",
-                    key=f"short_1k_lactate_{active_team}_{athlete_key}",
-                )
-                short_1k_time = st.text_input(
-                    "1K Time", value=threshold_editor_rep_time(short_1k_data),
-                    placeholder="Example: 2:55.0",
-                    key=f"short_1k_time_{active_team}_{athlete_key}",
-                    help="Enter the athlete's 1K rep time, e.g. 2:55.0.",
-                )
+                st.caption(short_data.get("pace") or "--")
 
             with medium_col:
-                st.markdown("**Medium Reps (5–10 min)**")
-                medium_lactate = st.number_input(
-                    "Lactate (mmol)",
-                    min_value=0.0,
-                    max_value=20.0,
-                    value=threshold_editor_lactate(medium_data),
-                    step=0.1,
-                    format="%.1f",
-                    key=f"medium_lactate_{active_team}_{athlete_key}",
+                st.metric(
+                    "Medium Reps (5–10 min)",
+                    f"{threshold_display_lactate(medium_data)} mmol",
                 )
-                medium_pace = st.text_input(
-                    "Pace",
-                    value=threshold_editor_pace(medium_data),
-                    placeholder="Example: 5:10/mi",
-                    key=f"medium_pace_{active_team}_{athlete_key}",
-                )
+                st.caption(medium_data.get("pace") or "--")
 
             with long_col:
-                st.markdown("**Long Reps (10–15 min)**")
-                long_lactate = st.number_input(
-                    "Lactate (mmol)",
-                    min_value=0.0,
-                    max_value=20.0,
-                    value=threshold_editor_lactate(long_data),
-                    step=0.1,
-                    format="%.1f",
-                    key=f"long_lactate_{active_team}_{athlete_key}",
+                st.metric(
+                    "Long Reps (10–15 min)",
+                    f"{threshold_display_lactate(long_data)} mmol",
                 )
-                long_pace = st.text_input(
-                    "Pace",
-                    value=threshold_editor_pace(long_data),
-                    placeholder="Example: 5:20/mi",
-                    key=f"long_pace_{active_team}_{athlete_key}",
+                st.caption(long_data.get("pace") or "--")
+
+        # -----------------------------------------------------
+        # COACH EDITOR — COLLAPSED UNTIL NEEDED
+        # -----------------------------------------------------
+        with st.expander("Edit Threshold Profile", expanded=False):
+            st.caption(
+                "Update this athlete's threshold values. Saved values persist in Neon."
+            )
+
+            with st.form(
+                    f"threshold_profile_form_{active_team}_{athlete_key}",
+                    clear_on_submit=False,
+            ):
+                short_col, medium_col, long_col = st.columns(3)
+
+                with short_col:
+                    st.markdown("**Short Reps (1–3 min)**")
+                    short_lactate = st.number_input(
+                        "Lactate (mmol)",
+                        min_value=0.0,
+                        max_value=20.0,
+                        value=threshold_editor_lactate(short_data),
+                        step=0.1,
+                        format="%.1f",
+                        key=f"short_lactate_{active_team}_{athlete_key}",
+                    )
+                    short_pace = st.text_input(
+                        "Pace",
+                        value=threshold_editor_pace(short_data),
+                        placeholder="Example: 5:00/mi",
+                        key=f"short_pace_{active_team}_{athlete_key}",
+                    )
+                    st.markdown("**400 m Check**")
+                    short_400_lactate = st.number_input(
+                        "400 Lactate (mmol)",
+                        min_value=0.0,
+                        max_value=20.0,
+                        value=threshold_editor_lactate(short_400_data),
+                        step=0.1,
+                        format="%.1f",
+                        key=f"short_400_lactate_{active_team}_{athlete_key}",
+                    )
+                    short_400_time = st.text_input(
+                        "400 Time",
+                        value=threshold_editor_rep_time(short_400_data),
+                        placeholder="Example: 69.5",
+                        key=f"short_400_time_{active_team}_{athlete_key}",
+                        help="Enter the athlete's 400 m rep time in seconds, e.g. 69.5.",
+                    )
+
+                    st.markdown("**800 m Check**")
+                    short_800_lactate = st.number_input(
+                        "800 Lactate (mmol)", min_value=0.0, max_value=20.0,
+                        value=threshold_editor_lactate(short_800_data), step=0.1, format="%.1f",
+                        key=f"short_800_lactate_{active_team}_{athlete_key}",
+                    )
+                    short_800_time = st.text_input(
+                        "800 Time", value=threshold_editor_rep_time(short_800_data),
+                        placeholder="Example: 2:20.0",
+                        key=f"short_800_time_{active_team}_{athlete_key}",
+                        help="Enter the athlete's 800 m rep time, e.g. 2:20.0.",
+                    )
+
+                    st.markdown("**1K Check**")
+                    short_1k_lactate = st.number_input(
+                        "1K Lactate (mmol)", min_value=0.0, max_value=20.0,
+                        value=threshold_editor_lactate(short_1k_data), step=0.1, format="%.1f",
+                        key=f"short_1k_lactate_{active_team}_{athlete_key}",
+                    )
+                    short_1k_time = st.text_input(
+                        "1K Time", value=threshold_editor_rep_time(short_1k_data),
+                        placeholder="Example: 2:55.0",
+                        key=f"short_1k_time_{active_team}_{athlete_key}",
+                        help="Enter the athlete's 1K rep time, e.g. 2:55.0.",
+                    )
+
+                with medium_col:
+                    st.markdown("**Medium Reps (5–10 min)**")
+                    medium_lactate = st.number_input(
+                        "Lactate (mmol)",
+                        min_value=0.0,
+                        max_value=20.0,
+                        value=threshold_editor_lactate(medium_data),
+                        step=0.1,
+                        format="%.1f",
+                        key=f"medium_lactate_{active_team}_{athlete_key}",
+                    )
+                    medium_pace = st.text_input(
+                        "Pace",
+                        value=threshold_editor_pace(medium_data),
+                        placeholder="Example: 5:10/mi",
+                        key=f"medium_pace_{active_team}_{athlete_key}",
+                    )
+
+                with long_col:
+                    st.markdown("**Long Reps (10–15 min)**")
+                    long_lactate = st.number_input(
+                        "Lactate (mmol)",
+                        min_value=0.0,
+                        max_value=20.0,
+                        value=threshold_editor_lactate(long_data),
+                        step=0.1,
+                        format="%.1f",
+                        key=f"long_lactate_{active_team}_{athlete_key}",
+                    )
+                    long_pace = st.text_input(
+                        "Pace",
+                        value=threshold_editor_pace(long_data),
+                        placeholder="Example: 5:20/mi",
+                        key=f"long_pace_{active_team}_{athlete_key}",
+                    )
+
+                save_threshold = st.form_submit_button(
+                    "Save Threshold Profile",
+                    type="primary",
+                    use_container_width=True,
                 )
 
-            save_threshold = st.form_submit_button(
-                "Save Threshold Profile",
+            if save_threshold:
+                try:
+                    save_threshold_profile(
+                        active_team,
+                        athlete_key,
+                        short_lactate,
+                        short_pace.strip(),
+                        medium_lactate,
+                        medium_pace.strip(),
+                        long_lactate,
+                        long_pace.strip(),
+                        short_400_lactate,
+                        short_400_time.strip(),
+                        short_800_lactate,
+                        short_800_time.strip(),
+                        short_1k_lactate,
+                        short_1k_time.strip(),
+                    )
+                    st.success("Threshold profile saved.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"VEKDYN could not save the threshold profile: {error}")
+
+    # =========================================================
+    # COMPACT DASHBOARD — HEART RATE & SLEEP
+    # =========================================================
+
+    def classify_team_recovery(data):
+        """Conservative coaching flags; no data is never interpreted as normal."""
+        if not data:
+            return "No Data", ["No recent recovery measurements available."]
+        flags = []
+        measured = 0
+        sleep = data.get("sleep_minutes")
+        if sleep is not None:
+            measured += 1
+            if sleep < 360:
+                flags.append("Sleep under 6 hours")
+            elif sleep < 420:
+                flags.append("Sleep under 7 hours")
+        hrv = data.get("hrv_avg")
+        low = data.get("hrv_normal_low")
+        if hrv is not None and low is not None:
+            measured += 1
+            if hrv < low:
+                flags.append("HRV below personal normal range")
+        heart = data.get("sleep_hr_avg")
+        baseline = data.get("sleep_hr_baseline")
+        if heart is not None and baseline:
+            measured += 1
+            if heart > baseline * 1.08:
+                flags.append("Sleeping heart rate elevated over baseline")
+        if measured == 0:
+            return "No Data", ["Insufficient baseline data for a recovery assessment."]
+        if len(flags) >= 2:
+            return "Attention", flags
+        if flags:
+            return "Monitor", flags
+        return "Normal", ["Available indicators show no flagged deviations."]
+
+
+    @st.cache_data(ttl=60, show_spinner=False)
+    def load_team_recovery_snapshots(team_id, athlete_keys):
+        """Fetch all team recovery snapshots in one Neon connection/query.
+
+        Each metric uses its newest non-null recorded value, preserving the
+        original behavior when sleep, HRV and heart rate arrive on different days.
+        """
+        results = {key: {} for key in athlete_keys}
+        if not athlete_keys:
+            return results
+
+        initialize_coros_database()
+        columns = {
+            "sleep_minutes": "sleep_minutes",
+            "sleep_score": "sleep_score",
+            "hrv_avg": "hrv_avg",
+            "hrv_baseline": "hrv_baseline",
+            "hrv_normal_low": "hrv_normal_low",
+            "hrv_normal_high": "hrv_normal_high",
+            "hrv_status": "hrv_status",
+            "recovery_score": "COALESCE(vekdyn_recovery_score, recovery_score)",
+            "sleep_hr_avg": "sleep_hr_avg",
+            "sleep_hr_baseline": "sleep_hr_baseline",
+            "resting_hr": "resting_hr",
+        }
+        # The latest date is based on measured values, as in the original loader.
+        date_expr = "(sleep_minutes IS NOT NULL OR hrv_avg IS NOT NULL OR resting_hr IS NOT NULL OR sleep_hr_avg IS NOT NULL)"
+        select_fields = [
+            "athlete_key",
+            f"MAX(recovery_date) FILTER (WHERE {date_expr}) AS date",
+        ]
+        for alias, expr in columns.items():
+            select_fields.append(
+                f"(ARRAY_AGG({expr} ORDER BY recovery_date DESC) "
+                f"FILTER (WHERE {expr} IS NOT NULL))[1] AS {alias}"
+            )
+        query = (
+            "SELECT " + ", ".join(select_fields) +
+            " FROM coros_recovery_daily WHERE athlete_key = ANY(%s) GROUP BY athlete_key"
+        )
+        with get_database_connection() as db:
+            with db.cursor() as cursor:
+                cursor.execute(query, (list(athlete_keys),))
+                for row in cursor.fetchall():
+                    key = row[0]
+                    values = row[1:]
+                    results[key] = (
+                        dict(zip(["date", *columns.keys()], values))
+                        if any(value is not None for value in values) else {}
+                    )
+        return results
+
+
+    @st.fragment
+    def render_team_recovery_overview(active_team, athletes):
+        if active_team == DEMO_TEAM_ID:
+            snapshots = {key: {} for key in athletes}
+        else:
+            snapshots = load_team_recovery_snapshots(active_team, tuple(sorted(athletes)))
+
+        status_colors = {
+            "Normal": ("#dcfce7", "#166534"),
+            "Monitor": ("#ffedd5", "#9a3412"),
+            "Attention": ("#fee2e2", "#991b1b"),
+            "No Data": ("#e5e7eb", "#374151"),
+        }
+        priority = {"Attention": 0, "Monitor": 1, "Normal": 2, "No Data": 3}
+        recovery_rows = []
+        for member_key, member in athletes.items():
+            snapshot = snapshots.get(member_key) or {}
+            status, reasons = classify_team_recovery(snapshot)
+            recovery_rows.append((member_key, member["profile"]["name"], status, reasons, snapshot))
+        recovery_rows.sort(key=lambda row: (priority[row[2]], row[1].casefold()))
+
+        st.markdown("""<style>
+        .vekdyn-recovery-header {font-size:0.83rem;font-weight:650;color:#64748b;padding:0.25rem 0;}
+        .vekdyn-recovery-name {font-size:0.95rem;font-weight:500;padding-top:0.45rem;}
+        .vekdyn-recovery-pill {display:inline-block;border-radius:999px;padding:0.25rem 0.75rem;
+          font-size:0.8rem;font-weight:700;margin-top:0.32rem;white-space:nowrap;}
+        div[data-testid="stHorizontalBlock"]:has(.vekdyn-recovery-name) {align-items:center;}
+        </style>""", unsafe_allow_html=True)
+
+        with st.container(border=True):
+            title_col, count_col = st.columns([5, 1], vertical_alignment="center")
+            with title_col:
+                st.markdown("### Team Recovery Overview")
+                st.caption(f"{team_config(active_team)['name']} · Latest available measurements")
+            with count_col:
+                st.caption(f"{len(recovery_rows)} athletes")
+
+            left, middle, right = st.columns([5, 2, 2], vertical_alignment="center")
+            left.markdown('<div class="vekdyn-recovery-header">Athlete</div>', unsafe_allow_html=True)
+            middle.markdown('<div class="vekdyn-recovery-header">Recovery</div>', unsafe_allow_html=True)
+            right.markdown('<div class="vekdyn-recovery-header">Details</div>', unsafe_allow_html=True)
+            st.divider()
+
+            for member_key, name, status, reasons, snapshot in recovery_rows:
+                bg, fg = status_colors[status]
+                row_left, row_middle, row_right = st.columns([5, 2, 2], vertical_alignment="center")
+                row_left.markdown(
+                    f'<div class="vekdyn-recovery-name">{html.escape(name)}</div>',
+                    unsafe_allow_html=True,
+                )
+                row_middle.markdown(
+                    f'<span class="vekdyn-recovery-pill" style="background:{bg};color:{fg}">{status}</span>',
+                    unsafe_allow_html=True,
+                )
+                state_key = f"recovery_expanded_{active_team}_{member_key}"
+                is_open = st.session_state.get(state_key, False)
+                if row_right.button(
+                    "⌃ Close" if is_open else "⌄ Expand",
+                    key=f"recovery_toggle_{active_team}_{member_key}",
+                    use_container_width=True,
+                ):
+                    is_open = not is_open
+                    st.session_state[state_key] = is_open
+
+                if is_open:
+                    with st.container(border=True):
+                        metrics = st.columns(3)
+                        minutes = snapshot.get("sleep_minutes")
+                        metrics[0].metric(
+                            "Sleep",
+                            f"{int(minutes)//60}h {int(minutes)%60:02d}m" if minutes is not None else "—",
+                        )
+                        hrv = snapshot.get("hrv_avg")
+                        metrics[1].metric("HRV", f"{hrv} ms" if hrv is not None else "—")
+                        hr = snapshot.get("sleep_hr_avg")
+                        if hr is None:
+                            hr = snapshot.get("resting_hr")
+                        metrics[2].metric("Heart Rate", f"{hr} bpm" if hr is not None else "—")
+                        if snapshot.get("hrv_baseline") is not None:
+                            st.caption(f"HRV baseline: {snapshot['hrv_baseline']} ms")
+                        if snapshot.get("sleep_hr_baseline") is not None:
+                            st.caption(f"Sleeping HR baseline: {snapshot['sleep_hr_baseline']} bpm")
+                        for reason in reasons:
+                            st.caption(f"• {reason}")
+                st.divider()
+            st.caption(
+                "Status reflects available measurements only; it is not a medical diagnosis or "
+                "definitive readiness assessment. Missing data is never treated as normal."
+            )
+
+
+
+    if dashboard_view == "Dashboard":
+        render_team_recovery_overview(active_team, athletes)
+
+    # =========================================================
+    # TRAINING VOLUME — PLANNED WEEK SUMMARY
+    # =========================================================
+
+    if dashboard_view == "Training":
+        st.subheader("Planned Training")
+        try:
+            if active_team == DEMO_TEAM_ID:
+                st.metric("Planned Week", "72 mi")
+                raise StopIteration
+            planned_week_start = week_start_for(datetime.now(ZoneInfo("America/Chicago")).date())
+            planned_week_end = planned_week_start + timedelta(days=6)
+            planned_workouts = load_team_workouts_range(
+                active_team, planned_week_start, planned_week_end, athlete_key
+            )
+            _, planned_miles = _weekly_workout_matrix(planned_workouts, planned_week_start)
+            if planned_miles is not None:
+                st.metric("Planned Week", f"{planned_miles:g} mi")
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+
+    # =========================================================
+    # ATHLETE ACCESS & CONNECTIONS — COLLAPSED ADMIN CONTROLS
+    # =========================================================
+
+    if dashboard_view == "Connections" and active_team == DEMO_TEAM_ID:
+        st.divider()
+        st.subheader("Athlete Access & Connections")
+        st.success("Demo athlete connected")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Strava**  ·  Connected")
+            st.caption("Demo connection — no real OAuth token is exposed.")
+        with c2:
+            st.markdown("**COROS**  ·  Connected")
+            st.caption("Demo recovery feed — sample data only.")
+
+    elif dashboard_view == "Connections":
+        st.divider()
+        with st.expander("Athlete Access & Connections", expanded=True):
+            st.caption(
+                "Manage this athlete's VEKDYN login and review the connected training account. "
+                "These controls stay collapsed during normal coaching use."
+            )
+
+            # Keep the existing secure account workflow. Readable temporary passwords
+            # only appear immediately after Create/Reset and disappear when cleared.
+            render_athlete_account_manager(
+                athlete_key=athlete_key,
+                profile=profile,
+                team_id=active_team,
+            )
+
+            st.divider()
+            st.markdown("#### Training Connection")
+
+            try:
+                coach_strava_connection = athlete_strava_connection(athlete_key)
+            except Exception as error:
+                coach_strava_connection = {}
+                st.warning(f"VEKDYN could not load this athlete's Strava connection: {error}")
+
+            if coach_strava_connection:
+                connected_name = coach_strava_connection.get("strava_name") or athlete_name
+                st.success(f"Strava connected — {connected_name}")
+                st.caption(
+                    "Training data is stored through the athlete's VEKDYN connection and is available to the coach dashboard."
+                )
+            else:
+                st.info("Strava not connected")
+                st.caption(
+                    "The athlete can authorize Strava from VEKDYN Athlete. Coach-side connection is only needed as an administrative fallback."
+                )
+
+    # =========================================================
+    # COMPACT BOTTOM NAVIGATION
+    # =========================================================
+
+    st.markdown('<div class="bottom-nav-anchor"></div>', unsafe_allow_html=True)
+    nav1, nav2, nav3, nav4, nav5, nav6 = st.columns([1.1, 1.7, 1.8, 1.8, 1.8, 1.8])
+    with nav1:
+        st.markdown("**VEK<span style='color:#2f9e44'>DYN</span>**", unsafe_allow_html=True)
+    for column, label, view in [
+        (nav2, "▣ Dashboard", "Dashboard"),
+        (nav3, "▥ Training Volume", "Training"),
+        (nav4, "◎ Predictor", "Predictor"),
+        (nav5, "↗ Connections", "Connections"),
+        (nav6, "♟ Athlete Profile", "Profile"),
+    ]:
+        with column:
+            if st.button(
+                label,
+                use_container_width=True,
+                type="primary" if dashboard_view == view else "secondary",
+                key=f"bottom_nav_{view.lower()}",
+            ):
+                st.session_state["dashboard_view"] = view
+                st.rerun()
+
+    logout_col, _ = st.columns([1, 5])
+    with logout_col:
+        if st.button("Log Out", key="compact_logout_button", use_container_width=True):
+            log_out()
+
+def _run_athlete():
+    import base64
+    import calendar
+    import hashlib
+    import json
+    import re
+    import hmac
+    import html
+    import secrets
+    import time
+    from datetime import date, timedelta
+    from urllib.parse import urlencode
+    from zoneinfo import ZoneInfo
+
+    import bcrypt
+    import psycopg2
+    import requests
+    import pandas as pd
+    import streamlit as st
+    from pathlib import Path
+
+
+    # =========================================================
+    # VEKDYN ATHLETE
+    # =========================================================
+
+    st.set_page_config(
+        page_title="VEKDYN Athlete",
+        page_icon="🏃",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+
+
+    # =========================================================
+    # DATABASE
+    # =========================================================
+
+    def get_database_connection():
+        """
+        Connect to the same Neon database used by
+        the VEKDYN Coach platform.
+        """
+
+        return psycopg2.connect(
+            st.secrets["DATABASE_URL"]
+        )
+
+
+    # =========================================================
+    # STRAVA — ATHLETE SELF-CONNECTION
+    # =========================================================
+
+    STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
+    STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
+    STRAVA_REDIRECT_URI = st.secrets.get("ATHLETE_STRAVA_REDIRECT_URI", "http://localhost:8501")
+
+    def strava_secret(name, default=None):
+        try:
+            return st.secrets[name]
+        except (KeyError, FileNotFoundError):
+            return default
+
+    @st.cache_resource(show_spinner=False)
+    def initialize_strava_database():
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS strava_connections (
+                        athlete_key TEXT PRIMARY KEY,
+                        access_token TEXT NOT NULL,
+                        refresh_token TEXT NOT NULL,
+                        expires_at BIGINT NOT NULL,
+                        scope TEXT,
+                        strava_athlete_id BIGINT UNIQUE,
+                        strava_name TEXT
+                    )
+                """)
+
+    def load_saved_strava_connection(athlete_key):
+        initialize_strava_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute("""
+                    SELECT athlete_key, access_token, refresh_token, expires_at,
+                           scope, strava_athlete_id, strava_name
+                    FROM strava_connections
+                    WHERE athlete_key = %s
+                """, (athlete_key,))
+                row = cursor.fetchone()
+        if not row:
+            return {}
+        return {
+            "athlete_key": row[0], "access_token": row[1], "refresh_token": row[2],
+            "expires_at": row[3], "scope": row[4], "strava_athlete_id": row[5],
+            "strava_name": row[6],
+        }
+
+    def saved_owner_of_strava_account(strava_athlete_id):
+        if not strava_athlete_id:
+            return None
+        initialize_strava_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "SELECT athlete_key FROM strava_connections WHERE strava_athlete_id = %s",
+                    (strava_athlete_id,),
+                )
+                row = cursor.fetchone()
+        return row[0] if row else None
+
+    def persist_strava_connection(athlete_key, connection):
+        initialize_strava_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO strava_connections (
+                        athlete_key, access_token, refresh_token, expires_at,
+                        scope, strava_athlete_id, strava_name
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (athlete_key) DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        refresh_token = EXCLUDED.refresh_token,
+                        expires_at = EXCLUDED.expires_at,
+                        scope = EXCLUDED.scope,
+                        strava_athlete_id = EXCLUDED.strava_athlete_id,
+                        strava_name = EXCLUDED.strava_name
+                """, (
+                    athlete_key, connection["access_token"], connection["refresh_token"],
+                    int(connection["expires_at"]), connection.get("scope", ""),
+                    connection.get("strava_athlete_id"), connection.get("strava_name", ""),
+                ))
+
+    def create_strava_login_url(athlete_key):
+        client_id = strava_secret("STRAVA_CLIENT_ID")
+        client_secret = strava_secret("STRAVA_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            return None
+        nonce = secrets.token_urlsafe(12)
+        payload = f"{athlete_key}:{nonce}"
+        signature = hmac.new(str(client_secret).encode(), payload.encode(), hashlib.sha256).hexdigest()
+        state = f"{payload}:{signature}"
+        params = {
+            "client_id": client_id, "redirect_uri": STRAVA_REDIRECT_URI,
+            "response_type": "code", "approval_prompt": "force",
+            "scope": "read,activity:read_all", "state": state,
+        }
+        return f"{STRAVA_AUTHORIZE_URL}?{urlencode(params)}"
+
+    def athlete_key_from_oauth_state(oauth_state):
+        client_secret = strava_secret("STRAVA_CLIENT_SECRET")
+        if not oauth_state or not client_secret:
+            return None
+        try:
+            athlete_key, nonce, returned_signature = oauth_state.split(":", 2)
+        except ValueError:
+            return None
+        payload = f"{athlete_key}:{nonce}"
+        expected = hmac.new(str(client_secret).encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return athlete_key if hmac.compare_digest(returned_signature, expected) else None
+
+    def exchange_authorization_code(code, athlete_key):
+        response = requests.post(STRAVA_TOKEN_URL, data={
+            "client_id": strava_secret("STRAVA_CLIENT_ID"),
+            "client_secret": strava_secret("STRAVA_CLIENT_SECRET"),
+            "code": code, "grant_type": "authorization_code",
+        }, timeout=15)
+        response.raise_for_status()
+        token_data = response.json()
+        person = token_data.get("athlete", {})
+        strava_id = person.get("id")
+        strava_name = " ".join(x for x in [person.get("firstname", ""), person.get("lastname", "")] if x).strip()
+        owner = saved_owner_of_strava_account(strava_id)
+        if owner and owner != athlete_key:
+            raise RuntimeError("This Strava account is already connected to another VEKDYN athlete.")
+        connection = {
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data["refresh_token"],
+            "expires_at": token_data["expires_at"],
+            "scope": token_data.get("scope", ""),
+            "strava_athlete_id": strava_id,
+            "strava_name": strava_name,
+        }
+        persist_strava_connection(athlete_key, connection)
+        return connection
+
+    def refresh_strava_token(athlete_key):
+        connection = load_saved_strava_connection(athlete_key)
+        refresh_token = connection.get("refresh_token")
+        if not refresh_token:
+            raise RuntimeError("No Strava refresh token exists.")
+        response = requests.post(STRAVA_TOKEN_URL, data={
+            "client_id": strava_secret("STRAVA_CLIENT_ID"),
+            "client_secret": strava_secret("STRAVA_CLIENT_SECRET"),
+            "refresh_token": refresh_token, "grant_type": "refresh_token",
+        }, timeout=15)
+        response.raise_for_status()
+        token_data = response.json()
+        updated = {
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data["refresh_token"],
+            "expires_at": token_data["expires_at"],
+            "scope": token_data.get("scope", connection.get("scope", "")),
+            "strava_athlete_id": connection.get("strava_athlete_id"),
+            "strava_name": connection.get("strava_name", ""),
+        }
+        persist_strava_connection(athlete_key, updated)
+        return updated["access_token"]
+
+    def get_valid_strava_token(athlete_key):
+        connection = load_saved_strava_connection(athlete_key)
+        if not connection:
+            return None
+        if connection.get("access_token") and connection.get("expires_at", 0) > time.time() + 60:
+            return connection["access_token"]
+        return refresh_strava_token(athlete_key)
+
+    STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+
+    @st.cache_data(ttl=900, show_spinner=False)
+    def get_athlete_strava_weekly(access_token, number_of_weeks=8):
+        """Return weekly running mileage for the athlete represented by this token."""
+        today = date.today()
+        after_day = today - timedelta(weeks=number_of_weeks, days=7)
+        response = requests.get(
+            STRAVA_ACTIVITIES_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"after": int(time.mktime(after_day.timetuple())), "per_page": 100, "page": 1},
+            timeout=20,
+        )
+        response.raise_for_status()
+        totals = {}
+        for activity in response.json():
+            sport = str(activity.get("sport_type") or activity.get("type") or "")
+            if sport not in {"Run", "TrailRun", "VirtualRun"}:
+                continue
+            started = activity.get("start_date_local") or activity.get("start_date")
+            if not started:
+                continue
+            try:
+                activity_day = date.fromisoformat(str(started)[:10])
+            except ValueError:
+                continue
+            week_start = activity_day - timedelta(days=activity_day.weekday())
+            totals[week_start] = totals.get(week_start, 0.0) + float(activity.get("distance") or 0) / 1609.344
+
+        current_week = today - timedelta(days=today.weekday())
+        weeks = [current_week - timedelta(weeks=i) for i in reversed(range(number_of_weeks))]
+        return pd.DataFrame({
+            "Week": [week.strftime("%b %d") for week in weeks],
+            "Mileage": [round(totals.get(week, 0.0), 2) for week in weeks],
+        })
+
+    def render_strava_volume_chart(athlete_key):
+        """Athlete-facing 8-week mileage chart, isolated to the logged-in athlete."""
+        connection = load_saved_strava_connection(athlete_key)
+        if not connection:
+            st.info("Connect Strava in Connections to see your training-volume chart.")
+            return
+        try:
+            token = get_valid_strava_token(athlete_key)
+            weekly = get_athlete_strava_weekly(token, 8)
+        except Exception as error:
+            st.warning(f"Strava training data could not be loaded: {error}")
+            return
+        if weekly.empty:
+            st.info("No recent Strava running data is available yet.")
+            return
+        current = float(weekly["Mileage"].iloc[-1])
+        st.metric("This week", f"{current:.1f} mi")
+        st.line_chart(weekly.set_index("Week")[["Mileage"]], height=260)
+        st.caption("Last 8 weeks · Strava")
+
+    def handle_strava_callback():
+        code = st.query_params.get("code")
+        returned_state = st.query_params.get("state")
+        oauth_error = st.query_params.get("error")
+        if not code and not oauth_error:
+            return
+        if oauth_error:
+            st.error("Strava authorization was cancelled.")
+            clear_oauth_params_keep_session()
+            return
+        oauth_athlete_key = athlete_key_from_oauth_state(returned_state)
+        if not oauth_athlete_key:
+            st.error("The Strava connection could not be verified.")
+            clear_oauth_params_keep_session()
+            return
+        logged_in_key = st.session_state.get("athlete_id")
+        if not logged_in_key or oauth_athlete_key != logged_in_key:
+            st.error("This Strava authorization does not belong to the logged-in VEKDYN athlete.")
+            clear_oauth_params_keep_session()
+            return
+        try:
+            connection = exchange_authorization_code(code, oauth_athlete_key)
+            st.session_state["strava_success"] = f"Connected to {connection.get('strava_name') or 'Strava'}."
+            st.session_state["athlete_nav"] = "Connections"
+            current_session = browser_session_token()
+            st.query_params.clear()
+            if current_session:
+                set_browser_session_token(current_session, view="Connections")
+            return
+        except (requests.RequestException, RuntimeError) as error:
+            st.error(f"Strava connection failed: {error}")
+
+
+    # =========================================================
+    # COROS MCP — ATHLETE SELF-CONNECTION + SLEEP / HRV
+    # =========================================================
+    # COROS authorization happens on the athlete side.  The resulting connection
+    # and recovery rows are stored in the same Neon database the Coach Hub reads.
+    # This means the athlete owns the authorization, while the coach can see the
+    # connected status and recovery data without ever receiving COROS credentials.
+
+    # Universal COROS MCP endpoint; COROS routes the athlete to the correct region.
+    COROS_MCP_URL = "https://mcp.coros.com/mcp"
+    COROS_TIMEZONE = "America/Chicago"
+    COROS_PROTOCOL_VERSION = "2025-06-18"
+
+    # COROS must use its own deployed callback. Never fall back to Strava/localhost.
+    COROS_REDIRECT_URI = str(st.secrets.get("ATHLETE_COROS_REDIRECT_URI", "")).strip()
+
+
+    @st.cache_resource(show_spinner=False)
+    def initialize_coros_database():
+        """Create/upgrade the shared COROS tables used by Athlete and Coach."""
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                # One dynamically registered COROS OAuth client per redirect URI.
+                # Keeping the redirect URI in the primary key avoids colliding with
+                # the coach app if both apps are deployed at different URLs.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coros_athlete_oauth_clients (
+                        redirect_uri TEXT PRIMARY KEY,
+                        client_id TEXT NOT NULL,
+                        client_secret TEXT,
+                        token_endpoint TEXT NOT NULL,
+                        authorization_endpoint TEXT NOT NULL,
+                        token_endpoint_auth_method TEXT,
+                        registration_json JSONB,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coros_athlete_oauth_pending (
+                        state TEXT PRIMARY KEY,
+                        athlete_key TEXT NOT NULL,
+                        athlete_id TEXT NOT NULL,
+                        code_verifier TEXT NOT NULL,
+                        redirect_uri TEXT NOT NULL,
+                        client_id TEXT NOT NULL,
+                        client_secret TEXT,
+                        token_endpoint TEXT NOT NULL,
+                        token_endpoint_auth_method TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coros_connections (
+                        athlete_key TEXT PRIMARY KEY,
+                        access_token TEXT NOT NULL,
+                        refresh_token TEXT,
+                        token_type TEXT,
+                        scope TEXT,
+                        expires_at BIGINT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+                # Upgrade an older COROS table without destroying existing tokens.
+                cursor.execute(
+                    "ALTER TABLE coros_connections ADD COLUMN IF NOT EXISTS client_id TEXT"
+                )
+                cursor.execute(
+                    "ALTER TABLE coros_connections ADD COLUMN IF NOT EXISTS client_secret TEXT"
+                )
+                cursor.execute(
+                    "ALTER TABLE coros_connections ADD COLUMN IF NOT EXISTS token_endpoint TEXT"
+                )
+                cursor.execute(
+                    "ALTER TABLE coros_connections ADD COLUMN IF NOT EXISTS token_endpoint_auth_method TEXT"
+                )
+                cursor.execute(
+                    "ALTER TABLE coros_connections ADD COLUMN IF NOT EXISTS redirect_uri TEXT"
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coros_recovery_daily (
+                        athlete_key TEXT NOT NULL,
+                        recovery_date DATE NOT NULL,
+                        sleep_minutes INTEGER,
+                        sleep_score INTEGER,
+                        hrv_avg INTEGER,
+                        hrv_baseline INTEGER,
+                        hrv_normal_low INTEGER,
+                        hrv_normal_high INTEGER,
+                        hrv_status TEXT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (athlete_key, recovery_date)
+                    )
+                    """
+                )
+
+                cursor.execute(
+                    "ALTER TABLE coros_recovery_daily ADD COLUMN IF NOT EXISTS resting_hr INTEGER"
+                )
+                cursor.execute(
+                    "ALTER TABLE coros_recovery_daily ADD COLUMN IF NOT EXISTS vekdyn_recovery_score INTEGER"
+                )
+
+            database.commit()
+
+
+    def _safe_json(response):
+        try:
+            return response.json()
+        except ValueError as error:
+            raise RuntimeError(
+                f"COROS returned an unreadable response ({response.status_code})."
+            ) from error
+
+
+    @st.cache_resource(show_spinner=False)
+    def _coros_auth_metadata():
+        """Discover COROS OAuth endpoints from the protected MCP resource."""
+        origin = COROS_MCP_URL.rsplit("/mcp", 1)[0]
+        resource_metadata = None
+
+        # RFC 9728 path-aware location first, root fallback second.
+        for metadata_url in (
+            f"{origin}/.well-known/oauth-protected-resource/mcp",
+            f"{origin}/.well-known/oauth-protected-resource",
+        ):
+            try:
+                response = requests.get(metadata_url, timeout=15, allow_redirects=True)
+            except requests.RequestException:
+                continue
+
+            if response.ok:
+                candidate = _safe_json(response)
+                if candidate.get("authorization_servers"):
+                    resource_metadata = candidate
+                    break
+
+        if not resource_metadata:
+            # Some MCP servers advertise the metadata URL only on a 401 challenge.
+            try:
+                challenge = requests.get(
+                    COROS_MCP_URL,
+                    headers={"Accept": "application/json, text/event-stream"},
+                    timeout=15,
+                    allow_redirects=True,
+                )
+                www_authenticate = challenge.headers.get("WWW-Authenticate", "")
+                match = re.search(r'resource_metadata="([^"]+)"', www_authenticate)
+                if match:
+                    response = requests.get(match.group(1), timeout=15, allow_redirects=True)
+                    if response.ok:
+                        resource_metadata = _safe_json(response)
+            except requests.RequestException:
+                pass
+
+        if not resource_metadata or not resource_metadata.get("authorization_servers"):
+            raise RuntimeError(
+                "COROS OAuth discovery failed. The COROS MCP authorization server "
+                "could not be located."
+            )
+
+        issuer = str(resource_metadata["authorization_servers"][0]).rstrip("/")
+
+        for metadata_url in (
+            f"{issuer}/.well-known/oauth-authorization-server",
+            f"{issuer}/.well-known/openid-configuration",
+        ):
+            try:
+                response = requests.get(metadata_url, timeout=15, allow_redirects=True)
+            except requests.RequestException:
+                continue
+
+            if response.ok:
+                metadata = _safe_json(response)
+                if metadata.get("authorization_endpoint") and metadata.get("token_endpoint"):
+                    return metadata
+
+        raise RuntimeError("COROS authorization metadata could not be loaded.")
+
+
+    @st.cache_resource(show_spinner=False)
+    def _load_coros_oauth_client():
+        """Return or dynamically register the OAuth client for this Athlete app."""
+        initialize_coros_database()
+        redirect_uri = str(COROS_REDIRECT_URI).strip()
+
+        if not redirect_uri:
+            raise RuntimeError(
+                "ATHLETE_COROS_REDIRECT_URI is missing from Streamlit Secrets. "
+                "Set it to the public VEKDYN Athlete app URL."
+            )
+
+        if not redirect_uri.startswith("https://"):
+            raise RuntimeError(
+                "ATHLETE_COROS_REDIRECT_URI must be the public HTTPS URL of the "
+                "VEKDYN Athlete app; localhost is not valid for production."
+            )
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT client_id, client_secret, token_endpoint,
+                           authorization_endpoint, token_endpoint_auth_method
+                    FROM coros_athlete_oauth_clients
+                    WHERE redirect_uri = %s
+                    """,
+                    (redirect_uri,),
+                )
+                row = cursor.fetchone()
+
+        if row:
+            return {
+                "client_id": row[0],
+                "client_secret": row[1],
+                "token_endpoint": row[2],
+                "authorization_endpoint": row[3],
+                "token_endpoint_auth_method": row[4] or "none",
+            }
+
+        metadata = _coros_auth_metadata()
+        registration_endpoint = metadata.get("registration_endpoint")
+        if not registration_endpoint:
+            raise RuntimeError(
+                "COROS did not advertise dynamic OAuth client registration."
+            )
+
+        registration_payload = {
+            "client_name": "VEKDYN Athlete",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        }
+
+        response = requests.post(
+            registration_endpoint,
+            json=registration_payload,
+            timeout=20,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        registration = _safe_json(response)
+
+        client_id = registration.get("client_id")
+        if not client_id:
+            raise RuntimeError("COROS registration did not return a client ID.")
+
+        client = {
+            "client_id": str(client_id),
+            "client_secret": registration.get("client_secret"),
+            "token_endpoint": str(metadata["token_endpoint"]),
+            "authorization_endpoint": str(metadata["authorization_endpoint"]),
+            "token_endpoint_auth_method": registration.get(
+                "token_endpoint_auth_method", "none"
+            ),
+        }
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO coros_athlete_oauth_clients (
+                        redirect_uri, client_id, client_secret, token_endpoint,
+                        authorization_endpoint, token_endpoint_auth_method,
+                        registration_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (redirect_uri)
+                    DO UPDATE SET
+                        client_id = EXCLUDED.client_id,
+                        client_secret = EXCLUDED.client_secret,
+                        token_endpoint = EXCLUDED.token_endpoint,
+                        authorization_endpoint = EXCLUDED.authorization_endpoint,
+                        token_endpoint_auth_method = EXCLUDED.token_endpoint_auth_method,
+                        registration_json = EXCLUDED.registration_json,
+                        updated_at = NOW()
+                    """,
+                    (
+                        redirect_uri,
+                        client["client_id"],
+                        client.get("client_secret"),
+                        client["token_endpoint"],
+                        client["authorization_endpoint"],
+                        client["token_endpoint_auth_method"],
+                        json.dumps(registration),
+                    ),
+                )
+            database.commit()
+
+        return client
+
+
+    def _pkce_pair():
+        verifier = secrets.token_urlsafe(64)
+        digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+        challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        return verifier, challenge
+
+
+    def create_coros_login_url(athlete_key, athlete_id):
+        """Create a COROS OAuth URL tied to the logged-in VEKDYN athlete."""
+        client = _load_coros_oauth_client()
+        metadata = _coros_auth_metadata()
+        verifier, challenge = _pkce_pair()
+        state = "coros_" + secrets.token_urlsafe(32)
+        redirect_uri = str(COROS_REDIRECT_URI).strip()
+
+        initialize_coros_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM coros_athlete_oauth_pending
+                    WHERE created_at < NOW() - INTERVAL '30 minutes'
+                    """
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO coros_athlete_oauth_pending (
+                        state, athlete_key, athlete_id, code_verifier, redirect_uri,
+                        client_id, client_secret, token_endpoint,
+                        token_endpoint_auth_method
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        state,
+                        str(athlete_key).strip(),
+                        str(athlete_id).strip(),
+                        verifier,
+                        redirect_uri,
+                        client["client_id"],
+                        client.get("client_secret"),
+                        client["token_endpoint"],
+                        client.get("token_endpoint_auth_method", "none"),
+                    ),
+                )
+            database.commit()
+
+        params = {
+            "response_type": "code",
+            "client_id": client["client_id"],
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": COROS_MCP_URL,
+        }
+
+        supported_scopes = metadata.get("scopes_supported") or []
+        if supported_scopes:
+            params["scope"] = " ".join(str(scope) for scope in supported_scopes)
+
+        return str(client["authorization_endpoint"]) + "?" + urlencode(params)
+
+
+    def _coros_pending_oauth(state):
+        initialize_coros_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT athlete_key, athlete_id, code_verifier, redirect_uri,
+                           client_id, client_secret, token_endpoint,
+                           token_endpoint_auth_method
+                    FROM coros_athlete_oauth_pending
+                    WHERE state = %s
+                      AND created_at > NOW() - INTERVAL '30 minutes'
+                    LIMIT 1
+                    """,
+                    (state,),
+                )
+                row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "athlete_key": row[0],
+            "athlete_id": row[1],
+            "code_verifier": row[2],
+            "redirect_uri": row[3],
+            "client_id": row[4],
+            "client_secret": row[5],
+            "token_endpoint": row[6],
+            "token_endpoint_auth_method": row[7] or "none",
+        }
+
+
+    def _oauth_token_request(endpoint, form, client_id, client_secret, auth_method):
+        """POST to an OAuth token endpoint using the registered client auth method."""
+        clean_form = dict(form)
+        auth = None
+
+        if auth_method == "client_secret_basic" and client_secret:
+            auth = (client_id, client_secret)
+        else:
+            clean_form["client_id"] = client_id
+            if auth_method == "client_secret_post" and client_secret:
+                clean_form["client_secret"] = client_secret
+
+        response = requests.post(
+            endpoint,
+            data=clean_form,
+            auth=auth,
+            timeout=20,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        return _safe_json(response)
+
+
+    def exchange_coros_authorization_code(code, state):
+        pending = _coros_pending_oauth(state)
+        if not pending:
+            raise RuntimeError(
+                "This COROS authorization expired or could not be verified. "
+                "Sign in to VEKDYN Athlete and select Connect COROS again."
+            )
+
+        token = _oauth_token_request(
+            endpoint=pending["token_endpoint"],
+            form={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": pending["redirect_uri"],
+                "code_verifier": pending["code_verifier"],
+                "resource": COROS_MCP_URL,
+            },
+            client_id=pending["client_id"],
+            client_secret=pending.get("client_secret"),
+            auth_method=pending.get("token_endpoint_auth_method", "none"),
+        )
+
+        access_token = token.get("access_token")
+        if not access_token:
+            raise RuntimeError("COROS returned no access token.")
+
+        expires_at = None
+        if token.get("expires_in") is not None:
+            expires_at = int(time.time()) + int(token["expires_in"])
+
+        initialize_coros_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO coros_connections (
+                        athlete_key, access_token, refresh_token, token_type,
+                        scope, expires_at, client_id, client_secret,
+                        token_endpoint, token_endpoint_auth_method, redirect_uri
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (athlete_key)
+                    DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        refresh_token = EXCLUDED.refresh_token,
+                        token_type = EXCLUDED.token_type,
+                        scope = EXCLUDED.scope,
+                        expires_at = EXCLUDED.expires_at,
+                        client_id = EXCLUDED.client_id,
+                        client_secret = EXCLUDED.client_secret,
+                        token_endpoint = EXCLUDED.token_endpoint,
+                        token_endpoint_auth_method = EXCLUDED.token_endpoint_auth_method,
+                        redirect_uri = EXCLUDED.redirect_uri,
+                        updated_at = NOW()
+                    """,
+                    (
+                        pending["athlete_key"],
+                        access_token,
+                        token.get("refresh_token"),
+                        token.get("token_type", "Bearer"),
+                        token.get("scope", ""),
+                        expires_at,
+                        pending["client_id"],
+                        pending.get("client_secret"),
+                        pending["token_endpoint"],
+                        pending.get("token_endpoint_auth_method", "none"),
+                        pending["redirect_uri"],
+                    ),
+                )
+                cursor.execute(
+                    "DELETE FROM coros_athlete_oauth_pending WHERE state = %s",
+                    (state,),
+                )
+            database.commit()
+
+        return pending["athlete_key"], pending["athlete_id"]
+
+
+    def load_saved_coros_connection(athlete_key):
+        initialize_coros_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT access_token, refresh_token, expires_at, client_id,
+                           client_secret, token_endpoint,
+                           token_endpoint_auth_method, redirect_uri
+                    FROM coros_connections
+                    WHERE athlete_key = %s
+                    """,
+                    (athlete_key,),
+                )
+                row = cursor.fetchone()
+
+        if not row:
+            return {}
+
+        return {
+            "access_token": row[0],
+            "refresh_token": row[1],
+            "expires_at": row[2],
+            "client_id": row[3],
+            "client_secret": row[4],
+            "token_endpoint": row[5],
+            "token_endpoint_auth_method": row[6] or "none",
+            "redirect_uri": row[7],
+        }
+
+
+    def coros_is_connected(athlete_key):
+        return bool(load_saved_coros_connection(athlete_key).get("access_token"))
+
+
+    def get_valid_coros_token(athlete_key):
+        connection = load_saved_coros_connection(athlete_key)
+        if not connection:
+            raise RuntimeError("COROS has not been connected yet.")
+
+        expires_at = connection.get("expires_at")
+        if not expires_at or int(expires_at) > int(time.time()) + 120:
+            return connection["access_token"]
+
+        refresh_token = connection.get("refresh_token")
+        if not refresh_token:
+            raise RuntimeError("The COROS session expired. Reconnect COROS.")
+
+        if not connection.get("client_id") or not connection.get("token_endpoint"):
+            raise RuntimeError(
+                "This older COROS connection is missing refresh information. Reconnect COROS once."
+            )
+
+        token = _oauth_token_request(
+            endpoint=connection["token_endpoint"],
+            form={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "resource": COROS_MCP_URL,
+            },
+            client_id=connection["client_id"],
+            client_secret=connection.get("client_secret"),
+            auth_method=connection.get("token_endpoint_auth_method", "none"),
+        )
+
+        if not token.get("access_token"):
+            raise RuntimeError("COROS did not return a refreshed access token.")
+
+        new_expires_at = None
+        if token.get("expires_in") is not None:
+            new_expires_at = int(time.time()) + int(token["expires_in"])
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE coros_connections
+                    SET access_token = %s,
+                        refresh_token = COALESCE(%s, refresh_token),
+                        expires_at = %s,
+                        updated_at = NOW()
+                    WHERE athlete_key = %s
+                    """,
+                    (
+                        token["access_token"],
+                        token.get("refresh_token"),
+                        new_expires_at,
+                        athlete_key,
+                    ),
+                )
+            database.commit()
+
+        return token["access_token"]
+
+
+    def _mcp_response_json(response):
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+
+        if "application/json" in content_type:
+            return response.json()
+
+        # Streamable HTTP may reply as SSE. Read the first JSON data event.
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload:
+                    try:
+                        return json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+
+        raise RuntimeError("COROS MCP returned an unreadable response.")
+
+
+    def coros_mcp_tool_call(access_token, tool_name, arguments):
+        """Initialize a short MCP session and call one COROS tool."""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": COROS_PROTOCOL_VERSION,
+        }
+
+        initialize_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": COROS_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "VEKDYN Athlete", "version": "1.0"},
+            },
+        }
+
+        initialize_response = requests.post(
+            COROS_MCP_URL,
+            headers=headers,
+            json=initialize_payload,
+            timeout=25,
+            allow_redirects=True,
+        )
+        initialize_data = _mcp_response_json(initialize_response)
+        if initialize_data.get("error"):
+            raise RuntimeError(str(initialize_data["error"]))
+
+        session_id = initialize_response.headers.get("Mcp-Session-Id")
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+
+        # Complete the MCP initialization handshake before calling a tool.
+        initialized_payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }
+        initialized_response = requests.post(
+            COROS_MCP_URL,
+            headers=headers,
+            json=initialized_payload,
+            timeout=15,
+            allow_redirects=True,
+        )
+        if initialized_response.status_code >= 400:
+            initialized_response.raise_for_status()
+
+        call_payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+            },
+        }
+
+        call_response = requests.post(
+            COROS_MCP_URL,
+            headers=headers,
+            json=call_payload,
+            timeout=30,
+            allow_redirects=True,
+        )
+        call_data = _mcp_response_json(call_response)
+        if call_data.get("error"):
+            raise RuntimeError(str(call_data["error"]))
+
+        text_parts = []
+        for item in call_data.get("result", {}).get("content", []):
+            if isinstance(item, dict) and item.get("text"):
+                text_parts.append(str(item["text"]))
+
+        return "\n".join(text_parts)
+
+
+    def _parse_coros_sleep(text):
+        records = {}
+        pattern = re.compile(
+            r"(\d{4}-\d{2}-\d{2})[\s\S]*?"
+            r"Sleep Score:\s*(\d+)[\s\S]*?"
+            r"Main Sleep:\s*(?:(\d+)h\s*)?(\d+)min"
+        )
+        for match in pattern.finditer(text or ""):
+            records[match.group(1)] = {
+                "sleep_score": int(match.group(2)),
+                "sleep_minutes": int(match.group(3) or 0) * 60 + int(match.group(4)),
+            }
+        return records
+
+
+    def _parse_coros_hrv(text):
+        records = {}
+        pattern = re.compile(
+            r"(\d{4}-\d{2}-\d{2}):\s*\n\s*"
+            r"HRV Avg:\s*(\d+)\s*ms\s*(?:—|-)\s*([^\n]+)\s*\n\s*"
+            r"Normal Range:\s*(\d+)\s*-\s*(\d+)\s*ms\s*\n\s*"
+            r"Baseline:\s*(\d+)\s*ms"
+        )
+        for match in pattern.finditer(text or ""):
+            records[match.group(1)] = {
+                "hrv_avg": int(match.group(2)),
+                "hrv_status": match.group(3).strip(),
+                "hrv_normal_low": int(match.group(4)),
+                "hrv_normal_high": int(match.group(5)),
+                "hrv_baseline": int(match.group(6)),
+            }
+        return records
+
+
+    def _parse_coros_resting_hr(text):
+        records = {}
+        pattern = re.compile(r"(\d{4}-\d{2}-\d{2}):\s*(\d+)\s*bpm", re.IGNORECASE)
+        for match in pattern.finditer(text or ""):
+            records[match.group(1)] = int(match.group(2))
+        return records
+
+
+    def _recovery_score(sleep_score, hrv_avg, hrv_baseline, resting_hr, resting_baseline):
+        """VEKDYN training-readiness score; missing inputs are reweighted, never fabricated."""
+        components = []
+        if sleep_score is not None:
+            components.append((max(0.0, min(100.0, float(sleep_score))), 0.45))
+        if hrv_avg is not None and hrv_baseline not in (None, 0):
+            value = 100.0 * float(hrv_avg) / float(hrv_baseline)
+            components.append((max(0.0, min(100.0, value)), 0.40))
+        if resting_hr is not None and resting_baseline not in (None, 0):
+            value = 100.0 * float(resting_baseline) / float(resting_hr)
+            components.append((max(0.0, min(100.0, value)), 0.15))
+        if not components:
+            return None
+        total_weight = sum(weight for _, weight in components)
+        return int(round(sum(value * weight for value, weight in components) / total_weight))
+
+
+    def _resting_hr_baseline(athlete_key, recovery_date):
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT AVG(resting_hr)::float
+                    FROM (
+                        SELECT resting_hr
+                        FROM coros_recovery_daily
+                        WHERE athlete_key = %s
+                          AND recovery_date < %s
+                          AND resting_hr IS NOT NULL
+                        ORDER BY recovery_date DESC
+                        LIMIT 7
+                    ) recent
+                    """,
+                    (athlete_key, recovery_date),
+                )
+                row = cursor.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+
+    def sync_coros_recovery(athlete_key, days=7):
+        """Pull recent COROS sleep, sleep HRV and resting HR into the shared Neon table."""
+        access_token = get_valid_coros_token(athlete_key)
+        days = max(1, min(int(days), 7))
+        arguments = {"startDate": "", "endDate": "", "days": days, "timezone": COROS_TIMEZONE}
+
+        sleep_text = coros_mcp_tool_call(access_token, "querySleepOverview", arguments)
+        hrv_text = coros_mcp_tool_call(access_token, "querySleepHrv", arguments)
+        resting_text = coros_mcp_tool_call(
+            access_token,
+            "queryRestingHeartRate",
+            {"days": days, "timezone": COROS_TIMEZONE},
+        )
+
+        sleep_records = _parse_coros_sleep(sleep_text)
+        hrv_records = _parse_coros_hrv(hrv_text)
+        resting_records = _parse_coros_resting_hr(resting_text)
+        all_dates = sorted(set(sleep_records) | set(hrv_records) | set(resting_records))
+
+        if not all_dates:
+            raise RuntimeError("COROS connected, but no recent recovery record was returned.")
+
+        initialize_coros_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                for recovery_date in all_dates:
+                    sleep = sleep_records.get(recovery_date, {})
+                    hrv = hrv_records.get(recovery_date, {})
+                    resting_hr = resting_records.get(recovery_date)
+                    baseline = _resting_hr_baseline(athlete_key, recovery_date)
+                    score = _recovery_score(
+                        sleep.get("sleep_score"),
+                        hrv.get("hrv_avg"),
+                        hrv.get("hrv_baseline"),
+                        resting_hr,
+                        baseline,
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO coros_recovery_daily (
+                            athlete_key, recovery_date, sleep_minutes, sleep_score,
+                            hrv_avg, hrv_baseline, hrv_normal_low, hrv_normal_high,
+                            hrv_status, resting_hr, vekdyn_recovery_score
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (athlete_key, recovery_date)
+                        DO UPDATE SET
+                            sleep_minutes = COALESCE(EXCLUDED.sleep_minutes, coros_recovery_daily.sleep_minutes),
+                            sleep_score = COALESCE(EXCLUDED.sleep_score, coros_recovery_daily.sleep_score),
+                            hrv_avg = COALESCE(EXCLUDED.hrv_avg, coros_recovery_daily.hrv_avg),
+                            hrv_baseline = COALESCE(EXCLUDED.hrv_baseline, coros_recovery_daily.hrv_baseline),
+                            hrv_normal_low = COALESCE(EXCLUDED.hrv_normal_low, coros_recovery_daily.hrv_normal_low),
+                            hrv_normal_high = COALESCE(EXCLUDED.hrv_normal_high, coros_recovery_daily.hrv_normal_high),
+                            hrv_status = COALESCE(EXCLUDED.hrv_status, coros_recovery_daily.hrv_status),
+                            resting_hr = COALESCE(EXCLUDED.resting_hr, coros_recovery_daily.resting_hr),
+                            vekdyn_recovery_score = COALESCE(EXCLUDED.vekdyn_recovery_score, coros_recovery_daily.vekdyn_recovery_score),
+                            updated_at = NOW()
+                        """,
+                        (
+                            athlete_key, recovery_date, sleep.get("sleep_minutes"), sleep.get("sleep_score"),
+                            hrv.get("hrv_avg"), hrv.get("hrv_baseline"), hrv.get("hrv_normal_low"),
+                            hrv.get("hrv_normal_high"), hrv.get("hrv_status"), resting_hr, score,
+                        ),
+                    )
+            database.commit()
+
+        return load_latest_coros_recovery(athlete_key)
+
+
+    def load_latest_coros_recovery(athlete_key):
+        """Load the newest recorded non-null COROS value for each recovery metric."""
+        initialize_coros_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute("""
+                    SELECT
+                        (SELECT recovery_date FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_minutes IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT sleep_minutes FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_minutes IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT sleep_score FROM coros_recovery_daily WHERE athlete_key=%s AND sleep_score IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_avg FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_avg IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_baseline FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_baseline IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_normal_low FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_low IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_normal_high FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_normal_high IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT hrv_status FROM coros_recovery_daily WHERE athlete_key=%s AND hrv_status IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT resting_hr FROM coros_recovery_daily WHERE athlete_key=%s AND resting_hr IS NOT NULL ORDER BY recovery_date DESC LIMIT 1),
+                        (SELECT vekdyn_recovery_score FROM coros_recovery_daily WHERE athlete_key=%s AND vekdyn_recovery_score IS NOT NULL ORDER BY recovery_date DESC LIMIT 1)
+                """, (athlete_key,) * 10)
+                row = cursor.fetchone()
+
+        if not row or all(value is None for value in row):
+            return {}
+
+        return {
+            "date": row[0],
+            "sleep_minutes": row[1],
+            "sleep_score": row[2],
+            "hrv_avg": row[3],
+            "hrv_baseline": row[4],
+            "hrv_normal_low": row[5],
+            "hrv_normal_high": row[6],
+            "hrv_status": row[7],
+            "resting_hr": row[8],
+            "vekdyn_recovery_score": row[9],
+        }
+
+
+    def coros_recovery_sync_due(athlete_key, hours=6):
+        """Return True when connected COROS recovery has never synced or is stale."""
+        initialize_coros_database()
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT MAX(updated_at)
+                    FROM coros_recovery_daily
+                    WHERE athlete_key = %s
+                    """,
+                    (athlete_key,),
+                )
+                row = cursor.fetchone()
+
+        last_sync = row[0] if row else None
+        if last_sync is None:
+            return True
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "SELECT %s < NOW() - (%s * INTERVAL '1 hour')",
+                    (last_sync, int(hours)),
+                )
+                stale_row = cursor.fetchone()
+
+        return bool(stale_row and stale_row[0])
+
+
+    # =========================================================
+    # ATHLETE LOGIN TABLE
+    # =========================================================
+
+    @st.cache_resource(show_spinner=False)
+    def create_login_table():
+        """
+        Create/upgrade the ONE shared athlete-login table used by
+        VEKDYN Coach and VEKDYN Athlete.
+        """
+
+        conn = get_database_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_logins (
+                        athlete_id TEXT PRIMARY KEY,
+                        password_hash TEXT NOT NULL,
+                        active BOOLEAN NOT NULL DEFAULT TRUE
+                    );
+                    """
+                )
+
+                cursor.execute(
+                    "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS athlete_key TEXT;"
+                )
+                cursor.execute(
+                    "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS team_id TEXT;"
+                )
+                cursor.execute(
+                    "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS display_name TEXT;"
+                )
+                cursor.execute(
+                    "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS event_group TEXT DEFAULT 'Distance';"
+                )
+                cursor.execute(
+                    "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ;"
+                )
+                # Existing accounts remain normal accounts. The Coach Hub should set this
+                # to TRUE whenever it generates/resets a temporary athlete password.
+                cursor.execute(
+                    "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;"
+                )
+
+                # Coach Hub stores email as an alias; the internal athlete_id stays stable.
+                cursor.execute(
+                    "ALTER TABLE athlete_logins ADD COLUMN IF NOT EXISTS login_email TEXT;"
+                )
+
+
+                cursor.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'athlete_logins';
+                    """
+                )
+                existing_columns = {row[0] for row in cursor.fetchall()}
+
+                if "athlete_name" in existing_columns:
+                    cursor.execute(
+                        """
+                        UPDATE athlete_logins
+                        SET display_name = athlete_name
+                        WHERE (display_name IS NULL OR BTRIM(display_name) = '')
+                          AND athlete_name IS NOT NULL
+                          AND BTRIM(athlete_name) <> '';
+                        """
+                    )
+
+                if "updated_at" in existing_columns:
+                    cursor.execute(
+                        """
+                        UPDATE athlete_logins
+                        SET password_updated_at = updated_at
+                        WHERE password_updated_at IS NULL
+                          AND updated_at IS NOT NULL;
+                        """
+                    )
+
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET athlete_key = athlete_id
+                    WHERE athlete_key IS NULL
+                       OR BTRIM(athlete_key) = '';
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET event_group = 'Distance'
+                    WHERE event_group IS NULL
+                       OR BTRIM(event_group) = '';
+                    """
+                )
+
+            conn.commit()
+
+        finally:
+            conn.close()
+
+    try:
+
+        create_login_table()
+
+    except Exception as error:
+
+        st.error(
+            f"Could not initialize athlete login system: {error}"
+        )
+
+
+    # =========================================================
+    # PERSISTENT ATHLETE SESSIONS
+    # =========================================================
+
+    ATHLETE_SESSION_DAYS = 30
+
+
+    @st.cache_resource(show_spinner=False)
+    def create_athlete_session_table():
+        """
+        Persistent login tokens live in Neon so a browser refresh does not
+        force the athlete to sign in again.
+
+        Only a SHA-256 hash of the random token is stored in Neon.
+        """
+        conn = get_database_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        athlete_id TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        revoked BOOLEAN NOT NULL DEFAULT FALSE
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_athlete_sessions_athlete_id
+                    ON athlete_sessions (athlete_id);
+                    """
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM athlete_sessions
+                    WHERE expires_at <= NOW()
+                       OR revoked = TRUE;
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+    def _session_token_hash(raw_token):
+        return hashlib.sha256(
+            str(raw_token).encode("utf-8")
+        ).hexdigest()
+
+
+    def issue_persistent_athlete_session(athlete_id):
+        """
+        Create a high-entropy bearer token and store only its hash in Neon.
+        The raw token is returned to the browser through the app URL.
+        """
+        raw_token = secrets.token_urlsafe(48)
+        token_hash = _session_token_hash(raw_token)
+
+        conn = get_database_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO athlete_sessions (
+                        token_hash,
+                        athlete_id,
+                        expires_at,
+                        revoked
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        NOW() + (%s * INTERVAL '1 day'),
+                        FALSE
+                    );
+                    """,
+                    (
+                        token_hash,
+                        str(athlete_id).strip(),
+                        int(ATHLETE_SESSION_DAYS),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return raw_token
+
+
+    def athlete_id_from_persistent_session(raw_token):
+        """
+        Validate the browser token against Neon and return the athlete ID.
+        """
+        if not raw_token:
+            return None
+
+        token_hash = _session_token_hash(raw_token)
+
+        conn = get_database_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT s.athlete_id
+                    FROM athlete_sessions s
+                    JOIN athlete_logins a
+                      ON LOWER(TRIM(a.athlete_id)) = LOWER(TRIM(s.athlete_id))
+                    WHERE s.token_hash = %s
+                      AND s.revoked = FALSE
+                      AND s.expires_at > NOW()
+                      AND a.active = TRUE
+                      AND COALESCE(a.must_change_password, FALSE) = FALSE
+                    LIMIT 1;
+                    """,
+                    (token_hash,),
+                )
+                row = cursor.fetchone()
+
+            return row[0] if row else None
+
+        finally:
+            conn.close()
+
+
+    def revoke_persistent_athlete_session(raw_token):
+        if not raw_token:
+            return
+
+        token_hash = _session_token_hash(raw_token)
+
+        conn = get_database_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE athlete_sessions
+                    SET revoked = TRUE
+                    WHERE token_hash = %s;
+                    """,
+                    (token_hash,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+    def browser_session_token():
+        """Return the persistent athlete token without losing it on calendar clicks.
+
+        Prefer the URL token because it survives a brand-new Streamlit session, but
+        keep a session_state copy as a fallback for internal reruns/navigation.
+        """
+        token = st.query_params.get("session")
+
+        if isinstance(token, list):
+            token = token[0] if token else None
+
+        if token:
+            clean_token = str(token).strip()
+            st.session_state["persistent_athlete_session"] = clean_token
+            return clean_token
+
+        cached_token = st.session_state.get("persistent_athlete_session")
+        return str(cached_token).strip() if cached_token else None
+
+
+    def set_browser_session_token(raw_token, view=None):
+        if raw_token:
+            clean_token = str(raw_token).strip()
+            st.session_state["persistent_athlete_session"] = clean_token
+            st.query_params["session"] = clean_token
+        if view:
+            st.session_state["athlete_nav"] = str(view)
+            st.query_params["view"] = str(view)
+
+
+    def clear_oauth_params_keep_session():
+        """
+        Remove Strava callback parameters without deleting the athlete's
+        persistent VEKDYN login token.
+        """
+        current_session = browser_session_token()
+        st.query_params.clear()
+
+        if current_session:
+            st.query_params["session"] = current_session
+
+
+    def handle_coros_callback_before_login():
+        """Finish COROS OAuth even when the redirect creates a fresh Streamlit session."""
+        code = st.query_params.get("code")
+        state = st.query_params.get("state")
+        oauth_error = st.query_params.get("error")
+
+        if isinstance(state, list):
+            state = state[0] if state else None
+        if isinstance(code, list):
+            code = code[0] if code else None
+        if isinstance(oauth_error, list):
+            oauth_error = oauth_error[0] if oauth_error else None
+
+        # Strava uses a different state format. Leave its callback alone.
+        if not state or not str(state).startswith("coros_"):
+            return
+
+        if oauth_error:
+            try:
+                pending = _coros_pending_oauth(str(state))
+                if pending and pending.get("athlete_id"):
+                    persistent_token = issue_persistent_athlete_session(
+                        pending["athlete_id"]
+                    )
+                    clean_return_params = urlencode({
+                        "session": persistent_token,
+                        "view": "Connections",
+                    })
+                    st.markdown(
+                        f"""
+                        <meta http-equiv="refresh" content="0; url=?{clean_return_params}">
+                        <script>
+                            window.location.replace("?{clean_return_params}");
+                        </script>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.stop()
+            except Exception:
+                pass
+
+            st.session_state["coros_callback_error"] = (
+                "COROS authorization was cancelled or denied."
+            )
+            return
+
+        if not code:
+            return
+
+        try:
+            athlete_key, athlete_id = exchange_coros_authorization_code(
+                str(code),
+                str(state),
+            )
+
+            # Re-establish the VEKDYN athlete session after COROS redirects back.
+            persistent_token = issue_persistent_athlete_session(athlete_id)
+            st.session_state.logged_in = True
+            st.session_state.athlete_id = athlete_id
+            st.session_state.password_change_required = False
+            st.session_state["oauth_just_restored"] = True
+            # Return the athlete to the Connections page after COROS OAuth.
+            # A COROS redirect can create a fresh Streamlit session, so set this
+            # before the final rerun instead of allowing navigation to default Home.
+            st.session_state.athlete_nav = "Connections"
+
+            # Pull the first seven days immediately so a newly connected athlete
+            # returns to VEKDYN with recovery data already populated. A recovery
+            # fetch failure does not undo the valid COROS OAuth connection.
+            try:
+                latest_recovery = sync_coros_recovery(athlete_key, days=7)
+                st.session_state["coros_latest_recovery"] = latest_recovery
+                st.session_state["coros_success"] = (
+                    "COROS connected and recovery data synced."
+                )
+            except (requests.RequestException, RuntimeError, psycopg2.Error) as sync_error:
+                st.session_state["coros_success"] = "COROS connected."
+                st.session_state["coros_sync_error"] = str(sync_error)
+
+            # COROS returns through a full external browser redirect. Instead of
+            # relying on this callback's Streamlit session surviving, immediately
+            # replace the callback URL with a clean authenticated VEKDYN URL.
+            #
+            # The HTML redirect happens in the browser after the persistent token
+            # has already been committed to Neon, so the next Streamlit request can
+            # restore the athlete from scratch even if this session disappears.
+            clean_return_params = urlencode({
+                "session": persistent_token,
+                "view": "Connections",
+            })
+            st.markdown(
+                f"""
+                <meta http-equiv="refresh" content="0; url=?{clean_return_params}">
+                <script>
+                    window.location.replace("?{clean_return_params}");
+                </script>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.stop()
+
+        except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
+            st.query_params.clear()
+            st.session_state["coros_callback_error"] = f"COROS connection failed: {error}"
+
+
+    def athlete_id_for_athlete_key(athlete_key):
+        """Resolve the permanent VEKDYN login ID that owns an athlete_key."""
+        clean_key = str(athlete_key or "").strip()
+        if not clean_key:
+            return None
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT athlete_id
+                    FROM athlete_logins
+                    WHERE athlete_key = %s
+                      AND active = TRUE
+                    LIMIT 1;
+                    """,
+                    (clean_key,),
+                )
+                row = cursor.fetchone()
+
+        return row[0] if row else None
+
+
+    def handle_strava_callback_before_login():
+        """Finish Strava OAuth and restore VEKDYN login after a fresh redirect."""
+        code = st.query_params.get("code")
+        state = st.query_params.get("state")
+        oauth_error = st.query_params.get("error")
+
+        if isinstance(state, list):
+            state = state[0] if state else None
+        if isinstance(code, list):
+            code = code[0] if code else None
+        if isinstance(oauth_error, list):
+            oauth_error = oauth_error[0] if oauth_error else None
+
+        # COROS owns states beginning with coros_. Leave those callbacks alone.
+        if not state or str(state).startswith("coros_"):
+            return
+
+        athlete_key = athlete_key_from_oauth_state(str(state))
+        if not athlete_key:
+            return
+
+        athlete_id = athlete_id_for_athlete_key(athlete_key)
+        if not athlete_id:
+            st.query_params.clear()
+            st.session_state["strava_callback_error"] = (
+                "The Strava connection could not be matched to an active VEKDYN athlete."
+            )
+            return
+
+        if oauth_error:
+            # Even a cancelled Strava authorization should return the athlete to
+            # their own VEKDYN session instead of dropping them at sign-in.
+            persistent_token = issue_persistent_athlete_session(athlete_id)
+            st.session_state.logged_in = True
+            st.session_state.athlete_id = athlete_id
+            st.session_state.password_change_required = False
+            st.session_state["oauth_just_restored"] = True
+            st.session_state["strava_callback_error"] = "Strava authorization was cancelled."
+            st.query_params.clear()
+            set_browser_session_token(persistent_token, view="Connections")
+            # Do not force st.rerun() here. The callback already restored
+            # logged_in/athlete_id, so this same run can render Connections.
+            # Avoiding an immediate rerun also gives the browser time to persist
+            # the session token in the URL after the external COROS redirect.
+            return
+
+        if not code:
+            return
+
+        try:
+            connection = exchange_authorization_code(str(code), athlete_key)
+
+            # Strava can return in a brand-new Streamlit session. Reissue the
+            # persistent VEKDYN session exactly as the COROS callback does.
+            persistent_token = issue_persistent_athlete_session(athlete_id)
+            st.session_state.logged_in = True
+            st.session_state.athlete_id = athlete_id
+            st.session_state.password_change_required = False
+            st.session_state["oauth_just_restored"] = True
+            st.session_state["strava_success"] = (
+                f"Connected to {connection.get('strava_name') or 'Strava'}."
+            )
+
+            st.query_params.clear()
+            set_browser_session_token(persistent_token, view="Connections")
+            # Do not force st.rerun() here. The callback already restored
+            # logged_in/athlete_id, so this same run can render Connections.
+            # Avoiding an immediate rerun also gives the browser time to persist
+            # the session token in the URL after the external COROS redirect.
+            return
+
+        except (requests.RequestException, RuntimeError, psycopg2.Error) as error:
+            # Restore the athlete's VEKDYN session even if Strava itself fails.
+            persistent_token = issue_persistent_athlete_session(athlete_id)
+            st.session_state.logged_in = True
+            st.session_state.athlete_id = athlete_id
+            st.session_state.password_change_required = False
+            st.session_state["oauth_just_restored"] = True
+            st.session_state["strava_callback_error"] = f"Strava connection failed: {error}"
+            st.query_params.clear()
+            set_browser_session_token(persistent_token, view="Connections")
+            # Do not force st.rerun() here. The callback already restored
+            # logged_in/athlete_id, so this same run can render Connections.
+            # Avoiding an immediate rerun also gives the browser time to persist
+            # the session token in the URL after the external COROS redirect.
+            return
+
+
+    try:
+        create_athlete_session_table()
+    except Exception as error:
+        st.error(
+            f"Could not initialize persistent athlete sessions: {error}"
+        )
+
+
+    # =========================================================
+    # ATHLETE ACCOUNT PROFILE — SHARED WITH COACH HUB
+    # =========================================================
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def load_logged_in_athlete_profile(athlete_id):
+        """
+        Resolve the authenticated login to the exact athlete/team record created
+        in VEKDYN Coach.
+        """
+
+        clean_id = str(athlete_id).strip().lower()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        athlete_id,
+                        athlete_key,
+                        team_id,
+                        display_name,
+                        COALESCE(event_group, 'Distance')
+                    FROM athlete_logins
+                    WHERE LOWER(TRIM(athlete_id)) = %s
+                      AND active = TRUE
+                    LIMIT 1;
+                    """,
+                    (clean_id,),
+                )
+                row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        stored_athlete_id = str(row[0]).strip()
+        athlete_key = str(row[1] or row[0]).strip()
+        team_id = str(row[2] or "").strip()
+        display_name = str(row[3] or "").strip()
+        event_group = str(row[4] or "Distance").strip() or "Distance"
+
+        if not athlete_key or not team_id or not display_name:
+            raise RuntimeError(
+                "This athlete login exists, but its athlete/team profile has not "
+                "been linked by VEKDYN Coach yet. Reset/create the athlete login "
+                "once from the Coach Hub."
+            )
+
+        team_labels = {
+            "ollu_distance": "OLLU",
+            "sam_houston": "Sam Houston",
+            "dark_horse_endurance": "Dark Horse Endurance",
+        }
+
+        return {
+            "athlete_id": stored_athlete_id,
+            "athlete_key": athlete_key,
+            "team_id": team_id,
+            "name": display_name,
+            "team": team_labels.get(team_id, team_id.replace("_", " ").title()),
+            "event_group": event_group,
+        }
+
+
+    # =========================================================
+    # AUTHENTICATION
+    # =========================================================
+
+    def authenticate_athlete(athlete_id, password):
+        """
+        Verify the athlete's password using email or legacy athlete ID.
+
+        Returns:
+            (stored_athlete_id, must_change_password) when valid
+            None when invalid
+        """
+        athlete_id = athlete_id.strip().lower()
+
+        # Password remains case-sensitive.
+        password = password.strip()
+
+        conn = get_database_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        athlete_id,
+                        password_hash,
+                        active,
+                        COALESCE(must_change_password, FALSE)
+                    FROM athlete_logins
+                    WHERE LOWER(TRIM(athlete_id)) = %s
+                       OR LOWER(TRIM(login_email)) = %s
+                    LIMIT 1;
+                    """,
+                    (athlete_id, athlete_id),
+                )
+
+                account = cursor.fetchone()
+
+            if account is None:
+                return None
+
+            stored_athlete_id = account[0]
+            stored_password_hash = account[1]
+            active = account[2]
+            must_change_password = bool(account[3])
+
+            if not active:
+                return None
+
+            if isinstance(stored_password_hash, str):
+                stored_password_hash = stored_password_hash.encode("utf-8")
+
+            entered_password = password.encode("utf-8")
+
+            try:
+                password_matches = bcrypt.checkpw(
+                    entered_password,
+                    stored_password_hash,
+                )
+            except ValueError:
+                return None
+
+            if password_matches:
+                return stored_athlete_id, must_change_password
+
+            return None
+
+        except Exception as error:
+            st.error(f"Authentication error: {error}")
+            return None
+
+        finally:
+            conn.close()
+
+
+    def update_athlete_password(athlete_id, new_password):
+        """
+        Replace the temporary/current password with a bcrypt hash of the athlete's
+        new password and clear the first-login requirement.
+        """
+        clean_athlete_id = str(athlete_id).strip().lower()
+        clean_password = str(new_password)
+
+        if len(clean_password) < 8:
+            raise ValueError("Your password must be at least 8 characters long.")
+
+        new_password_hash = bcrypt.hashpw(
+            clean_password.encode("utf-8"),
+            bcrypt.gensalt(),
+        ).decode("utf-8")
+
+        conn = get_database_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE athlete_logins
+                    SET password_hash = %s,
+                        must_change_password = FALSE,
+                        password_updated_at = NOW()
+                    WHERE LOWER(TRIM(athlete_id)) = %s
+                      AND active = TRUE;
+                    """,
+                    (new_password_hash, clean_athlete_id),
+                )
+
+                if cursor.rowcount != 1:
+                    raise RuntimeError("The athlete account could not be updated.")
+
+                # A password change invalidates every older persistent login for
+                # this athlete. A fresh session is issued after the change.
+                cursor.execute(
+                    """
+                    UPDATE athlete_sessions
+                    SET revoked = TRUE
+                    WHERE LOWER(TRIM(athlete_id)) = %s
+                      AND revoked = FALSE;
+                    """,
+                    (clean_athlete_id,),
+                )
+
+            conn.commit()
+
+        finally:
+            conn.close()
+
+
+    # =========================================================
+    # SESSION STATE
+    # =========================================================
+
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if "athlete_id" not in st.session_state:
+        st.session_state.athlete_id = None
+
+    if "training_week_offset" not in st.session_state:
+        st.session_state.training_week_offset = 0
+
+    if "training_month_offset" not in st.session_state:
+        st.session_state.training_month_offset = 0
+
+    if "home_week_offset" not in st.session_state:
+        st.session_state.home_week_offset = 0
+
+    if "home_selected_date" not in st.session_state:
+        st.session_state.home_selected_date = date.today()
+
+    if "password_change_required" not in st.session_state:
+        st.session_state.password_change_required = False
+
+    # External OAuth can return in a fresh Streamlit session. Initialize state first,
+    # then let the callback restore authentication before login-page routing runs.
+    handle_coros_callback_before_login()
+    handle_strava_callback_before_login()
+
+    _return_view = st.query_params.get("view")
+    if isinstance(_return_view, list):
+        _return_view = _return_view[0] if _return_view else None
+    if _return_view in {"Home", "Training", "Performance", "Connections"}:
+        st.session_state["athlete_nav"] = _return_view
+
+    _calendar_day = st.query_params.get("calday")
+    if isinstance(_calendar_day, list):
+        _calendar_day = _calendar_day[0] if _calendar_day else None
+    if _calendar_day:
+        try:
+            _calendar_day = date.fromisoformat(str(_calendar_day))
+            st.session_state["home_selected_date"] = _calendar_day
+            st.session_state["athlete_nav"] = "Home"
+        except ValueError:
+            pass
+
+
+    # A hard browser refresh creates a new Streamlit session. Restore the
+    # authenticated athlete from the persistent Neon-backed token.
+    if not st.session_state.logged_in and not st.session_state.pop("oauth_just_restored", False):
+        saved_session_token = browser_session_token()
+
+        if saved_session_token:
+            try:
+                restored_athlete_id = athlete_id_from_persistent_session(
+                    saved_session_token
+                )
+            except Exception:
+                restored_athlete_id = None
+
+            if restored_athlete_id:
+                st.session_state.logged_in = True
+                st.session_state.athlete_id = restored_athlete_id
+            else:
+                # Invalid/expired tokens should not remain in the address bar.
+                st.query_params.clear()
+
+
+    # =========================================================
+    # STYLE
+    # =========================================================
+
+    st.markdown(
+        """
+        <style>
+
+        /* Athlete daily feedback: entered note text should be clearly readable. */
+        div[data-testid="stTextArea"] textarea {
+            color: #111111 !important;
+            -webkit-text-fill-color: #111111 !important;
+            caret-color: #111111 !important;
+        }
+
+        div[data-testid="stTextArea"] textarea::placeholder {
+            color: #9ca3af !important;
+            -webkit-text-fill-color: #9ca3af !important;
+            opacity: 1 !important;
+        }
+
+
+        /* -----------------------------------------------------
+           APP SHELL
+        ----------------------------------------------------- */
+
+        .stApp {
+            background: #f6f8f6;
+            color: #111827;
+        }
+
+        .block-container {
+            max-width: 980px;
+            padding-top: 2.2rem;
+            padding-bottom: 4rem;
+        }
+
+        #MainMenu {
+            visibility: hidden;
+        }
+
+        footer {
+            visibility: hidden;
+        }
+
+        header {
+            visibility: hidden;
+        }
+
+        /* Keep the Streamlit sidebar completely out of the athlete app. */
+        [data-testid="stSidebar"],
+        [data-testid="collapsedControl"],
+        [data-testid="stSidebarCollapsedControl"] {
+            display: none !important;
+        }
+
+        /* -----------------------------------------------------
+           TYPOGRAPHY / BRAND
+        ----------------------------------------------------- */
+
+        .vekdyn {
+            font-size: 16px;
+            font-weight: 800;
+            letter-spacing: 1.8px;
+            margin-bottom: 36px;
+            color: #111827;
+        }
+
+        .vekdyn span {
+            color: #2f9e44;
+        }
+
+        .welcome {
+            font-size: 34px;
+            font-weight: 800;
+            line-height: 1.15;
+            margin-bottom: 6px;
+            color: #111827;
+        }
+
+        .subtext {
+            color: #6b7280;
+            font-size: 15px;
+            margin-bottom: 0;
+        }
+
+        .pace-label {
+            color: #6b7280;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1px;
+        }
+
+        .pace-value {
+            font-size: 20px;
+            font-weight: 700;
+            margin-top: 5px;
+            color: #111827;
+        }
+
+        /* -----------------------------------------------------
+           TABS
+        ----------------------------------------------------- */
+
+        button[data-baseweb="tab"] {
+            color: #374151 !important;
+            font-weight: 600 !important;
+        }
+
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: #2f9e44 !important;
+        }
+
+        div[data-baseweb="tab-highlight"] {
+            background-color: #2f9e44 !important;
+        }
+
+        /* -----------------------------------------------------
+           INPUTS / CARDS / DIVIDERS
+        ----------------------------------------------------- */
+
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            background: #ffffff;
+            border-color: #dfe5df !important;
+            border-radius: 14px !important;
+        }
+
+        div[data-testid="stMarkdownContainer"] p,
+        div[data-testid="stCaptionContainer"] {
+            color: #4b5563;
+        }
+
+        hr {
+            border-color: #dfe5df !important;
+        }
+
+        /* Buttons should visually match the Coach dashboard. */
+        div.stButton > button,
+        div.stLinkButton > a {
+            border-radius: 10px !important;
+        }
+
+        div.stButton > button[kind="primary"],
+        div.stLinkButton > a[kind="primary"] {
+            background: #2f9e44 !important;
+            border-color: #2f9e44 !important;
+            color: white !important;
+        }
+
+        /* -----------------------------------------------------
+           RESPONSIVE HEADER
+        ----------------------------------------------------- */
+
+        .athlete-header-wrap {
+            width: 100%;
+            margin-bottom: 18px;
+        }
+
+        .school-logo-caption {
+            text-align: center;
+            color: #4b5563;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+
+        @media (max-width: 720px) {
+            .block-container {
+                padding-top: 1.4rem;
+            }
+
+            .welcome {
+                font-size: 28px;
+            }
+        }
+
+
+        /* -----------------------------------------------------
+           ATHLETE NOTE TEXT
+        ----------------------------------------------------- */
+
+        div[data-testid="stTextArea"] textarea {
+            color: #111111 !important;
+            -webkit-text-fill-color: #111111 !important;
+            caret-color: #111111 !important;
+        }
+
+        div[data-testid="stTextArea"] textarea::placeholder {
+            color: #9ca3af !important;
+            -webkit-text-fill-color: #9ca3af !important;
+            opacity: 1 !important;
+        }
+
+
+        /* -----------------------------------------------------
+           2026 MOBILE ATHLETE APP SHELL
+        ----------------------------------------------------- */
+        .block-container { max-width: 760px !important; padding-bottom: 7.2rem !important; }
+        .mobile-topbar { display:flex; align-items:center; justify-content:space-between; margin:0 0 1.15rem; }
+        .mobile-brand { font-size:20px; font-weight:900; letter-spacing:2px; color:#10213c; }
+        .mobile-brand span { color:#25a95a; }
+        .profile-bubble { width:38px; height:38px; border:1px solid #d9e0e7; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; background:#fff; }
+        .mobile-greeting { margin:.1rem 0 1.5rem; }
+        .mobile-greeting .welcome { font-size:29px; }
+        .mobile-section-title { font-size:28px; font-weight:900; color:#10213c; margin:.4rem 0 .15rem; }
+        .mobile-week-range { color:#667085; font-size:15px; margin-bottom:.75rem; }
+
+        /* Turn Streamlit tabs into a phone-style bottom navigation bar. */
+        div[data-testid="stTabs"] > div[data-baseweb="tab-list"] {
+            position:fixed !important; left:50% !important; bottom:0 !important;
+            transform:translateX(-50%) !important; width:min(760px,100vw) !important;
+            z-index:9999 !important; background:rgba(255,255,255,.97) !important;
+            border-top:1px solid #e5e7eb !important; box-shadow:0 -6px 20px rgba(15,23,42,.06) !important;
+            display:grid !important; grid-template-columns:repeat(4,1fr) !important;
+            padding:.45rem .55rem calc(.45rem + env(safe-area-inset-bottom)) !important;
+            gap:.15rem !important;
+        }
+        div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"] {
+            height:54px !important; border-radius:12px !important; justify-content:center !important;
+            font-size:13px !important; padding:.35rem .25rem !important;
+        }
+        div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"] {
+            background:#eef9f1 !important; color:#24a75a !important;
+        }
+        div[data-baseweb="tab-highlight"] { display:none !important; }
+
+        /* Compact Strava-like week strip. */
+        div[data-testid="stHorizontalBlock"] div.stButton > button {
+            min-height:62px; padding:.35rem .15rem !important; font-size:12px !important;
+        }
+
+        @media (max-width:720px) {
+            .block-container { padding:1rem 1rem 7rem !important; }
+            .mobile-brand { font-size:19px; }
+            .mobile-section-title { font-size:27px; }
+            .mobile-greeting .welcome { font-size:26px; }
+            div[data-testid="stTabs"] > div[data-baseweb="tab-list"] button[data-baseweb="tab"] { font-size:12px !important; }
+        }
+
+        /* V3: pin the keyed navigation container itself to the phone bottom. */
+        .st-key-athlete_bottom_nav {
+            position:fixed !important; left:50% !important; bottom:0 !important;
+            transform:translateX(-50%) !important; width:min(760px,100vw) !important;
+            z-index:9999 !important; background:rgba(255,255,255,.98) !important;
+            border-top:1px solid #e5e7eb !important; box-shadow:0 -6px 20px rgba(15,23,42,.06) !important;
+            padding:.38rem .55rem calc(.38rem + env(safe-area-inset-bottom)) !important;
+        }
+        .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] { gap:.15rem !important; }
+        .st-key-athlete_bottom_nav div.stButton > button {
+            min-height:52px !important; border:0 !important; box-shadow:none !important;
+            font-size:12px !important; padding:.2rem .05rem !important; border-radius:10px !important;
+        }
+
+        /* V3: all seven days share the available width — no wrap and no horizontal overflow. */
+        div[data-testid="stSegmentedControl"] { width:100% !important; overflow:visible !important; padding-bottom:2px; }
+        div[data-testid="stSegmentedControl"] > div {
+            display:flex !important; flex-wrap:nowrap !important; width:100% !important; min-width:0 !important; gap:4px !important;
+        }
+        div[data-testid="stSegmentedControl"] button {
+            flex:1 1 0 !important; min-width:0 !important; width:auto !important; height:58px !important;
+            white-space:normal !important; border-radius:10px !important; font-size:11px !important; padding:3px 2px !important;
+        }
+        @media (max-width:420px) {
+          div[data-testid="stSegmentedControl"] > div { gap:2px !important; }
+          div[data-testid="stSegmentedControl"] button { font-size:10px !important; padding:2px 0 !important; }
+        }
+
+        /* V5 PHONE LAYOUT: Streamlit normally stacks columns/segments on narrow screens. */
+        .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] {
+            display:grid !important;
+            grid-template-columns:repeat(4,minmax(0,1fr)) !important;
+            flex-wrap:nowrap !important;
+            gap:4px !important;
+            width:100% !important;
+        }
+        .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+            width:100% !important;
+            min-width:0 !important;
+            flex:none !important;
+        }
+        .st-key-athlete_bottom_nav div.stButton,
+        .st-key-athlete_bottom_nav div.stButton > button { width:100% !important; }
+        .st-key-athlete_bottom_nav div.stButton > button {
+            min-height:58px !important;
+            padding:4px 1px !important;
+            font-size:11px !important;
+            line-height:1.15 !important;
+            white-space:normal !important;
+        }
+
+        /* Seven-day selector: hard seven-column grid, never wrap to a second row. */
+        div[data-testid="stSegmentedControl"] > div,
+        div[data-testid="stSegmentedControl"] [role="radiogroup"] {
+            display:grid !important;
+            grid-template-columns:repeat(7,minmax(0,1fr)) !important;
+            grid-auto-flow:column !important;
+            width:100% !important;
+            min-width:0 !important;
+            gap:3px !important;
+            overflow:visible !important;
+        }
+        div[data-testid="stSegmentedControl"] button,
+        div[data-testid="stSegmentedControl"] [role="radio"] {
+            width:100% !important;
+            min-width:0 !important;
+            max-width:none !important;
+            margin:0 !important;
+            padding:4px 0 !important;
+            font-size:10px !important;
+            line-height:1.1 !important;
+            white-space:normal !important;
+            overflow:hidden !important;
+        }
+        /* V6: compact school identity exactly like the mobile render. */
+        .athlete-identity-row { display:flex; align-items:center; gap:14px; margin:.2rem 0 1.65rem; }
+        .athlete-school-logo { width:58px; height:58px; flex:0 0 58px; border-radius:13px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#fff; border:1px solid #e2e7ec; box-shadow:0 4px 12px rgba(15,23,42,.05); }
+        .athlete-school-logo img { display:block; width:100% !important; height:100% !important; object-fit:contain !important; padding:5px; box-sizing:border-box; }
+        .athlete-school-logo-fallback { font-size:25px; }
+        .athlete-identity-row .mobile-greeting { margin:0 !important; min-width:0; }
+        .athlete-identity-row .welcome { margin:0 0 4px !important; line-height:1.08 !important; }
+        .athlete-identity-row .subtext { margin:0 !important; }
+
+        /* V6: real seven-column week grid; anchors do not inherit Streamlit's responsive wrapping. */
+        .week-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:2px; width:100%; margin:.25rem 0 1rem; align-items:start; }
+        .week-day { min-width:0; height:64px; box-sizing:border-box; border:0; border-radius:0; background:transparent; text-decoration:none !important; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; color:#566273 !important; line-height:1; padding-top:4px; }
+        .week-dow { font-size:12px; font-weight:600; margin-bottom:8px; }
+        .week-num { width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:17px; font-weight:700; color:#243248; white-space:nowrap; }
+        .week-dot { display:block; width:6px; height:6px; border-radius:50%; background:#91a0ad; margin-top:4px; }
+        .week-day.active { background:transparent; border:0; color:#566273 !important; }
+        .week-day.active .week-num { background:#2f9e44; color:#fff; }
+
+        @media (max-width:480px) {
+            .st-key-athlete_bottom_nav { padding-left:6px !important; padding-right:6px !important; }
+            .st-key-athlete_bottom_nav div[data-testid="stHorizontalBlock"] { gap:2px !important; }
+            .st-key-athlete_bottom_nav div.stButton > button { font-size:10px !important; }
+            div[data-testid="stSegmentedControl"] > div,
+            div[data-testid="stSegmentedControl"] [role="radiogroup"] { gap:2px !important; }
+            div[data-testid="stSegmentedControl"] button,
+            div[data-testid="stSegmentedControl"] [role="radio"] { font-size:9px !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+    # =========================================================
+    # SECURE ATHLETE INVITATIONS (shared Neon database)
+    # =========================================================
+
+    def initialize_athlete_invitations():
+        with get_database_connection() as db:
+            with db.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS athlete_invitations (
+                    token_hash TEXT PRIMARY KEY,
+                    athlete_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ
+                )""")
+                cur.execute("CREATE INDEX IF NOT EXISTS athlete_invitations_athlete_idx ON athlete_invitations (athlete_id)")
+            db.commit()
+
+
+    def invitation_details(raw_token):
+        """Look up a valid invitation; never reveal tokens or password hashes."""
+        initialize_athlete_invitations()
+        digest = hashlib.sha256(str(raw_token).encode()).hexdigest()
+        with get_database_connection() as db:
+            with db.cursor() as cur:
+                cur.execute("""SELECT i.athlete_id, i.email
+                               FROM athlete_invitations i JOIN athlete_logins a ON a.athlete_id=i.athlete_id
+                               WHERE i.token_hash=%s AND i.used_at IS NULL AND i.expires_at>NOW()
+                                 AND a.active=TRUE AND LOWER(TRIM(a.login_email))=i.email""", (digest,))
+                return cur.fetchone()
+
+
+    def accept_athlete_invitation(raw_token, new_password):
+        """Consume token once and set password atomically, invalidating old sessions."""
+        if len(new_password) < 12 or len(new_password.encode('utf-8')) > 72:
+            raise ValueError("Use a password of 12–72 UTF-8 bytes.")
+        digest = hashlib.sha256(str(raw_token).encode()).hexdigest()
+        hashed = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode()
+        with get_database_connection() as db:
+            with db.cursor() as cur:
+                cur.execute("""SELECT athlete_id, email FROM athlete_invitations
+                               WHERE token_hash=%s AND used_at IS NULL AND expires_at>NOW() FOR UPDATE""", (digest,))
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("This invitation has expired or has already been used.")
+                cur.execute("""UPDATE athlete_logins SET password_hash=%s, must_change_password=FALSE,
+                               password_updated_at=NOW() WHERE athlete_id=%s AND active=TRUE
+                               AND LOWER(TRIM(login_email))=%s""", (hashed, row[0], row[1]))
+                if cur.rowcount != 1:
+                    raise ValueError("The invitation no longer matches an active account.")
+                cur.execute("UPDATE athlete_invitations SET used_at=NOW() WHERE token_hash=%s", (digest,))
+                cur.execute("UPDATE athlete_sessions SET revoked=TRUE WHERE athlete_id=%s", (row[0],))
+            db.commit()
+        return row[0]
+
+    # =========================================================
+    # INVITATION ACTIVATION — BEFORE SIGN-IN
+    # =========================================================
+    if not st.session_state.logged_in and st.query_params.get("invite"):
+        invitation_token = str(st.query_params.get("invite"))
+        st.title("Activate VEKDYN Athlete")
+        try:
+            invitation = invitation_details(invitation_token)
+        except psycopg2.Error:
+            invitation = None
+            st.error("Unable to verify the invitation right now. Try again later.")
+        if invitation:
+            st.caption(f"Create a password for {invitation[1]}. This link is valid once.")
+            with st.form("accept_invitation_form"):
+                password = st.text_input("New password (12 characters minimum)", type="password")
+                confirmation = st.text_input("Confirm password", type="password")
+                activate = st.form_submit_button("Activate my account", type="primary")
+            if activate:
+                if password != confirmation:
+                    st.error("Passwords do not match.")
+                else:
+                    try:
+                        athlete_id = accept_athlete_invitation(invitation_token, password)
+                        st.query_params.clear()
+                        st.session_state.logged_in = True
+                        st.session_state.athlete_id = athlete_id
+                        st.session_state.password_change_required = False
+                        session = issue_persistent_athlete_session(athlete_id)
+                        set_browser_session_token(session)
+                        st.rerun()
+                    except (ValueError, psycopg2.Error) as error:
+                        st.error(str(error))
+        else:
+            st.warning("Invitation expired, already used, or invalid. Ask your coach to send a new one.")
+        st.stop()
+
+    # =========================================================
+    # LOGIN PAGE
+    # =========================================================
+
+    if not st.session_state.logged_in:
+
+        st.markdown(
+            '<div class="vekdyn">VEK<span>DYN</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        st.title(
+            "Athlete Sign In"
+        )
+
+        st.caption(
+            "Sign in using the email saved by your coach or your existing Athlete ID. First-time athletes can use a temporary password supplied by their coach."
+        )
+
+        with st.form(
+            "athlete_login_form",
+            clear_on_submit=False,
+        ):
+
+            athlete_id_input = st.text_input(
+                "Email address or Athlete ID",
+                placeholder="athlete@example.com",
+            )
+
+            password_input = st.text_input(
+                "Password",
+                type="password",
+            )
+
+            submitted = st.form_submit_button(
+                "Sign in",
+                use_container_width=True,
+                type="primary",
+            )
+
+        if submitted:
+
+            clean_athlete_id = (
+                athlete_id_input
+                .strip()
+                .lower()
+            )
+
+            clean_password = (
+                password_input.strip()
+            )
+
+            if not clean_athlete_id:
+
+                st.error(
+                    "Enter your email address or Athlete ID."
+                )
+
+            elif not clean_password:
+
+                st.error(
+                    "Enter your password."
+                )
+
+            else:
+
+                authenticated_id = (
+                    authenticate_athlete(
+                        clean_athlete_id,
+                        clean_password,
+                    )
+                )
+
+                if authenticated_id is not None:
+
+                    authenticated_athlete_id, must_change_password = authenticated_id
+
+                    st.session_state.logged_in = True
+                    st.session_state.athlete_id = authenticated_athlete_id
+                    st.session_state.password_change_required = must_change_password
+
+                    # A temporary password must be replaced before VEKDYN issues
+                    # the athlete's persistent 30-day browser session.
+                    if not must_change_password:
+                        persistent_token = issue_persistent_athlete_session(
+                            authenticated_athlete_id
+                        )
+                        set_browser_session_token(
+                            persistent_token
+                        )
+
+                    st.rerun()
+
+                else:
+
+                    st.error(
+                        "Incorrect email/athlete ID or password."
+                    )
+
+        st.stop()
+
+
+    # =========================================================
+    # FIRST LOGIN — CREATE PERMANENT PASSWORD
+    # =========================================================
+
+    if st.session_state.logged_in and st.session_state.password_change_required:
+        st.markdown(
+            '<div class="vekdyn">VEK<span>DYN</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        st.title("Create your password")
+        st.caption(
+            "Your coach gave you a temporary password. Create your own password "
+            "before entering VEKDYN Athlete."
+        )
+
+        with st.form("first_login_password_form", clear_on_submit=True):
+            new_password = st.text_input(
+                "New password",
+                type="password",
+                help="Use at least 8 characters.",
+            )
+            confirm_password = st.text_input(
+                "Confirm new password",
+                type="password",
+            )
+            create_password_submitted = st.form_submit_button(
+                "Create password",
                 type="primary",
                 use_container_width=True,
             )
 
-        if save_threshold:
-            try:
-                save_threshold_profile(
-                    active_team,
-                    athlete_key,
-                    short_lactate,
-                    short_pace.strip(),
-                    medium_lactate,
-                    medium_pace.strip(),
-                    long_lactate,
-                    long_pace.strip(),
-                    short_400_lactate,
-                    short_400_time.strip(),
-                    short_800_lactate,
-                    short_800_time.strip(),
-                    short_1k_lactate,
-                    short_1k_time.strip(),
-                )
-                st.success("Threshold profile saved.")
-                st.rerun()
-            except Exception as error:
-                st.error(f"VEKDYN could not save the threshold profile: {error}")
+        if create_password_submitted:
+            if len(new_password) < 8:
+                st.error("Your password must be at least 8 characters long.")
+            elif new_password != confirm_password:
+                st.error("The passwords do not match.")
+            else:
+                try:
+                    update_athlete_password(
+                        st.session_state.athlete_id,
+                        new_password,
+                    )
 
-# =========================================================
-# COMPACT DASHBOARD — HEART RATE & SLEEP
-# =========================================================
+                    st.session_state.password_change_required = False
 
-if dashboard_view == "Dashboard":
-    st.markdown('<div class="compact-section-title">Heart Rate & Sleep</div>', unsafe_allow_html=True)
-    max_hr = (
-        194
-        if active_team == DEMO_TEAM_ID
-        else live_heart_rate.get("max_heart_rate", "—")
-    )
-    resting_hr = coros_recovery.get("sleep_hr_avg")
-    if resting_hr is None:
-        resting_hr = coros_recovery.get("resting_hr")
-    sleep_minutes = coros_recovery.get("sleep_minutes")
-    hrv_value = coros_recovery.get("hrv_avg")
+                    persistent_token = issue_persistent_athlete_session(
+                        st.session_state.athlete_id
+                    )
+                    set_browser_session_token(persistent_token)
 
-    if sleep_minutes is not None:
-        sleep_hours = int(sleep_minutes) // 60
-        sleep_remainder = int(sleep_minutes) % 60
-        sleep_display = f"{sleep_hours}h {sleep_remainder:02d}m"
-    else:
-        sleep_display = "—"
+                    st.session_state.password_changed_success = True
+                    st.rerun()
 
-    # Small color-coded metric accents make each recovery card easier to scan
-    # without changing the clean white-card layout or the value typography.
-    metric_label_style = (
-        "font-size:0.78rem;font-weight:700;letter-spacing:0.02em;"
-        "color:#667085;display:flex;align-items:center;gap:0.42rem;"
-        "margin-bottom:0.25rem;white-space:nowrap;"
-    )
+                except (ValueError, RuntimeError) as error:
+                    st.error(str(error))
+                except Exception as error:
+                    st.error(f"Your password could not be updated: {error}")
 
-    hr1, hr2, hr3, hr4 = st.columns(4)
-    with hr1:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#ef4444;font-size:1.05rem;line-height:1;">♥</span><span>MAX HR</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {max_hr} bpm")
-
-    with hr2:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#3b82f6;font-size:1.05rem;line-height:1;">●</span><span>RESTING HR</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {resting_hr if resting_hr is not None else '—'} bpm")
-
-    with hr3:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#8b5cf6;font-size:1.08rem;line-height:1;">☾</span><span>SLEEP</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {sleep_display}")
-
-    with hr4:
-        with st.container(border=True):
-            st.markdown(
-                f'<div style="{metric_label_style}"><span style="color:#22c55e;font-size:0.98rem;line-height:1;letter-spacing:-0.12rem;">▮▮</span><span>HRV</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"### {hrv_value if hrv_value is not None else '—'} ms")
-
-# =========================================================
-# TRAINING VOLUME — PLANNED WEEK SUMMARY
-# =========================================================
-
-if dashboard_view == "Training":
-    st.subheader("Planned Training")
-    try:
-        if active_team == DEMO_TEAM_ID:
-            st.metric("Planned Week", "72 mi")
-            raise StopIteration
-        planned_week_start = week_start_for(datetime.now(ZoneInfo("America/Chicago")).date())
-        planned_week_end = planned_week_start + timedelta(days=6)
-        planned_workouts = load_team_workouts_range(
-            active_team, planned_week_start, planned_week_end, athlete_key
-        )
-        _, planned_miles = _weekly_workout_matrix(planned_workouts, planned_week_start)
-        if planned_miles is not None:
-            st.metric("Planned Week", f"{planned_miles:g} mi")
-    except StopIteration:
-        pass
-    except Exception:
-        pass
-
-# =========================================================
-# ATHLETE ACCESS & CONNECTIONS — COLLAPSED ADMIN CONTROLS
-# =========================================================
-
-if dashboard_view == "Connections" and active_team == DEMO_TEAM_ID:
-    st.divider()
-    st.subheader("Athlete Access & Connections")
-    st.success("Demo athlete connected")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Strava**  ·  Connected")
-        st.caption("Demo connection — no real OAuth token is exposed.")
-    with c2:
-        st.markdown("**COROS**  ·  Connected")
-        st.caption("Demo recovery feed — sample data only.")
-
-elif dashboard_view == "Connections":
-    st.divider()
-    with st.expander("Athlete Access & Connections", expanded=True):
-        st.caption(
-            "Manage this athlete's VEKDYN login and review the connected training account. "
-            "These controls stay collapsed during normal coaching use."
-        )
-
-        # Keep the existing secure account workflow. Readable temporary passwords
-        # only appear immediately after Create/Reset and disappear when cleared.
-        render_athlete_account_manager(
-            athlete_key=athlete_key,
-            profile=profile,
-            team_id=active_team,
-        )
-
-        st.divider()
-        st.markdown("#### Training Connection")
-
-        try:
-            coach_strava_connection = athlete_strava_connection(athlete_key)
-        except Exception as error:
-            coach_strava_connection = {}
-            st.warning(f"VEKDYN could not load this athlete's Strava connection: {error}")
-
-        if coach_strava_connection:
-            connected_name = coach_strava_connection.get("strava_name") or athlete_name
-            st.success(f"Strava connected — {connected_name}")
-            st.caption(
-                "Training data is stored through the athlete's VEKDYN connection and is available to the coach dashboard."
-            )
-        else:
-            st.info("Strava not connected")
-            st.caption(
-                "The athlete can authorize Strava from VEKDYN Athlete. Coach-side connection is only needed as an administrative fallback."
-            )
-
-# =========================================================
-# COMPACT BOTTOM NAVIGATION
-# =========================================================
-
-st.markdown('<div class="bottom-nav-anchor"></div>', unsafe_allow_html=True)
-nav1, nav2, nav3, nav4, nav5, nav6 = st.columns([1.1, 1.7, 1.8, 1.8, 1.8, 1.8])
-with nav1:
-    st.markdown("**VEK<span style='color:#2f9e44'>DYN</span>**", unsafe_allow_html=True)
-for column, label, view in [
-    (nav2, "▣ Dashboard", "Dashboard"),
-    (nav3, "▥ Training Volume", "Training"),
-    (nav4, "◎ Predictor", "Predictor"),
-    (nav5, "↗ Connections", "Connections"),
-    (nav6, "♟ Athlete Profile", "Profile"),
-]:
-    with column:
-        if st.button(
-            label,
-            use_container_width=True,
-            type="primary" if dashboard_view == view else "secondary",
-            key=f"bottom_nav_{view.lower()}",
-        ):
-            st.session_state["dashboard_view"] = view
+        if st.button("Back to sign in", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.athlete_id = None
+            st.session_state.password_change_required = False
+            st.query_params.clear()
             st.rerun()
 
-logout_col, _ = st.columns([1, 5])
-with logout_col:
-    if st.button("Log Out", key="compact_logout_button", use_container_width=True):
-        log_out()
+        st.stop()
+
+
+    # =========================================================
+    # LOGGED-IN ATHLETE
+    # =========================================================
+
+    logged_in_athlete_id = (
+        st.session_state.athlete_id
+    )
+
+    # Strava OAuth callbacks are processed before login restoration above so a
+    # provider redirect cannot drop the athlete back at the sign-in screen.
+
+
+    # =========================================================
+    # ATHLETE PROFILE — RESOLVED FROM THE LOGIN
+    # =========================================================
+
+    try:
+        athlete = load_logged_in_athlete_profile(logged_in_athlete_id)
+    except Exception as error:
+        st.error(f"VEKDYN could not load your athlete profile: {error}")
+        if st.button("Sign out", key="profile_load_signout"):
+            st.session_state.logged_in = False
+            st.session_state.athlete_id = None
+            st.rerun()
+        st.stop()
+
+    if athlete is None:
+        st.error("This VEKDYN athlete account could not be found or is inactive.")
+        if st.button("Sign out", key="missing_profile_signout"):
+            st.session_state.logged_in = False
+            st.session_state.athlete_id = None
+            st.rerun()
+        st.stop()
+
+
+    if st.session_state.get("password_changed_success"):
+        st.success("Password created successfully. You are signed in to VEKDYN ✓")
+        st.session_state.password_changed_success = False
+
+
+    # COROS recovery is synced automatically in the successful OAuth callback.
+    # Do not contact COROS during ordinary tab/navigation reruns.
+
+
+    # =========================================================
+    # TEAM-SPECIFIC ATHLETE THEME
+    # =========================================================
+
+    if athlete.get("team_id") == "dark_horse_endurance":
+        st.markdown(
+            """
+            <style>
+            :root { --dh-purple:#7c3cff; --dh-purple-bright:#9a5cff; --dh-purple-soft:#b596ff; --dh-bg:#080911; --dh-card:#11111d; --dh-border:#29263d; --dh-text:#f7f5ff; --dh-muted:#9c96b5; }
+            html, body, [data-testid="stAppViewContainer"], .stApp {
+              background:radial-gradient(circle at 78% 4%, rgba(80,38,126,.20) 0%, rgba(8,9,17,0) 28%),linear-gradient(180deg,#090a12 0%,#080911 100%) !important;
+              color:var(--dh-text) !important;
+            }
+            .block-container { max-width:620px !important; padding:1.25rem .95rem 7.5rem !important; }
+            .mobile-topbar { margin-bottom:1.15rem !important; }
+            .mobile-brand { color:#fff !important; font-size:21px !important; letter-spacing:2.5px !important; }
+            .mobile-brand span { color:#36d274 !important; }
+            .profile-bubble { width:42px !important; height:42px !important; background:#0f1019 !important; border:1px solid #3a3451 !important; color:#f8f6ff !important; }
+            .mobile-greeting { margin:.1rem 0 1.5rem !important; }
+            .mobile-greeting .welcome { color:#fff !important; font-size:30px !important; font-weight:900 !important; }
+            .subtext,.mobile-week-range,div[data-testid="stCaptionContainer"] { color:var(--dh-muted) !important; }
+            .mobile-section-title { color:#fff !important; font-size:29px !important; font-weight:900 !important; }
+            h1,h2,h3,h4,.vekdyn,.pace-value { color:#fff !important; }
+            div[data-testid="stMarkdownContainer"] p { color:#d7d2e5; }
+            hr { border-color:#29263d !important; }
+            [data-testid="stVerticalBlockBorderWrapper"] { background:linear-gradient(145deg,rgba(20,19,34,.98),rgba(13,13,23,.99)) !important; border:1px solid var(--dh-border) !important; border-radius:13px !important; }
+            [data-testid="stAlert"] { background:#12111e !important; border:1px solid #30284b !important; color:#eee9ff !important; }
+            div[data-testid="stSegmentedControl"] { width:100% !important; overflow:visible !important; }
+            div[data-testid="stSegmentedControl"] > div { display:grid !important; grid-template-columns:repeat(7,minmax(0,1fr)) !important; gap:6px !important; width:100% !important; }
+            div[data-testid="stSegmentedControl"] button { min-width:0 !important; width:100% !important; height:70px !important; padding:4px 1px !important; white-space:normal !important; background:#10111b !important; border:1px solid #2c2a40 !important; border-radius:9px !important; color:#aba6bd !important; font-size:11px !important; line-height:1.25 !important; box-shadow:none !important; }
+            div[data-testid="stSegmentedControl"] button[aria-pressed="true"], div[data-testid="stSegmentedControl"] button[data-selected="true"] { background:linear-gradient(180deg,#8e4cff,#6830ef) !important; border-color:#9c60ff !important; color:white !important; box-shadow:0 5px 18px rgba(124,60,255,.24) !important; }
+            div.stButton > button, div.stLinkButton > a { background:#11111c !important; border:1px solid #302b46 !important; color:#eeeaff !important; border-radius:10px !important; }
+            div.stButton > button[kind="primary"], div.stLinkButton > a[kind="primary"] { background:linear-gradient(180deg,#8647ff,#6a31ee) !important; border-color:#955cff !important; color:white !important; }
+            [data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea { background:#0f1018 !important; color:#f8f6ff !important; -webkit-text-fill-color:#f8f6ff !important; border-color:#332d4a !important; }
+            .st-key-athlete_bottom_nav { background:rgba(9,10,17,.98) !important; border-top:1px solid #252335 !important; box-shadow:0 -10px 30px rgba(0,0,0,.24) !important; backdrop-filter:blur(18px) !important; }
+            .st-key-athlete_bottom_nav div.stButton > button { background:transparent !important; border:0 !important; color:#aaa3be !important; font-size:12px !important; min-height:58px !important; }
+            .st-key-athlete_bottom_nav div.stButton > button[kind="primary"] { background:transparent !important; color:#8d52ff !important; box-shadow:none !important; }
+            .dh-workout-card { margin-top:.75rem; background:linear-gradient(145deg,#151422,#10101a); border:1px solid #2d2940; border-radius:13px; padding:17px 17px 13px; }
+            .dh-workout-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:10px; }
+            .dh-workout-head-title { color:#fff; font-size:22px; line-height:1.1; font-weight:900; }
+            .dh-workout-date { color:#9790ad; font-size:13px; white-space:nowrap; }
+            .dh-session { display:grid; grid-template-columns:74px 1fr; gap:14px; align-items:center; padding:13px 0; }
+            .dh-session + .dh-session { border-top:1px solid #292638; }
+            .dh-session-badge { height:66px; border-radius:11px; display:flex; flex-direction:column; align-items:center; justify-content:center; font-weight:900; font-size:16px; }
+            .dh-session-badge.am { background:linear-gradient(145deg,#3a211b,#22171a); color:#ff9a52; }
+            .dh-session-badge.pm { background:linear-gradient(145deg,#232047,#19172f); color:#9c72ff; }
+            .dh-session-icon { font-size:22px; line-height:1; margin-bottom:3px; }
+            .dh-session-title { color:#fff; font-size:17px; font-weight:850; line-height:1.2; }
+            .dh-session-detail { color:#9d96b3; font-size:14px; margin-top:5px; line-height:1.35; }
+            .dh-note { border-top:1px solid #292638; margin-top:3px; padding:14px 0 5px; display:grid; grid-template-columns:44px 1fr; gap:10px; }
+            .dh-note-icon { color:#b1a8c8; font-size:22px; }
+            .dh-note-label { color:#938ca8; font-size:12px; margin-bottom:2px; }
+            .dh-note-text { color:#eeeaff; font-size:14px; }
+            .dh-feedback-shell { margin-top:14px; background:linear-gradient(145deg,#151422,#10101a); border:1px solid #2d2940; border-radius:13px; padding:15px 16px; }
+            .dh-feedback-row { display:grid; grid-template-columns:54px 1fr 18px; gap:12px; align-items:center; }
+            .dh-feedback-icon { width:50px;height:50px;border-radius:10px;background:#201a37;color:#925cff;display:flex;align-items:center;justify-content:center;font-size:23px; }
+            .dh-feedback-title { color:#fff;font-size:16px;font-weight:850; }
+            .dh-feedback-sub { color:#9891aa;font-size:12px;margin-top:2px; }
+            .dh-feedback-chevron { color:#9e96b3;font-size:22px; }
+            .athlete-school-logo { width:58px !important; height:58px !important; flex-basis:58px !important; background:#11121d !important; border-color:#302c43 !important; box-shadow:0 5px 18px rgba(0,0,0,.22) !important; }
+            .week-day { background:#10111b !important; border-color:#2c2a40 !important; color:#aaa5bc !important; }
+            .week-day .week-num { color:#f1eef9 !important; }
+            .week-day.active { background:linear-gradient(180deg,#8e4cff,#6830ef) !important; border-color:#9c60ff !important; color:#fff !important; box-shadow:0 5px 18px rgba(124,60,255,.24) !important; }
+            .week-day.active .week-num { color:#fff !important; }
+            @media (max-width:420px) { .block-container { padding-left:.7rem !important; padding-right:.7rem !important; } .mobile-greeting .welcome { font-size:27px !important; } div[data-testid="stSegmentedControl"] > div { gap:4px !important; } div[data-testid="stSegmentedControl"] button { height:66px !important; font-size:10px !important; } .dh-session { grid-template-columns:66px 1fr; gap:12px; } .dh-session-badge { height:62px; } }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+    # =========================================================
+    # SCHOOL BRANDING
+    # =========================================================
+
+    TEAM_LOGO_CANDIDATES = {
+        "sam_houston": [
+            "sam_houston.png",
+            "sam_houston.jpg",
+            "sam_houston.jpeg",
+            "sam_houston.webp",
+            "shsu.png",
+            "shsu.jpg",
+        ],
+        "ollu_distance": [
+            "ollu_distance.png",
+            "ollu_distance.jpg",
+            "ollu_distance.jpeg",
+            "ollu_distance.webp",
+            "ollu.png",
+            "ollu.jpg",
+        ],
+        "dark_horse_endurance": [
+            "dark_horse_endurance.png",
+            "dark_horse_endurance.jpg",
+            "dark_horse_endurance.jpeg",
+            "dark_horse_endurance.webp",
+            "dark_horse.png",
+            "dark_horse.jpg",
+        ],
+    }
+
+    TEAM_LOGO_LABELS = {
+        "sam_houston": "Sam Houston State University",
+        "ollu_distance": "Our Lady of the Lake University",
+        "dark_horse_endurance": "Dark Horse Endurance",
+    }
+
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def find_team_logo(team_id):
+        """
+        Look for the athlete's school logo without changing any database logic.
+
+        Supported folders:
+          ./team_logos/
+          ./team_images/
+          project root
+        """
+
+        candidate_names = TEAM_LOGO_CANDIDATES.get(team_id, [])
+
+        search_directories = [
+            Path(__file__).with_name("team_logos"),
+            Path(__file__).with_name("team_images"),
+            Path(__file__).parent,
+        ]
+
+        for directory in search_directories:
+            for candidate_name in candidate_names:
+                candidate_path = directory / candidate_name
+                if candidate_path.exists():
+                    return candidate_path
+
+        return None
+
+
+    # =========================================================
+    # ATHLETE + COACH NOTES — SHARED NEON FEED
+    # =========================================================
+
+    TEAM_TIMEZONE = ZoneInfo("America/Chicago")
+
+
+    def initialize_notes_database():
+        """Create the shared athlete/coach notes table used by both VEKDYN apps."""
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_notes (
+                        id BIGSERIAL PRIMARY KEY,
+                        athlete_key TEXT NOT NULL,
+                        author_name TEXT NOT NULL,
+                        author_role TEXT NOT NULL,
+                        note_text TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        CONSTRAINT athlete_notes_role_check
+                            CHECK (author_role IN ('COACH', 'ATHLETE'))
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS athlete_notes_athlete_created_idx
+                    ON athlete_notes (athlete_key, created_at DESC)
+                    """
+                )
+
+            database.commit()
+
+
+    def save_athlete_note(athlete_key, author_name, author_role, note_text):
+        """Save one note into the same Neon feed the coach dashboard reads."""
+
+        clean_note = str(note_text).strip()
+        clean_author = str(author_name).strip()
+        clean_role = str(author_role).strip().upper()
+
+        if not clean_note:
+            raise ValueError("Write a note before sending.")
+
+        if clean_role not in {"COACH", "ATHLETE"}:
+            raise ValueError("Note role must be COACH or ATHLETE.")
+
+        if not clean_author:
+            raise ValueError("The note needs an author name.")
+
+        initialize_notes_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO athlete_notes (
+                        athlete_key,
+                        author_name,
+                        author_role,
+                        note_text
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (athlete_key, clean_author, clean_role, clean_note),
+                )
+
+            database.commit()
+
+
+    def load_athlete_notes(athlete_key, limit=40):
+        """Load the shared athlete/coach conversation for the logged-in athlete."""
+
+        initialize_notes_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        author_name,
+                        author_role,
+                        note_text,
+                        created_at
+                    FROM athlete_notes
+                    WHERE athlete_key = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (athlete_key, int(limit)),
+                )
+
+                rows = cursor.fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "author_name": row[1],
+                "author_role": row[2],
+                "note_text": row[3],
+                "created_at": row[4],
+            }
+            for row in rows
+        ]
+
+
+    def format_note_timestamp(created_at):
+        if not created_at:
+            return ""
+
+        try:
+            return created_at.astimezone(TEAM_TIMEZONE).strftime(
+                "%b %d, %Y · %I:%M %p"
+            ).replace(" 0", " ")
+        except (AttributeError, ValueError):
+            return str(created_at)
+
+
+
+    # =========================================================
+    # DAY-SPECIFIC ATHLETE FEEDBACK - NEON
+    # =========================================================
+
+    def initialize_daily_feedback_database():
+        """
+        One athlete note per calendar day.
+
+        This intentionally replaces a general messaging thread: feedback stays
+        attached to the training day the athlete is commenting on.
+        """
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS athlete_daily_feedback (
+                        id BIGSERIAL PRIMARY KEY,
+                        team_id TEXT NOT NULL,
+                        athlete_key TEXT NOT NULL,
+                        feedback_date DATE NOT NULL,
+                        note_text TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (team_id, athlete_key, feedback_date)
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_athlete_daily_feedback_lookup
+                    ON athlete_daily_feedback (team_id, athlete_key, feedback_date);
+                    """
+                )
+            database.commit()
+
+
+    def load_daily_feedback(feedback_date):
+        initialize_daily_feedback_database()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT note_text, updated_at
+                    FROM athlete_daily_feedback
+                    WHERE team_id = %s
+                      AND athlete_key = %s
+                      AND feedback_date = %s
+                    LIMIT 1;
+                    """,
+                    (
+                        athlete["team_id"],
+                        athlete["athlete_key"],
+                        feedback_date,
+                    ),
+                )
+                row = cursor.fetchone()
+
+        if not row:
+            return {"note_text": "", "updated_at": None}
+
+        return {
+            "note_text": row[0] or "",
+            "updated_at": row[1],
+        }
+
+
+    def save_daily_feedback(feedback_date, note_text):
+        initialize_daily_feedback_database()
+
+        cleaned_note = (note_text or "").strip()
+
+        with get_database_connection() as database:
+            with database.cursor() as cursor:
+                if cleaned_note:
+                    cursor.execute(
+                        """
+                        INSERT INTO athlete_daily_feedback (
+                            team_id,
+                            athlete_key,
+                            feedback_date,
+                            note_text,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (team_id, athlete_key, feedback_date)
+                        DO UPDATE SET
+                            note_text = EXCLUDED.note_text,
+                            updated_at = NOW();
+                        """,
+                        (
+                            athlete["team_id"],
+                            athlete["athlete_key"],
+                            feedback_date,
+                            cleaned_note,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        DELETE FROM athlete_daily_feedback
+                        WHERE team_id = %s
+                          AND athlete_key = %s
+                          AND feedback_date = %s;
+                        """,
+                        (
+                            athlete["team_id"],
+                            athlete["athlete_key"],
+                            feedback_date,
+                        ),
+                    )
+            database.commit()
+
+
+    def render_daily_feedback(feedback_date):
+        """
+        Compact feedback attached to the selected day.
+
+        Saving a blank note removes that day's feedback.
+        """
+        try:
+            saved = load_daily_feedback(feedback_date)
+        except Exception as error:
+            st.warning(f"VEKDYN could not load your day note: {error}")
+            return
+
+        st.markdown("### How did you feel?")
+
+        # Keep the athlete's typed daily-feedback text black.
+        # This is intentionally injected here, after team-theme CSS, so later
+        # theme rules cannot turn this field's text white.
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stTextArea"] textarea,
+            div[data-testid="stTextArea"] textarea:focus,
+            div[data-testid="stTextArea"] textarea:active {
+                color: #111111 !important;
+                -webkit-text-fill-color: #111111 !important;
+                caret-color: #111111 !important;
+            }
+            div[data-testid="stTextArea"] textarea::placeholder {
+                color: #9ca3af !important;
+                -webkit-text-fill-color: #9ca3af !important;
+                opacity: 1 !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.caption(
+            "Leave a short note for your coach about this day — for example "
+            "how the workout felt, soreness, fatigue, or anything unusual."
+        )
+
+        widget_key = f"daily_feedback_{feedback_date.isoformat()}"
+        loaded_key = f"{widget_key}_loaded"
+
+        if not st.session_state.get(loaded_key):
+            st.session_state[widget_key] = saved["note_text"]
+            st.session_state[loaded_key] = True
+
+        with st.form(f"daily_feedback_form_{feedback_date.isoformat()}"):
+            note_text = st.text_area(
+                "Day note",
+                key=widget_key,
+                placeholder="Example: Felt smooth today. Legs were a little heavy early but opened up.",
+                height=92,
+                label_visibility="collapsed",
+            )
+
+            save_note = st.form_submit_button(
+                "Save day note",
+                use_container_width=True,
+            )
+
+        if save_note:
+            try:
+                save_daily_feedback(feedback_date, note_text)
+                st.success(
+                    "Day note saved for your coach."
+                    if note_text.strip()
+                    else "Day note cleared."
+                )
+            except Exception as error:
+                st.error(f"VEKDYN could not save your day note: {error}")
+
+
+    # =========================================================
+    # THRESHOLD TRAINING PACES - NEON
+    # =========================================================
+
+    @st.cache_data(ttl=60, show_spinner=False)
+    def get_threshold_profile(team_id, athlete_key):
+        """Load threshold data only when the Performance tab actually needs it."""
+
+        conn = get_database_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        short_lactate,
+                        short_pace,
+                        medium_lactate,
+                        medium_pace,
+                        long_lactate,
+                        long_pace
+                    FROM athlete_threshold_profiles
+                    WHERE team_id = %s
+                      AND athlete_key = %s
+                    LIMIT 1;
+                    """,
+                    (team_id, athlete_key),
+                )
+
+                row = cursor.fetchone()
+
+        except Exception as error:
+            st.error(f"Threshold database error: {error}")
+            return {
+                "short": {"pace": "--", "lactate": None},
+                "medium": {"pace": "--", "lactate": None},
+                "long": {"pace": "--", "lactate": None},
+            }
+
+        finally:
+            conn.close()
+
+        if not row:
+            return {
+                "short": {"pace": "--", "lactate": None},
+                "medium": {"pace": "--", "lactate": None},
+                "long": {"pace": "--", "lactate": None},
+            }
+
+        return {
+            "short": {
+                "lactate": row[0],
+                "pace": row[1] or "--",
+            },
+            "medium": {
+                "lactate": row[2],
+                "pace": row[3] or "--",
+            },
+            "long": {
+                "lactate": row[4],
+                "pace": row[5] or "--",
+            },
+        }
+
+
+
+    # =========================================================
+    # WORKOUT DATABASE
+    # =========================================================
+
+    def get_workouts(
+        start_date,
+        end_date,
+    ):
+        """
+        Read workouts written in VEKDYN Coach from the shared
+        Neon team_workouts table.
+
+        The athlete receives:
+
+        1. Team workouts:
+           athlete_key IS NULL
+
+        2. Individual workouts:
+           athlete_key matches this athlete
+        """
+
+        conn = get_database_connection()
+
+        try:
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    SELECT
+                        workout_date,
+                        workout_type,
+                        warm_up,
+                        workout,
+                        cool_down,
+                        notes,
+                        athlete_key,
+                        video_url,
+                        COALESCE(session_slot, 'AM'),
+                        effort_level,
+                        planned_miles
+                    FROM team_workouts
+                    WHERE team_id = %s
+                      AND workout_date BETWEEN %s AND %s
+                      AND (
+                          athlete_key IS NULL
+                          OR athlete_key = %s
+                      )
+                    ORDER BY
+                        workout_date ASC,
+                        CASE WHEN COALESCE(session_slot, 'AM') = 'AM' THEN 0 ELSE 1 END,
+                        id ASC;
+                    """,
+                    (
+                        athlete["team_id"],
+                        start_date,
+                        end_date,
+                        athlete["athlete_key"],
+                    ),
+                )
+
+                rows = cursor.fetchall()
+
+        except Exception as error:
+
+            st.error(
+                f"Workout database error: {error}"
+            )
+
+            return []
+
+        finally:
+
+            conn.close()
+
+
+        workouts = []
+
+        for row in rows:
+
+            workouts.append(
+                {
+                    "date": row[0],
+                    "title": (
+                        row[1]
+                        or "Training"
+                    ),
+                    "warmup": (
+                        row[2]
+                        or ""
+                    ),
+                    "main": (
+                        row[3]
+                        or ""
+                    ),
+                    "cooldown": (
+                        row[4]
+                        or ""
+                    ),
+                    "coach_notes": (
+                        row[5]
+                        or ""
+                    ),
+                    "assigned_to": row[6],
+                    "video_url": row[7] or "",
+                    "session": (row[8] or "AM").upper(),
+                    "effort": row[9] or "",
+                    "planned_miles": float(row[10]) if row[10] is not None else None,
+                }
+            )
+
+        return workouts
+
+
+    # =========================================================
+    # WORKOUT DISPLAY
+    # =========================================================
+
+    def display_workout(
+        workout,
+    ):
+
+        session_label = workout.get("session", "AM")
+        st.caption(f"{session_label} SESSION")
+        st.markdown(f"### {workout['title']}")
+        meta = []
+        if workout.get("effort"):
+            meta.append(f"Effort: {workout['effort']}")
+        if workout.get("planned_miles") is not None:
+            meta.append(f"Planned: {workout['planned_miles']:g} mi")
+        if meta:
+            st.caption(" · ".join(meta))
+
+        if workout["warmup"]:
+
+            st.write(
+                f"**Warm-up:** "
+                f"{workout['warmup']}"
+            )
+
+        if workout["main"]:
+
+            st.write(
+                f"**Workout:** "
+                f"{workout['main']}"
+            )
+
+        if workout["cooldown"]:
+
+            st.write(
+                f"**Cool-down:** "
+                f"{workout['cooldown']}"
+            )
+
+        if workout["coach_notes"]:
+
+            st.caption(
+                f"Coach note: "
+                f"{workout['coach_notes']}"
+            )
+
+        if workout.get("video_url"):
+            st.markdown("**Coach's workout breakdown**")
+            st.video(workout["video_url"])
+
+
+    # =========================================================
+    # HEADER — MOBILE ATHLETE APP
+    # =========================================================
+
+    first_name = athlete["name"].split()[0]
+    school_logo = find_team_logo(athlete["team_id"])
+
+    st.markdown(
+        '<div class="mobile-topbar">'
+        '<div class="mobile-brand">VEK<span>DYN</span></div>'
+        '<div class="profile-bubble">♙</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _logo_data_uri(path):
+        if not path:
+            return None
+        suffix = Path(path).suffix.lower()
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix, "image/png")
+        encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    logo_uri = _logo_data_uri(school_logo) if school_logo else None
+    logo_html = (
+        f'<div class="athlete-school-logo"><img src="{logo_uri}" alt="{html.escape(athlete["team"])} logo"></div>'
+        if logo_uri else
+        '<div class="athlete-school-logo athlete-school-logo-fallback">🏃</div>'
+    )
+
+    st.markdown(
+        f'<div class="athlete-identity-row">'
+        f'{logo_html}'
+        f'<div class="mobile-greeting">'
+        f'<div class="welcome">Good evening, {html.escape(first_name)}.</div>'
+        f'<div class="subtext">{html.escape(athlete["team"])} • {html.escape(athlete["event_group"])}</div>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # =========================================================
+    # ATHLETE APP NAVIGATION + DAILY TRAINING UX
+    # =========================================================
+
+    def athlete_logout():
+        """Fully end the athlete session and return to the unified VEKDYN login."""
+
+        # Revoke the athlete app's Neon-backed persistent session when possible.
+        current_token = browser_session_token()
+        if current_token:
+            try:
+                revoke_persistent_athlete_session(current_token)
+            except Exception:
+                # Logout should still succeed even if Neon is temporarily unavailable.
+                pass
+
+        # Clear athlete and unified login state.
+        for key in [
+            "athlete_id",
+            "password_change_required",
+            "vekdyn_authenticated_user",
+            "vekdyn_role",
+            "logged_in_user",
+            "active_team",
+            "pending_team",
+        ]:
+            st.session_state.pop(key, None)
+
+        st.session_state["logged_in"] = False
+        st.session_state["just_logged_out"] = True
+        st.session_state.pop("persistent_athlete_session", None)
+
+        # Remove athlete/coach/unified persistence tokens and explicitly tell
+        # vekdyn_unified.py this rerun is an intentional logout.
+        st.query_params.clear()
+        st.query_params["logout"] = "1"
+        st.rerun()
+
+
+    def workout_day_value(workout):
+        value = workout.get("date")
+        return value.date() if hasattr(value, "date") else value
+
+
+    def render_day_picker(week_start, workouts, selected_day, key_prefix):
+        """Compact seven-day strip that stays inside the authenticated Streamlit session."""
+        workout_dates = {workout_day_value(item) for item in workouts}
+        days = [week_start + timedelta(days=i) for i in range(7)]
+
+        state_key = f"{key_prefix}_selected_date"
+        if state_key not in st.session_state or st.session_state[state_key] not in days:
+            st.session_state[state_key] = selected_day if selected_day in days else days[0]
+
+        selected_day = st.session_state[state_key]
+        strip_key = f"{key_prefix}_compact_strip"
+
+        # IMPORTANT: do not use <a href> here. The unified VEKDYN app owns the
+        # top-level route, so a hard browser navigation can run the landing page
+        # before athlete_hub has a chance to restore its athlete session.
+        with st.container(key=strip_key):
+            cols = st.columns(7, gap="small")
+            for idx, (col, day_value) in enumerate(zip(cols, days)):
+                with col:
+                    st.markdown(
+                        f"<div class='vekdyn-week-dow'>{day_value.strftime('%a')[0]}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    if st.button(
+                        str(day_value.day),
+                        key=f"{key_prefix}_day_{day_value.isoformat()}",
+                        type="primary" if day_value == selected_day else "secondary",
+                        use_container_width=True,
+                    ):
+                        st.session_state[state_key] = day_value
+                        st.session_state.home_selected_date = day_value
+                        st.rerun()
+
+                    st.markdown(
+                        "<div class='vekdyn-week-dot active-dot'></div>"
+                        if day_value in workout_dates
+                        else "<div class='vekdyn-week-dot'></div>",
+                        unsafe_allow_html=True,
+                    )
+
+        # Scope the styling to this one current-week container. This preserves the
+        # compact Final-Surge-like layout while the controls remain native buttons.
+        st.markdown(
+            f"""
+            <style>
+            .st-key-{strip_key} {{
+                margin-top: .15rem;
+                margin-bottom: .8rem;
+            }}
+            .st-key-{strip_key} {{
+                width: 100% !important;
+                max-width: 100% !important;
+                overflow: hidden !important;
+            }}
+            .st-key-{strip_key} div[data-testid="stHorizontalBlock"] {{
+                display: grid !important;
+                grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                gap: 0 !important;
+                align-items: start !important;
+            }}
+            .st-key-{strip_key} div[data-testid="column"] {{
+                display: block !important;
+                width: 100% !important;
+                min-width: 0 !important;
+                max-width: none !important;
+                flex: none !important;
+                padding: 0 !important;
+            }}
+            .st-key-{strip_key} .vekdyn-week-dow {{
+                text-align: center;
+                color: #566273;
+                font-size: 13px;
+                line-height: 18px;
+                height: 18px;
+                margin: 0 0 3px 0;
+            }}
+            .st-key-{strip_key} div.stButton {{
+                display: flex;
+                justify-content: center;
+            }}
+            .st-key-{strip_key} div.stButton > button {{
+                width: 44px !important;
+                min-width: 44px !important;
+                max-width: 44px !important;
+                height: 44px !important;
+                min-height: 44px !important;
+                padding: 0 !important;
+                margin: 0 auto !important;
+                border-radius: 50% !important;
+                box-shadow: none !important;
+                font-size: 23px !important;
+                font-weight: 500 !important;
+                line-height: 44px !important;
+            }}
+            .st-key-{strip_key} div.stButton > button[kind="secondary"] {{
+                background: transparent !important;
+                border-color: transparent !important;
+                color: #566273 !important;
+            }}
+            .st-key-{strip_key} div.stButton > button[kind="primary"] {{
+                background: #2f9e44 !important;
+                border-color: #2f9e44 !important;
+                color: #ffffff !important;
+            }}
+            .st-key-{strip_key} .vekdyn-week-dot {{
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                margin: 4px auto 0;
+                background: transparent;
+                border: 1px solid transparent;
+            }}
+            .st-key-{strip_key} .vekdyn-week-dot.active-dot {{
+                background: #9fb0bd;
+                border-color: #9fb0bd;
+            }}
+            @media (max-width: 640px) {{
+                .st-key-{strip_key} {{
+                    padding-left: 0 !important;
+                    padding-right: 0 !important;
+                }}
+                .st-key-{strip_key} div[data-testid="stHorizontalBlock"] {{
+                    display: grid !important;
+                    grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+                    width: 100% !important;
+                    max-width: 100% !important;
+                    gap: 0 !important;
+                }}
+                .st-key-{strip_key} div[data-testid="column"] {{
+                    width: 100% !important;
+                    min-width: 0 !important;
+                    max-width: none !important;
+                    padding: 0 !important;
+                }}
+                .st-key-{strip_key} div.stButton > button {{
+                    width: 34px !important;
+                    min-width: 34px !important;
+                    max-width: 34px !important;
+                    height: 34px !important;
+                    min-height: 34px !important;
+                    padding: 0 !important;
+                    font-size: 18px !important;
+                    line-height: 34px !important;
+                }}
+                .st-key-{strip_key} .vekdyn-week-dow {{
+                    font-size: 11px !important;
+                    line-height: 15px !important;
+                    height: 15px !important;
+                    margin-bottom: 2px !important;
+                }}
+                .st-key-{strip_key} .vekdyn-week-dot {{
+                    margin-top: 3px !important;
+                }}
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        return st.session_state[state_key]
+
+
+    def render_selected_day_workouts(workouts, selected_day):
+        """Show only the workout(s) for the day the athlete selected."""
+
+        selected_workouts = [
+            item for item in workouts
+            if workout_day_value(item) == selected_day
+        ]
+
+        if not selected_workouts:
+            st.info("No workout has been assigned for this day.")
+            return
+
+        for workout_index, workout_item in enumerate(selected_workouts):
+            with st.container(border=True):
+                display_workout(workout_item)
+
+            if workout_index < len(selected_workouts) - 1:
+                st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+
+    def render_dark_horse_day_card(workouts, selected_day, today):
+        """Render the Dark Horse home workout card as one compact mobile panel."""
+        selected = [item for item in workouts if workout_day_value(item) == selected_day]
+        heading = "Today's workout" if selected_day == today else selected_day.strftime("%A's workout")
+        date_text = selected_day.strftime("%a, %b %d, %Y")
+        if not selected:
+            block = (
+                '<div class="dh-workout-card"><div class="dh-workout-head">'
+                f'<div class="dh-workout-head-title">{html.escape(heading)}</div>'
+                f'<div class="dh-workout-date">{html.escape(date_text)}</div></div>'
+                '<div class="dh-session-detail">No workout has been assigned for this day.</div></div>'
+            )
+            st.markdown(block, unsafe_allow_html=True)
+            return
+        sessions_html=[]
+        notes=[]
+        for item in selected:
+            session=str(item.get("session") or "AM").upper()
+            is_pm=session=="PM"
+            icon="☾" if is_pm else "☀"
+            cls="pm" if is_pm else "am"
+            title=html.escape(str(item.get("title") or "Training"))
+            parts=[]
+            main=str(item.get("main") or "").strip()
+            if main: parts.append(main)
+            if item.get("effort"): parts.append(f"Effort: {item['effort']}")
+            if item.get("planned_miles") is not None: parts.append(f"{item['planned_miles']:g} mi planned")
+            if item.get("warmup"): parts.append(f"Warm-up: {item['warmup']}")
+            if item.get("cooldown"): parts.append(f"Cool-down: {item['cooldown']}")
+            detail=html.escape(" · ".join(parts)) if parts else "Workout details from your coach"
+            sessions_html.append(
+                f'<div class="dh-session"><div class="dh-session-badge {cls}"><div class="dh-session-icon">{icon}</div>{html.escape(session)}</div>'
+                f'<div><div class="dh-session-title">{title}</div><div class="dh-session-detail">{detail}</div></div></div>'
+            )
+            note=str(item.get("coach_notes") or "").strip()
+            if note and note not in notes: notes.append(note)
+        notes_html=""
+        if notes:
+            notes_html=(
+                '<div class="dh-note"><div class="dh-note-icon">▣</div><div><div class="dh-note-label">Coach note</div>'
+                f'<div class="dh-note-text">{html.escape(" · ".join(notes))}</div></div></div>'
+            )
+        block=(
+            '<div class="dh-workout-card"><div class="dh-workout-head">'
+            f'<div class="dh-workout-head-title">{html.escape(heading)}</div>'
+            f'<div class="dh-workout-date">{html.escape(date_text)}</div></div>'
+            + ''.join(sessions_html) + notes_html + '</div>'
+        )
+        st.markdown(block, unsafe_allow_html=True)
+
+
+    def render_dark_horse_feedback_intro():
+        st.markdown(
+            '<div class="dh-feedback-shell"><div class="dh-feedback-row">'
+            '<div class="dh-feedback-icon">▥</div><div><div class="dh-feedback-title">How did you feel?</div>'
+            '<div class="dh-feedback-sub">Log your readiness, energy, and notes.</div></div>'
+            '<div class="dh-feedback-chevron">›</div></div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+    def render_threshold_paces():
+        """
+        Show only prescribed threshold paces.
+
+        VEKDYN does not prescribe an easy-run pace here. Easy running remains
+        athlete-controlled unless a coach explicitly writes something in the workout.
+        """
+        # Do not make this Neon query during login -> Home. It is only needed here.
+        threshold_profile = get_threshold_profile(
+            athlete["team_id"], athlete["athlete_key"]
+        )
+
+        st.markdown("### Threshold paces")
+        st.caption("Prescribed threshold pace by repetition length.")
+
+        short_col, medium_col, long_col = st.columns(3)
+
+        pace_groups = [
+            (short_col, "SHORT REPS", threshold_profile["short"]),
+            (medium_col, "MEDIUM REPS", threshold_profile["medium"]),
+            (long_col, "LONG REPS", threshold_profile["long"]),
+        ]
+
+        for column, label, profile in pace_groups:
+            with column:
+                with st.container(border=True):
+                    st.markdown(
+                        f'<div class="pace-label">{label}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f'<div class="pace-value">{profile["pace"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    lactate = profile.get("lactate")
+                    st.caption(
+                        f"{lactate} mmol" if lactate is not None else "-- mmol"
+                    )
+
+
+    def render_connections_page():
+        """Athlete-owned integrations plus account logout."""
+
+        st.header("Connections")
+        st.caption("Connect your own training accounts directly to VEKDYN.")
+
+        athlete_key = athlete["athlete_key"]
+
+        # -----------------------------------------------------
+        # STRAVA
+        # -----------------------------------------------------
+        try:
+            strava_connection = load_saved_strava_connection(athlete_key)
+        except Exception as error:
+            strava_connection = {}
+            st.warning(f"Could not check Strava connection: {error}")
+
+        with st.container(border=True):
+            if strava_connection:
+                st.write("🟢 **Strava connected**")
+                connected_name = (
+                    strava_connection.get("strava_name")
+                    or "Strava athlete"
+                )
+                st.caption(
+                    f"Connected as {connected_name}. "
+                    "Your coach can use the synced training data in VEKDYN Coach."
+                )
+
+                reconnect_url = create_strava_login_url(athlete_key)
+                if reconnect_url:
+                    st.link_button(
+                        "Reconnect Strava",
+                        reconnect_url,
+                        use_container_width=True,
+                    )
+
+            else:
+                st.write("⚪ **Strava not connected**")
+                st.caption(
+                    "Authorize your own Strava account here. "
+                    "Your coach never receives your Strava password."
+                )
+
+                strava_url = create_strava_login_url(athlete_key)
+                if strava_url:
+                    st.link_button(
+                        "Connect Strava",
+                        strava_url,
+                        type="primary",
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning(
+                        "Strava is not configured yet for this Athlete app."
+                    )
+
+        if st.session_state.get("strava_success"):
+            st.success(st.session_state.pop("strava_success"))
+
+        # -----------------------------------------------------
+        # COROS
+        # -----------------------------------------------------
+        try:
+            coros_connection = load_saved_coros_connection(athlete_key)
+        except Exception as error:
+            coros_connection = {}
+            st.warning(f"Could not check COROS connection: {error}")
+
+        with st.container(border=True):
+            if coros_connection:
+                st.write("🟢 **COROS connected**")
+                st.caption(
+                    "Your COROS account is linked to VEKDYN. "
+                    "Sleep, resting HR and sleep HRV can be shared with your coach."
+                )
+
+                sync_col, reconnect_col = st.columns(2)
+
+                with sync_col:
+                    if st.button(
+                        "Sync Recovery Data",
+                        type="primary",
+                        use_container_width=True,
+                        key="athlete_connections_sync_coros",
+                    ):
+                        try:
+                            latest = sync_coros_recovery(athlete_key, days=7)
+                            st.session_state["coros_sync_success"] = True
+                            st.session_state["coros_latest_recovery"] = latest
+                            st.rerun()
+                        except (
+                            requests.RequestException,
+                            RuntimeError,
+                            psycopg2.Error,
+                        ) as error:
+                            st.session_state["coros_sync_error"] = str(error)
+                            st.rerun()
+
+                with reconnect_col:
+                    try:
+                        reconnect_coros_url = create_coros_login_url(
+                            athlete_key,
+                            logged_in_athlete_id,
+                        )
+                        st.link_button(
+                            "Reconnect COROS",
+                            str(reconnect_coros_url),
+                            use_container_width=True,
+                        )
+                    except (
+                        requests.RequestException,
+                        RuntimeError,
+                        psycopg2.Error,
+                    ) as error:
+                        st.warning(f"COROS reconnect unavailable: {error}")
+
+                try:
+                    latest_recovery = load_latest_coros_recovery(athlete_key)
+                except Exception:
+                    latest_recovery = {}
+
+                if latest_recovery:
+                    sleep_minutes = latest_recovery.get("sleep_minutes")
+                    hrv_avg = latest_recovery.get("hrv_avg")
+                    recovery_date = latest_recovery.get("date")
+
+                    sleep_text = "--"
+                    if sleep_minutes is not None:
+                        sleep_text = (
+                            f"{sleep_minutes // 60}h "
+                            f"{sleep_minutes % 60}m"
+                        )
+
+                    hrv_text = (
+                        f"{hrv_avg} ms"
+                        if hrv_avg is not None
+                        else "--"
+                    )
+
+                    sleep_col, hrv_col = st.columns(2)
+                    with sleep_col:
+                        st.metric("Sleep", sleep_text)
+                    with hrv_col:
+                        st.metric("Sleep HRV", hrv_text)
+
+                    detail_parts = []
+
+                    if latest_recovery.get("sleep_score") is not None:
+                        detail_parts.append(
+                            f"sleep score {latest_recovery['sleep_score']}"
+                        )
+
+                    if latest_recovery.get("hrv_baseline") is not None:
+                        detail_parts.append(
+                            f"HRV baseline "
+                            f"{latest_recovery['hrv_baseline']} ms"
+                        )
+
+                    if latest_recovery.get("hrv_status"):
+                        detail_parts.append(
+                            str(latest_recovery["hrv_status"])
+                        )
+
+                    date_text = (
+                        recovery_date.strftime("%b %d, %Y")
+                        if recovery_date
+                        else "latest day"
+                    )
+
+                    if detail_parts:
+                        st.caption(
+                            f"{date_text} · "
+                            + " · ".join(detail_parts)
+                        )
+                    else:
+                        st.caption(date_text)
+
+            else:
+                st.write("⚪ **COROS not connected**")
+                st.caption(
+                    "Authorize your own COROS account here. "
+                    "Your coach never receives your COROS password."
+                )
+
+                try:
+                    coros_url = create_coros_login_url(
+                        athlete_key,
+                        logged_in_athlete_id,
+                    )
+                    st.link_button(
+                        "Connect COROS",
+                        str(coros_url),
+                        type="primary",
+                        use_container_width=True,
+                    )
+                except (
+                    requests.RequestException,
+                    RuntimeError,
+                    psycopg2.Error,
+                ) as error:
+                    st.warning(f"COROS connection is not ready: {error}")
+
+        if st.session_state.get("coros_success"):
+            st.success(st.session_state.pop("coros_success"))
+
+        if st.session_state.pop("coros_sync_success", False):
+            st.success("COROS recovery data synced to VEKDYN ✓")
+
+        if st.session_state.get("coros_sync_error"):
+            st.warning(
+                "COROS sync: "
+                + st.session_state.pop("coros_sync_error")
+            )
+
+        if st.session_state.get("coros_callback_error"):
+            st.warning(
+                st.session_state.pop("coros_callback_error")
+            )
+
+        st.divider()
+
+        # -----------------------------------------------------
+        # ACCOUNT
+        # -----------------------------------------------------
+        st.markdown("### Account")
+        st.caption(
+            "Signing out removes this device's persistent VEKDYN session."
+        )
+
+        if st.button(
+            "Log Out",
+            use_container_width=True,
+            key="athlete_logout_button",
+        ):
+            athlete_logout()
+
+
+    # =========================================================
+    # NAVIGATION
+    # =========================================================
+
+    if "athlete_nav" not in st.session_state:
+        st.session_state.athlete_nav = "Home"
+
+    nav_labels = ["Home", "Training", "Performance", "Connections"]
+    nav_icons = {"Home": "⌂", "Training": "🏃", "Performance": "▥", "Connections": "↗"}
+
+    # Real bottom navigation: key the container so CSS can reliably pin the whole row.
+    with st.container(key="athlete_bottom_nav"):
+        nav_cols = st.columns(4, gap="small")
+        for _i, _label in enumerate(nav_labels):
+            with nav_cols[_i]:
+                st.button(
+                    f"{nav_icons[_label]}\n{_label}",
+                    key=f"athlete_bottom_nav_{_label.lower()}",
+                    use_container_width=True,
+                    type="primary" if st.session_state.athlete_nav == _label else "secondary",
+                    on_click=lambda label=_label: st.session_state.update(athlete_nav=label),
+                )
+
+    active_nav = st.session_state.athlete_nav
+
+
+    # =========================================================
+    # HOME — CURRENT WEEK / SELECTED DAY
+    # =========================================================
+
+    if active_nav == "Home":
+        st.markdown('<div class="mobile-section-title">My workouts</div>', unsafe_allow_html=True)
+
+        today = date.today()
+        selected_day = st.session_state.home_selected_date
+
+        # Show the week containing the selected calendar day, not always today's week.
+        current_sunday = selected_day - timedelta(
+            days=(selected_day.weekday() + 1) % 7
+        )
+        current_saturday = current_sunday + timedelta(days=6)
+
+        # The selected calendar day is now stored in session state. Clean the
+        # one-shot URL value while keeping the persistent athlete session.
+        if st.query_params.get("calday"):
+            _session = browser_session_token()
+            st.query_params.clear()
+            if _session:
+                st.query_params["session"] = _session
+            st.query_params["view"] = "Home"
+
+        st.markdown(
+            f"<div class='mobile-week-range'>"
+            f"{current_sunday.strftime('%b %d')} – "
+            f"{current_saturday.strftime('%b %d, %Y')}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        current_week_workouts = get_workouts(
+            current_sunday,
+            current_saturday,
+        )
+
+        new_selected_day = render_day_picker(
+            current_sunday,
+            current_week_workouts,
+            selected_day,
+            "home_day",
+        )
+
+        if new_selected_day != selected_day:
+            st.session_state.home_selected_date = new_selected_day
+            st.rerun()
+
+        selected_day = st.session_state.home_selected_date
+
+        if athlete.get("team_id") == "dark_horse_endurance":
+            render_dark_horse_day_card(current_week_workouts, selected_day, today)
+            render_dark_horse_feedback_intro()
+            with st.expander("Add / edit today's note", expanded=False):
+                render_daily_feedback(selected_day)
+        else:
+            if selected_day == today:
+                st.markdown("### Today's workout")
+            else:
+                st.markdown(
+                    f"### {selected_day.strftime('%A, %B %d')}"
+                )
+            render_selected_day_workouts(current_week_workouts, selected_day)
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            render_daily_feedback(selected_day)
+
+
+
+    # =========================================================
+    # TRAINING — MONTHLY BIG-PICTURE CALENDAR
+    # =========================================================
+
+    def shifted_month(base_date, offset):
+        """Return the first day of the month offset from base_date."""
+        month_index = (base_date.year * 12 + (base_date.month - 1)) + offset
+        year, zero_based_month = divmod(month_index, 12)
+        return date(year, zero_based_month + 1, 1)
+
+
+    def render_expanded_training_calendar(start_month, workouts, month_count=3):
+        """Native Streamlit calendar with the original 7-column visual layout."""
+        today = date.today()
+        workout_dates = {
+            item.get("date") for item in workouts if item.get("date") is not None
+        }
+        weekday_labels = ["S", "M", "T", "W", "T", "F", "S"]
+
+        # IMPORTANT: don't wrap st.columns inside a keyed container. On mobile the
+        # prior scoped CSS/container interaction collapsed each 7-column row into
+        # one vertical column. Style each generated row directly instead.
+        st.markdown(
+            """
+            <style>
+            /* Training calendar rows */
+            div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7)) {
+                gap: 0 !important;
+                flex-wrap: nowrap !important;
+                width: 100% !important;
+            }
+            div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
+            > div[data-testid="stColumn"] {
+                width: 14.2857% !important;
+                flex: 1 1 14.2857% !important;
+                min-width: 0 !important;
+            }
+
+            .vekdyn-cal-month {
+                font-size:24px;
+                font-weight:850;
+                color:#111827;
+                margin:10px 0 12px;
+            }
+            .vekdyn-cal-weekday {
+                text-align:center;
+                padding:6px 0 10px;
+                font-size:13px;
+                font-weight:700;
+                color:#6b7280;
+                border-bottom:1px solid #e5e7eb;
+            }
+            .vekdyn-cal-empty {
+                height:76px;
+                border-bottom:1px solid #eef0ee;
+            }
+            .vekdyn-cal-dot {
+                height:0;
+                position:relative;
+                z-index:2;
+                top:-18px;
+                text-align:center;
+                pointer-events:none;
+                color:#91a6b5;
+                font-size:18px;
+                line-height:0;
+            }
+            .vekdyn-cal-gap {height:28px;}
+
+            /* Only buttons in rows containing our hidden marker get calendar styling. */
+            div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
+            div[data-testid="stButton"] > button {
+                height:76px !important;
+                min-height:76px !important;
+                width:100% !important;
+                padding:0 !important;
+                border:0 !important;
+                border-radius:0 !important;
+                border-bottom:1px solid #eef0ee !important;
+                background:transparent !important;
+                box-shadow:none !important;
+                color:#111827 !important;
+            }
+            div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
+            div[data-testid="stButton"] > button:hover {
+                background:#f7faf7 !important;
+            }
+            div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
+            div[data-testid="stButton"] > button p {
+                font-size:20px !important;
+                font-weight:650 !important;
+                color:#111827 !important;
+                margin:0 !important;
+            }
+
+            @media(max-width:720px) {
+                div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7)) {
+                    display:flex !important;
+                    flex-direction:row !important;
+                    flex-wrap:nowrap !important;
+                }
+                div[data-testid="stHorizontalBlock"]:has(> div[data-testid="stColumn"]:nth-child(7))
+                > div[data-testid="stColumn"] {
+                    width:14.2857% !important;
+                    flex:0 0 14.2857% !important;
+                    min-width:0 !important;
+                }
+                .vekdyn-cal-month {
+                    font-size:21px;
+                    margin:8px 0 10px;
+                }
+                .vekdyn-cal-weekday {
+                    font-size:12px;
+                    padding:6px 0 8px;
+                }
+                .vekdyn-cal-empty,
+                div[data-testid="stHorizontalBlock"]
+                div[data-testid="stButton"] > button {
+                    height:64px !important;
+                    min-height:64px !important;
+                }
+                div[data-testid="stHorizontalBlock"]
+                div[data-testid="stButton"] > button p {
+                    font-size:18px !important;
+                }
+                .vekdyn-cal-dot {
+                    top:-15px;
+                    font-size:16px;
+                }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            "<div id='vekdyn-training-calendar-start'></div>",
+            unsafe_allow_html=True,
+        )
+
+        for month_offset in range(month_count):
+            month_first = shifted_month(start_month, month_offset)
+            cal = calendar.Calendar(firstweekday=6)
+            weeks = cal.monthdatescalendar(month_first.year, month_first.month)
+
+            st.markdown(
+                f"<div class='vekdyn-cal-month'>{month_first.strftime('%B %Y')}</div>",
+                unsafe_allow_html=True,
+            )
+
+            header_cols = st.columns(7, gap=None)
+            for idx, label in enumerate(weekday_labels):
+                with header_cols[idx]:
+                    st.markdown(
+                        f"<div class='vekdyn-cal-weekday'>{label}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+            for week in weeks:
+                cols = st.columns(7, gap=None)
+                for idx, day_value in enumerate(week):
+                    with cols[idx]:
+                        if day_value.month != month_first.month:
+                            st.markdown(
+                                "<div class='vekdyn-cal-empty'></div>",
+                                unsafe_allow_html=True,
+                            )
+                            continue
+
+                        clicked = st.button(
+                            str(day_value.day),
+                            key=f"training_calendar_{day_value.isoformat()}",
+                            use_container_width=True,
+                            type="primary" if day_value == today else "secondary",
+                        )
+
+                        if day_value in workout_dates:
+                            st.markdown(
+                                "<div class='vekdyn-cal-dot'>•</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        if clicked:
+                            st.session_state.home_selected_date = day_value
+                            st.session_state.athlete_nav = "Home"
+                            st.rerun()
+
+            st.markdown("<div class='vekdyn-cal-gap'></div>", unsafe_allow_html=True)
+
+        return None
+
+
+    if active_nav == "Training":
+        st.header("Training")
+        st.caption("Your full training block. Tap any workout day to open its sessions.")
+
+        today = date.today()
+        first_month = date(today.year, today.month, 1)
+        last_month = shifted_month(first_month, 2)
+        last_day = date(
+            last_month.year,
+            last_month.month,
+            calendar.monthrange(last_month.year, last_month.month)[1],
+        )
+
+        # One database read supplies all three expanded months.
+        training_workouts = get_workouts(first_month, last_day)
+        render_expanded_training_calendar(
+            first_month,
+            training_workouts,
+            month_count=3,
+        )
+
+        planned_values = [
+            item.get("planned_miles")
+            for item in training_workouts
+            if item.get("planned_miles") is not None
+        ]
+        if planned_values:
+            st.caption(f"Planned mileage shown: {round(sum(planned_values), 1):g} mi")
+
+
+    # =========================================================
+    # PERFORMANCE — THRESHOLD + PERFORMANCE TOOLS
+    # =========================================================
+
+    if active_nav == "Performance":
+        st.markdown('<div class="mobile-section-title">Performance</div>', unsafe_allow_html=True)
+        st.caption("Your coach-prescribed threshold profile and performance tools.")
+        render_threshold_paces()
+
+
+
+    # =========================================================
+    # CONNECTIONS
+    # =========================================================
+
+    if active_nav == "Connections":
+        render_connections_page()
+
+if mode == "athlete":
+    _run_athlete()
+else:
+    _run_coach()
