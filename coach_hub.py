@@ -947,8 +947,17 @@ def send_athlete_invitation(athlete_key, athlete_email):
     sender = str(st.secrets.get("INVITE_FROM_EMAIL", "")).strip()
     athlete_url = str(st.secrets.get("VEKDYN_ATHLETE_URL", "")).strip().rstrip("/")
     smtp_port = int(st.secrets.get("INVITE_SMTP_PORT", 587))
-    if not all([smtp_host, smtp_user, smtp_password, sender, athlete_url]):
-        raise RuntimeError("Configure INVITE_SMTP_HOST, INVITE_SMTP_USER, INVITE_SMTP_PASSWORD, INVITE_FROM_EMAIL and VEKDYN_ATHLETE_URL in Coach Streamlit Secrets.")
+    # Diagnose missing configuration without displaying secret values.
+    required_invite_secrets = {
+        "INVITE_SMTP_HOST": smtp_host,
+        "INVITE_SMTP_USER": smtp_user,
+        "INVITE_SMTP_PASSWORD": smtp_password,
+        "INVITE_FROM_EMAIL": sender,
+        "VEKDYN_ATHLETE_URL": athlete_url,
+    }
+    missing = [name for name, value in required_invite_secrets.items() if not str(value).strip()]
+    if missing:
+        raise RuntimeError("Missing Streamlit Secrets: " + ", ".join(missing))
     if not athlete_url.startswith("https://"):
         raise ValueError("VEKDYN_ATHLETE_URL must be HTTPS.")
     initialize_athlete_invitations()
