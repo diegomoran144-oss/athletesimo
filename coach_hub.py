@@ -6094,7 +6094,8 @@ def load_team_recovery_snapshots(team_id, athlete_keys):
     return results
 
 
-if dashboard_view == "Dashboard":
+@st.fragment
+def render_team_recovery_overview(active_team, athletes):
     if active_team == DEMO_TEAM_ID:
         snapshots = {key: {} for key in athletes}
     else:
@@ -6182,6 +6183,11 @@ if dashboard_view == "Dashboard":
             "Status reflects available measurements only; it is not a medical diagnosis or "
             "definitive readiness assessment. Missing data is never treated as normal."
         )
+
+
+
+if dashboard_view == "Dashboard":
+    render_team_recovery_overview(active_team, athletes)
 
 # =========================================================
 # TRAINING VOLUME — PLANNED WEEK SUMMARY
