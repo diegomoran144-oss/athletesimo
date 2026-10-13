@@ -6043,13 +6043,54 @@ def classify_team_recovery(data):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_team_recovery_snapshots(team_id, athlete_keys):
-    """Read the latest stored recovery for each team member, without external API calls."""
-    results = {}
-    for key in athlete_keys:
-        try:
-            results[key] = cached_latest_coros_recovery(key)
-        except Exception:
-            results[key] = {}
+    """Fetch all team recovery snapshots in one Neon connection/query.
+
+    Each metric uses its newest non-null recorded value, preserving the
+    original behavior when sleep, HRV and heart rate arrive on different days.
+    """
+    results = {key: {} for key in athlete_keys}
+    if not athlete_keys:
+        return results
+
+    initialize_coros_database()
+    columns = {
+        "sleep_minutes": "sleep_minutes",
+        "sleep_score": "sleep_score",
+        "hrv_avg": "hrv_avg",
+        "hrv_baseline": "hrv_baseline",
+        "hrv_normal_low": "hrv_normal_low",
+        "hrv_normal_high": "hrv_normal_high",
+        "hrv_status": "hrv_status",
+        "recovery_score": "COALESCE(vekdyn_recovery_score, recovery_score)",
+        "sleep_hr_avg": "sleep_hr_avg",
+        "sleep_hr_baseline": "sleep_hr_baseline",
+        "resting_hr": "resting_hr",
+    }
+    # The latest date is based on measured values, as in the original loader.
+    date_expr = "(sleep_minutes IS NOT NULL OR hrv_avg IS NOT NULL OR resting_hr IS NOT NULL OR sleep_hr_avg IS NOT NULL)"
+    select_fields = [
+        "athlete_key",
+        f"MAX(recovery_date) FILTER (WHERE {date_expr}) AS date",
+    ]
+    for alias, expr in columns.items():
+        select_fields.append(
+            f"(ARRAY_AGG({expr} ORDER BY recovery_date DESC) "
+            f"FILTER (WHERE {expr} IS NOT NULL))[1] AS {alias}"
+        )
+    query = (
+        "SELECT " + ", ".join(select_fields) +
+        " FROM coros_recovery_daily WHERE athlete_key = ANY(%s) GROUP BY athlete_key"
+    )
+    with get_database_connection() as db:
+        with db.cursor() as cursor:
+            cursor.execute(query, (list(athlete_keys),))
+            for row in cursor.fetchall():
+                key = row[0]
+                values = row[1:]
+                results[key] = (
+                    dict(zip(["date", *columns.keys()], values))
+                    if any(value is not None for value in values) else {}
+                )
     return results
 
 
@@ -6113,8 +6154,8 @@ if dashboard_view == "Dashboard":
                 key=f"recovery_toggle_{active_team}_{member_key}",
                 use_container_width=True,
             ):
-                st.session_state[state_key] = not is_open
-                st.rerun()
+                is_open = not is_open
+                st.session_state[state_key] = is_open
 
             if is_open:
                 with st.container(border=True):
