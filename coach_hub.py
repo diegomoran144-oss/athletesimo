@@ -947,17 +947,8 @@ def send_athlete_invitation(athlete_key, athlete_email):
     sender = str(st.secrets.get("INVITE_FROM_EMAIL", "")).strip()
     athlete_url = str(st.secrets.get("VEKDYN_ATHLETE_URL", "")).strip().rstrip("/")
     smtp_port = int(st.secrets.get("INVITE_SMTP_PORT", 587))
-    # Diagnose missing configuration without displaying secret values.
-    required_invite_secrets = {
-        "INVITE_SMTP_HOST": smtp_host,
-        "INVITE_SMTP_USER": smtp_user,
-        "INVITE_SMTP_PASSWORD": smtp_password,
-        "INVITE_FROM_EMAIL": sender,
-        "VEKDYN_ATHLETE_URL": athlete_url,
-    }
-    missing = [name for name, value in required_invite_secrets.items() if not str(value).strip()]
-    if missing:
-        raise RuntimeError("Missing Streamlit Secrets: " + ", ".join(missing))
+    if not all([smtp_host, smtp_user, smtp_password, sender, athlete_url]):
+        raise RuntimeError("Configure INVITE_SMTP_HOST, INVITE_SMTP_USER, INVITE_SMTP_PASSWORD, INVITE_FROM_EMAIL and VEKDYN_ATHLETE_URL in Coach Streamlit Secrets.")
     if not athlete_url.startswith("https://"):
         raise ValueError("VEKDYN_ATHLETE_URL must be HTTPS.")
     initialize_athlete_invitations()
@@ -1017,56 +1008,55 @@ def render_athlete_account_manager(athlete_key, profile, team_id):
                 key=f"athlete_email_{team_id}_{athlete_key}",
                 placeholder="athlete@university.edu",
             )
-            if st.button("Save athlete email", key=f"save_email_{team_id}_{athlete_key}"):
+            st.caption("Save the email and automatically send a one-time activation link (valid for 24 hours). You can also use this button to resend an invitation.")
+            if st.button(
+                "Save email & send invitation",
+                key=f"save_email_{team_id}_{athlete_key}",
+                disabled=not account.get("active"),
+            ):
                 try:
                     saved = set_athlete_login_email(athlete_key, email)
-                    st.success(f"Email saved: {saved}")
-                    st.rerun()
                 except psycopg2.errors.UniqueViolation:
                     st.error("This email is already linked to another athlete.")
                 except (ValueError, psycopg2.Error) as error:
                     st.error(f"Could not save email: {error}")
-            st.caption("After saving the email, send a one-time invitation. The athlete sets their own password.")
-            if st.button("Send invitation email", key=f"invite_{team_id}_{athlete_key}", disabled=not account.get("login_email") or not account.get("active")):
-                try:
-                    destination = send_athlete_invitation(athlete_key, account.get("login_email"))
-                    st.success(f"Invitation sent to {destination}. Link expires in 24 hours.")
-                except (ValueError, RuntimeError, psycopg2.Error) as error:
-                    st.error(str(error))
+                else:
+                    try:
+                        destination = send_athlete_invitation(athlete_key, saved)
+                    except (ValueError, RuntimeError, psycopg2.Error) as error:
+                        st.warning(f"Email saved as {saved}, but the invitation was not sent: {error}. Fix the issue and click the button again to retry.")
+                    else:
+                        st.success(f"Email saved and invitation sent to {destination}. Link expires in 24 hours.")
         else:
             st.info("This athlete does not have a login account yet.")
 
-        # Preserve existing sign-in until the athlete application is migrated.
-        with st.expander("Legacy account administration", expanded=False):
+        # Coach access control lives directly beneath email onboarding.
+        # Password recovery will be handled by the Athlete login page.
+        if account:
+            active = bool(account.get("active"))
             if st.button(
-                "Reset temporary password" if account else "Create legacy athlete login",
-                key=f"athlete_login_create_reset_{team_id}_{athlete_key}",
+                "Disable athlete login" if active else "Enable athlete login",
+                key=f"toggle_athlete_login_{team_id}_{athlete_key}_{active}",
             ):
                 try:
-                    login_id, password = create_or_reset_athlete_login(
-                        athlete_key=athlete_key, team_id=team_id,
-                        display_name=athlete_name, event_group=event_group,
+                    set_athlete_login_active(athlete_key, not active)
+                    st.rerun()
+                except psycopg2.Error as error:
+                    st.error(f"Could not update account: {error}")
+        else:
+            # Retain initial account creation for athletes not yet provisioned.
+            if st.button("Create athlete account", key=f"athlete_login_create_reset_{team_id}_{athlete_key}"):
+                try:
+                    create_or_reset_athlete_login(
+                        athlete_key=athlete_key,
+                        team_id=team_id,
+                        display_name=athlete_name,
+                        event_group=event_group,
                     )
-                    st.session_state[f"temp_login_id_{athlete_key}"] = login_id
-                    st.session_state[f"temp_password_{athlete_key}"] = password
+                    st.success("Athlete account created. Add their email above to send an invitation.")
                     st.rerun()
                 except (ValueError, psycopg2.Error) as error:
-                    st.error(f"Could not create/reset login: {error}")
-            password = st.session_state.get(f"temp_password_{athlete_key}")
-            if password:
-                st.code(f"Legacy ID: {st.session_state.get(f'temp_login_id_{athlete_key}')}\nTemporary password: {password}")
-                if st.button("Clear credentials", key=f"clear_temp_password_{team_id}_{athlete_key}"):
-                    st.session_state.pop(f"temp_login_id_{athlete_key}", None)
-                    st.session_state.pop(f"temp_password_{athlete_key}", None)
-                    st.rerun()
-            if account:
-                active = bool(account.get("active"))
-                if st.button("Disable login" if active else "Enable login", key=f"toggle_athlete_login_{team_id}_{athlete_key}_{active}"):
-                    try:
-                        set_athlete_login_active(athlete_key, not active)
-                        st.rerun()
-                    except psycopg2.Error as error:
-                        st.error(f"Could not update account: {error}")
+                    st.error(f"Could not create athlete account: {error}")
 
 
 # =========================================================
